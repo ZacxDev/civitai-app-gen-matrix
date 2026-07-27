@@ -18,6 +18,10 @@
 #     plus the `ColorDomain`/maturity projection in BLOCK_INIT.
 # Both are PUBLISHED on npm and resolve from the registry directly — no local
 # `link:`/`overrides`. See PICKER-WIRING.md.
+# Single-package repo: declare the root explicitly so pnpm/setup-node cache
+# don't error "packages field missing or empty".
+packages:
+  - '.'
 minimumReleaseAgeExclude:
   - '@civitai/app-sdk'
   - '@civitai/blocks-react'
