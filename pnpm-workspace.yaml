@@ -1,0 +1,23 @@
+# pnpm's default minimumReleaseAge gate would refuse to install very fresh
+# package versions. The two Civitai SDK packages are pinned and trusted, so
+# exclude them from that gate.
+#
+# These versions ship the PAGE resource picker (with public display names) and
+# the shared SDK mock host:
+#   - @civitai/blocks-react@0.9.0 exports `useResourcePicker()` (host-chrome
+#     native picker for Checkpoint | LORA — civitai-app-starters #44) PLUS the
+#     shared dev mock host under `/testing` (`createMockHost` + `<Harness>` /
+#     `<MockHostProvider>` + `readMockHostUrlOptions`) the gen-matrix reference
+#     block now consumes instead of a hand-rolled harness, PLUS
+#     `useDomainMaturity()` / `<SfwGate>` (domain maturity ceiling from
+#     BLOCK_INIT, civitai #2670) used to gate the anon catalog read's advisory
+#     SFW filter.
+#   - @civitai/app-sdk@0.13.0 carries the OPEN_RESOURCE_PICKER /
+#     RESOURCE_PICKER_RESULT message types + BlockResourceInfo incl.
+#     `modelName`/`versionName` (the names the page picker returns — #2655/#47)
+#     plus the `ColorDomain`/maturity projection in BLOCK_INIT.
+# Both are PUBLISHED on npm and resolve from the registry directly — no local
+# `link:`/`overrides`. See PICKER-WIRING.md.
+minimumReleaseAgeExclude:
+  - '@civitai/app-sdk@0.13.0'
+  - '@civitai/blocks-react@0.9.0'

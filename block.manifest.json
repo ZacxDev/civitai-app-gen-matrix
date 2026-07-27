@@ -1,0 +1,24 @@
+{
+  "$schema": "https://civitai.com/schemas/app-block/v1.json",
+  "blockId": "gen-matrix",
+  "version": "0.7.1",
+  "name": "Gen Matrix",
+  "type": "block",
+  "scopes": ["ai:write:budgeted"],
+  "page": {
+    "path": "/",
+    "title": "Gen Matrix",
+    "icon": "bolt",
+    "buzzBudgetPerGen": 200
+  },
+  "iframe": {
+    "minHeight": 600,
+    "maxHeight": 4000,
+    "resizable": true,
+    "sandbox": "allow-scripts allow-forms"
+  },
+  "contentRating": "g",
+  "minApiVersion": "1.0",
+  "buildCommand": "npm run build",
+  "outputDir": "dist"
+}

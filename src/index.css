@@ -1,0 +1,223 @@
+:root {
+  color-scheme: light dark;
+}
+
+html,
+body,
+#root {
+  margin: 0;
+  width: 100%;
+  min-height: 100dvh;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+/* ---------------------------------------------------------------------------
+ * Pass 3 — visual polish & animation.
+ *
+ * The host can't inject CSS into the block iframe, so EVERY animation lives
+ * here (bundled with the app) and is keyed by className from App.tsx /
+ * ResourceBrowser.tsx. Colors stay in the inline palette() so light/dark keep
+ * working — this file only carries motion, layout, and structure that inline
+ * styles can't express (keyframes, :active, ::-webkit-scrollbar, media queries,
+ * gradient sweeps). All motion is GPU-cheap (transform/opacity only) and is
+ * disabled wholesale under prefers-reduced-motion (see the block at the end).
+ * ------------------------------------------------------------------------- */
+
+/* --- Staggered entry for grid cells / skeletons (D4.3) ---------------------
+ * Each cell sets `--gm-stagger` (index*40ms, capped) inline; the animation
+ * delay reads it. translateY+opacity only. */
+@keyframes gm-cell-in {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.gm-cell {
+  animation: gm-cell-in 220ms ease-out both;
+  animation-delay: var(--gm-stagger, 0ms);
+}
+
+/* --- Image fade-in once decoded (D4.1) -------------------------------------
+ * Applied to the <img> on its onLoad, so the decoded image (not the empty
+ * element) animates in. opacity + scale only. */
+@keyframes gm-img-in {
+  from {
+    opacity: 0;
+    transform: scale(0.96);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+
+.gm-img-loaded {
+  animation: gm-img-in 240ms ease-out both;
+}
+
+/* --- Skeleton shimmer (D4.2 / P5.5) ----------------------------------------
+ * A diagonal highlight sweeps across a translucent base. The two colors are
+ * supplied inline (theme-aware) via --gm-skel-base / --gm-skel-shine so dark
+ * mode stays correct; this rule only animates background-position. */
+.gm-skeleton {
+  background-image: linear-gradient(
+    100deg,
+    var(--gm-skel-base, rgba(128, 128, 128, 0.12)) 30%,
+    var(--gm-skel-shine, rgba(128, 128, 128, 0.28)) 50%,
+    var(--gm-skel-base, rgba(128, 128, 128, 0.12)) 70%
+  );
+  background-size: 200% 100%;
+  background-repeat: no-repeat;
+  animation: gm-shimmer 1.5s ease-in-out infinite;
+}
+
+@keyframes gm-shimmer {
+  from {
+    background-position: 150% 0;
+  }
+  to {
+    background-position: -50% 0;
+  }
+}
+
+/* --- Confirm-dialog entry (D4.6) ------------------------------------------- */
+@keyframes gm-dialog-in {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.gm-dialog-enter {
+  animation: gm-dialog-in 150ms ease-out both;
+}
+
+/* Backdrop fade for the modal + browser overlay. */
+@keyframes gm-backdrop-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+.gm-backdrop {
+  animation: gm-backdrop-in 150ms ease-out both;
+}
+
+/* --- Chip press (D4.4) -----------------------------------------------------
+ * Smooth background/border swap + a tactile press. Applied to selectable chips
+ * and the browse/pick buttons. */
+.gm-chip {
+  transition:
+    background-color 120ms ease,
+    border-color 120ms ease,
+    color 120ms ease,
+    transform 120ms ease;
+}
+
+.gm-chip:active {
+  transform: scale(0.96);
+}
+
+/* --- Mobile results grid (P5.1) -------------------------------------------
+ * Desktop keeps the plain table (untouched). On narrow viewports we freeze the
+ * row-header column (sticky), add an edge fade + a swipe cue so the off-screen
+ * 3rd column never sits cut-off-without-a-cue.
+ *
+ * .gm-grid-scroll is the horizontal scroller wrapping the table. The fade is a
+ * sticky pseudo-strip on the right edge that hides once scrolled to the end. */
+.gm-grid-scroll {
+  position: relative;
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+}
+
+/* Slim, theme-neutral scrollbar so the scroll affordance reads on desktop too. */
+.gm-grid-scroll::-webkit-scrollbar {
+  height: 8px;
+}
+.gm-grid-scroll::-webkit-scrollbar-thumb {
+  background: rgba(128, 128, 128, 0.4);
+  border-radius: 4px;
+}
+
+/* Edge fade + swipe cue default to hidden (desktop — the table fits). The
+ * narrow-viewport media query below RE-ENABLES them; it must come AFTER these
+ * base rules so its display wins by source order (equal specificity). */
+.gm-swipe-cue {
+  display: none;
+}
+.gm-edge-fade {
+  display: none;
+  position: absolute;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  width: 28px;
+  pointer-events: none;
+  background: linear-gradient(to right, transparent, var(--gm-fade-color, rgba(0, 0, 0, 0.12)));
+}
+
+@media (max-width: 560px) {
+  /* Freeze the row-header (checkpoint) column so the user keeps their bearings
+   * while swiping the style columns. The background is supplied inline so it
+   * stays opaque over the scrolled cells in both themes. */
+  .gm-grid-scroll .gm-row-th {
+    position: sticky;
+    left: 0;
+    z-index: 1;
+  }
+
+  /* The swipe cue + edge fade only matter where columns can overflow. */
+  .gm-swipe-cue {
+    display: flex;
+  }
+  .gm-edge-fade {
+    display: block;
+  }
+}
+
+/* --- Reduced motion: kill ALL of the above ------------------------------- */
+@media (prefers-reduced-motion: reduce) {
+  .gm-cell,
+  .gm-img-loaded,
+  .gm-skeleton,
+  .gm-dialog-enter,
+  .gm-backdrop {
+    animation: none !important;
+  }
+  .gm-cell {
+    /* Cells still need to be visible (animation provided `both`/opacity:0). */
+    opacity: 1;
+    transform: none;
+  }
+  .gm-img-loaded {
+    opacity: 1;
+    transform: none;
+  }
+  .gm-chip {
+    transition: none;
+  }
+  .gm-chip:active {
+    transform: none;
+  }
+  /* The shimmer keeps a static tinted background (no sweep). */
+  .gm-skeleton {
+    background-image: none;
+    background-color: var(--gm-skel-base, rgba(128, 128, 128, 0.16));
+  }
+}

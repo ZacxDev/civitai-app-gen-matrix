@@ -1,0 +1,33 @@
+{
+  "name": "gen-matrix",
+  "version": "0.7.1",
+  "private": true,
+  "description": "Gen Matrix — a Civitai App Block (W10 full-page) that generates a bounded grid of (checkpoint × modifier) cells so users can compare how each model/style changes the output. Spends real Buzz per cell via the page money path (estimate → consent → submit → poll), with a concurrency-limited queue, a client-side cell cap, and a confirm-before-spend total-cost gate. The LoRA second axis submits checkpoint + LoRA pairings live; compatibility is deferred to the server (incompatible pairings are rejected pre-spend and shown as muted/blocked, costing 0).",
+  "type": "module",
+  "license": "MIT",
+  "scripts": {
+    "dev": "vite",
+    "dev:harness": "VITE_DEV_HARNESS=true vite --host localhost --port 5187",
+    "build": "tsc -p tsconfig.json --noEmit && vite build",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "@civitai/app-sdk": "^0.13.0",
+    "@civitai/blocks-react": "^0.9.0",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^25.9.1",
+    "@types/react": "^19.2.15",
+    "@types/react-dom": "^19.0.0",
+    "@vitejs/plugin-react": "^6.0.2",
+    "@vitest/coverage-v8": "4.1.9",
+    "jsdom": "^25.0.0",
+    "typescript": "^5.9.2",
+    "vite": "^8.0.14",
+    "vitest": "^4.1.7"
+  }
+}
