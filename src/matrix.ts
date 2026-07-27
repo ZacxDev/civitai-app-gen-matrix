@@ -4,7 +4,11 @@
 // concurrency limiting, insufficient-Buzz detection, dedup/idempotency) live in
 // one tested place.
 
-import type { BlockWorkflowSnapshot } from '@civitai/app-sdk/blocks';
+import type {
+  BlockWorkflowSnapshot,
+  BlockTextToImageParams,
+  WorkflowBodyTextToImage,
+} from '@civitai/app-sdk/blocks';
 import type { CheckpointOption, ModifierOption } from './models.js';
 
 // ---------------------------------------------------------------------------
@@ -95,18 +99,19 @@ export function buildCellBody(
   checkpoint: CheckpointOption,
   prompt: string,
   modifier?: ModifierOption,
-) {
-  const body: {
-    kind: 'textToImage';
-    modelId: number;
-    modelVersionId: number;
-    params: { prompt: string };
-    additionalResources?: Array<{ modelVersionId: number; strength: number }>;
-  } = {
-    kind: 'textToImage' as const,
+): WorkflowBodyTextToImage {
+  // 🔴 app-sdk 0.26 turned `WorkflowBody` into a discriminated union
+  // (WorkflowBodyTextToImage | WorkflowBodyCustomComfy, keyed by `kind`). Type
+  // the builder to the specific `textToImage` member so its variant-only fields
+  // (modelVersionId / params / additionalResources) stay readable and it remains
+  // assignable to the `WorkflowBody` that estimate()/submit() take — behavior-
+  // preserving, no logic change.
+  const params: BlockTextToImageParams = { prompt: clampPrompt(prompt.trim()) };
+  const body: WorkflowBodyTextToImage = {
+    kind: 'textToImage',
     modelId: checkpoint.modelId,
     modelVersionId: checkpoint.versionId,
-    params: { prompt: clampPrompt(prompt.trim()) },
+    params,
   };
   if (modifier?.loraVersionId != null) {
     body.additionalResources = [

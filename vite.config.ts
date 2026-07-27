@@ -21,9 +21,30 @@ export default defineConfig({
     rollupOptions: { output: { manualChunks: undefined } },
   },
   test: {
-    // Pure-logic unit tests run in node; the matrix/queue/cost/cap helpers
-    // don't touch the DOM.
-    environment: 'node',
-    include: ['src/**/*.test.ts'],
+    // Two suites in one `vitest run`:
+    //  - `node`: pure-logic unit tests (*.test.ts) — the matrix/queue/cost/cap +
+    //            catalog/ecosystem helpers; no DOM.
+    //  - `dom` : component a11y tests (*.test.tsx) — jsdom + testing-library,
+    //            asserting the design-system affordances (aria-pressed / role=
+    //            status / accessible names) so they can't regress silently.
+    projects: [
+      {
+        extends: true,
+        test: {
+          name: 'node',
+          environment: 'node',
+          include: ['src/**/*.test.ts'],
+        },
+      },
+      {
+        extends: true,
+        test: {
+          name: 'dom',
+          environment: 'jsdom',
+          include: ['src/**/*.test.tsx'],
+          setupFiles: ['./src/test-setup.ts'],
+        },
+      },
+    ],
   },
 });

@@ -1,17 +1,22 @@
 // In-block resource browser overlay (Pass 2) — the fast, visual, curated path.
 //
 // AUGMENTS the native host-chrome picker (kept as the "All resources" fallback).
-// This is an in-IFRAME panel (NOT the host modal): a searchable grid of model
-// cards backed by the PUBLIC REST endpoint (see catalog-api.ts), heavily cached
-// (catalog-cache.ts). Click a card → adds it to the matrix axis via the shared
-// models.ts mappers (dedup-safe).
+// This is an in-IFRAME panel (the design-system `<Modal>`): a searchable grid of
+// model cards backed by the PUBLIC REST endpoint (see catalog-api.ts), heavily
+// cached (catalog-cache.ts). Click a card → adds it to the matrix axis via the
+// shared models.ts mappers (dedup-safe).
 //
 // This component is deliberately THIN: every non-trivial decision (URL/params,
 // mapping, ecosystem filter + count, cache) lives in the pure node-tested
 // modules. The vitest env here is `node`-only, so the component is kept to a
 // minimum render + state shell and the logic is covered exhaustively elsewhere.
+//
+// UI: the design system — `@civitai/blocks-react/ui` components + `@civitai/theme`
+// `--civitai-*` tokens (zero hardcoded colors; light/dark via `[data-theme]`).
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+
+import { Alert, Badge, Button, Modal, TextInput } from '@civitai/blocks-react/ui';
 
 import {
   DEFAULT_LIMIT,
@@ -36,23 +41,7 @@ import {
   type EcosystemFamily,
 } from './ecosystem.js';
 import type { CheckpointOption, ModifierOption } from './models.js';
-
-// A minimal palette shape (mirrors App's Palette; passed in so the browser
-// respects the existing light/dark theme without re-deriving it).
-interface Palette {
-  bg: string;
-  fg: string;
-  cardBg: string;
-  border: string;
-  inputBg: string;
-  accent: string;
-  accentFg: string;
-  danger: string;
-  muted: string;
-  /** Optional shimmer tokens (App's palette provides them; harness-safe). */
-  skelBase?: string;
-  skelShine?: string;
-}
+import { elevate, metaText, mutedText, radius, token, type Palette } from './theme.js';
 
 const SEARCH_DEBOUNCE_MS = 300;
 
@@ -63,6 +52,7 @@ const SEARCH_DEBOUNCE_MS = 300;
 const defaultFetch: FetchLike = (url, init) => fetch(url, init);
 
 export interface ResourceBrowserProps {
+  /** The app-chrome palette (all `--civitai-*` var refs; theme-agnostic). */
   c: Palette;
   /** Which axis we're browsing. */
   type: 'Checkpoint' | 'LORA';
@@ -137,20 +127,21 @@ export function ResourceBrowser(props: ResourceBrowserProps) {
   const fetchFn = fetchImpl ?? defaultFetch;
   // A present token selects the authoritative (maturity-clamped) read; absent →
   // public anon. Normalize empty-string to null so the build agrees.
-  const token = blockToken && blockToken.length > 0 ? blockToken : null;
-  const expectAuthoritative = token != null;
+  const tokenStr = blockToken && blockToken.length > 0 ? blockToken : null;
+  const expectAuthoritative = tokenStr != null;
   // Anon advisory SFW filter from the domain ceiling. Fail-closed SFW: an absent
   // value (pre-init / pre-#2670 host) → SFW. Only the anon path reads this.
   const anonSfwOnly = domainIsSfw !== false;
 
-  // Modal a11y (light polish): focus the search input on open, close on Escape,
-  // restore focus to the trigger on unmount. Markup/behavior only.
+  // The pack `<Modal>` owns the backdrop + focus-restore. We DISABLE its
+  // Escape-to-close (closeOnEscape={false}) and keep a panel-level Escape handler
+  // instead, so the nested ecosystem popover can consume Escape (close just the
+  // popover) without the whole browser closing. Also focus the search on open.
   const panelRef = useRef<HTMLDivElement>(null);
   const searchRef = useRef<HTMLInputElement>(null);
   const onCloseRef = useRef(onClose);
   onCloseRef.current = onClose;
   useEffect(() => {
-    const previouslyFocused = document.activeElement as HTMLElement | null;
     searchRef.current?.focus();
     const onKeyDown = (e: KeyboardEvent) => {
       if (e.key === 'Escape') {
@@ -162,7 +153,6 @@ export function ResourceBrowser(props: ResourceBrowserProps) {
     node?.addEventListener('keydown', onKeyDown);
     return () => {
       node?.removeEventListener('keydown', onKeyDown);
-      if (previouslyFocused && document.contains(previouslyFocused)) previouslyFocused.focus();
     };
   }, []);
 
@@ -232,7 +222,7 @@ export function ResourceBrowser(props: ResourceBrowserProps) {
       try {
         res = await fetchCatalog(q, {
           fetch: fetchFn,
-          auth: { token },
+          auth: { token: tokenStr },
           anonSfwOnly,
           onFallback: (info) => {
             // Deploy-order resilience: the authoritative endpoint isn't live /
@@ -271,7 +261,7 @@ export function ResourceBrowser(props: ResourceBrowserProps) {
         setState({ kind: 'error', message: res.message });
       }
     },
-    [cache, fetchFn, isLora, checkpointBaseModels, token, expectAuthoritative, anonSfwOnly],
+    [cache, fetchFn, isLora, checkpointBaseModels, tokenStr, expectAuthoritative, anonSfwOnly],
   );
 
   useEffect(() => {
@@ -288,54 +278,34 @@ export function ResourceBrowser(props: ResourceBrowserProps) {
   );
 
   return (
-    <div
-      className="gm-backdrop"
-      aria-label={`Browse ${isLora ? 'LoRAs' : 'checkpoints'}`}
-      style={overlay(c)}
-      onMouseDown={(e) => {
-        if (e.target === e.currentTarget) onClose();
-      }}
+    <Modal
+      opened
+      onClose={onClose}
+      title={isLora ? 'Browse LoRAs' : 'Browse checkpoints'}
+      size="lg"
+      closeOnEscape={false}
     >
-      <div ref={panelRef} role="dialog" aria-modal="true" className="gm-dialog-enter" style={panel(c)}>
-        <div style={headerRow}>
-          <strong style={{ fontSize: 16 }}>{isLora ? 'Browse LoRAs' : 'Browse checkpoints'}</strong>
-          <button
-            type="button"
-            onClick={onClose}
-            style={closeBtn(c)}
-            className="gm-chip"
-            data-testid="gm-browse-close"
-          >
-            Close
-          </button>
-        </div>
-
-        <input
+      <div ref={panelRef} style={{ display: 'grid', gap: 12 }} aria-label={`Browse ${isLora ? 'LoRAs' : 'checkpoints'}`}>
+        <TextInput
           ref={searchRef}
           type="search"
           value={rawQuery}
           placeholder={isLora ? 'Search LoRAs…' : 'Search checkpoints…'}
           aria-label={`Search ${isLora ? 'LoRAs' : 'checkpoints'}`}
           onChange={(e) => setRawQuery(e.target.value)}
-          style={searchInput(c)}
           data-testid="gm-browse-search"
         />
 
-        <EcosystemMultiselect
-          c={c}
-          selected={explicitFamilies}
-          onAdd={addFamily}
-          onRemove={removeFamily}
-        />
+        <EcosystemMultiselect selected={explicitFamilies} onAdd={addFamily} onRemove={removeFamily} />
 
         {isLora && usingImplicit && compatibleCount != null && state.kind === 'ok' && (
-          <p style={{ ...note(c), margin: 0 }} role="status">
+          <p style={mutedText} role="status">
             <strong>{compatibleCount}</strong> compatible {compatLabel}
             {mixedEcosystems && ' · mixed ecosystems selected'}
           </p>
         )}
 
-        <div style={gridScroll}>
+        <div style={{ overflowY: 'auto', minHeight: 120, maxHeight: '52dvh' }}>
           {state.kind === 'loading' && <SkeletonGrid c={c} />}
           {state.kind === 'empty' && (
             <EmptyOrError
@@ -369,18 +339,13 @@ export function ResourceBrowser(props: ResourceBrowserProps) {
           )}
         </div>
 
-        <div style={footerRow(c)}>
-          <button
-            type="button"
-            onClick={onOpenNativePicker}
-            style={linkBtn(c)}
-            data-testid="gm-browse-native"
-          >
+        <div style={{ borderTop: `1px solid ${token.border}`, paddingTop: 10 }}>
+          <Button variant="subtle" size="sm" onClick={onOpenNativePicker} data-testid="gm-browse-native">
             Browse all resources (full picker)
-          </button>
+          </Button>
         </div>
       </div>
-    </div>
+    </Modal>
   );
 }
 
@@ -393,12 +358,10 @@ export function ResourceBrowser(props: ResourceBrowserProps) {
  * stops propagation so the browser overlay's Escape handler doesn't also fire).
  */
 function EcosystemMultiselect({
-  c,
   selected,
   onAdd,
   onRemove,
 }: {
-  c: Palette;
   selected: readonly EcosystemFamily[];
   onAdd: (fam: EcosystemFamily) => void;
   onRemove: (fam: EcosystemFamily) => void;
@@ -436,38 +399,39 @@ function EcosystemMultiselect({
 
   return (
     <div ref={wrapRef} style={{ position: 'relative', display: 'grid', gap: 6 }}>
-      <div style={ecoControlRow}>
-        <button
-          type="button"
+      <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, alignItems: 'center' }}>
+        <Button
+          variant="outline"
+          size="sm"
           onClick={() => setOpen((o) => !o)}
           aria-haspopup="listbox"
           aria-expanded={open}
-          style={ecoTrigger(c)}
-          className="gm-chip"
+          rightSection={<span aria-hidden>▾</span>}
           data-testid="gm-eco-trigger"
         >
           {selected.length ? `Ecosystems · ${selected.length}` : 'Filter by ecosystem'}
-          <span aria-hidden style={{ marginLeft: 6, opacity: 0.7 }}>▾</span>
-        </button>
+        </Button>
         {selected.map((fam) => (
-          <span key={fam} style={ecoPill(c)} data-testid="gm-eco-pill">
-            {familyLabel(fam)}
-            <button
-              type="button"
-              onClick={() => onRemove(fam)}
-              aria-label={`Remove ${familyLabel(fam)}`}
-              style={ecoPillX(c)}
-              data-testid="gm-eco-pill-remove"
-            >
-              ×
-            </button>
-          </span>
+          <Badge key={fam} variant="filled" size="md" data-testid="gm-eco-pill">
+            <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
+              {familyLabel(fam)}
+              <button
+                type="button"
+                onClick={() => onRemove(fam)}
+                aria-label={`Remove ${familyLabel(fam)}`}
+                style={ecoPillX}
+                data-testid="gm-eco-pill-remove"
+              >
+                ×
+              </button>
+            </span>
+          </Badge>
         ))}
       </div>
 
       {open && (
-        <div style={ecoPopover(c)} role="listbox" aria-label="Ecosystems" data-testid="gm-eco-popover">
-          <input
+        <div style={ecoPopover} role="listbox" aria-label="Ecosystems" data-testid="gm-eco-popover">
+          <TextInput
             type="search"
             autoFocus
             value={filter}
@@ -484,12 +448,11 @@ function EcosystemMultiselect({
                 pick(visible[0].family);
               }
             }}
-            style={ecoSearch(c)}
             data-testid="gm-eco-search"
           />
-          <div style={ecoOptionList}>
+          <div style={{ display: 'grid', gap: 2, maxHeight: 200, overflowY: 'auto' }}>
             {visible.length === 0 ? (
-              <span style={{ ...note(c), padding: '6px 4px' }}>No ecosystems</span>
+              <span style={{ ...mutedText, padding: '6px 4px' }}>No ecosystems</span>
             ) : (
               visible.map((o) => (
                 <button
@@ -498,8 +461,8 @@ function EcosystemMultiselect({
                   role="option"
                   aria-selected={false}
                   onClick={() => pick(o.family)}
-                  style={ecoOption(c)}
-                  className="gm-chip"
+                  style={ecoOption}
+                  className="gm-eco-option"
                   data-testid="gm-eco-option"
                 >
                   {o.label}
@@ -513,7 +476,7 @@ function EcosystemMultiselect({
   );
 }
 
-function CardTile({
+export function CardTile({
   c,
   card,
   added,
@@ -532,7 +495,7 @@ function CardTile({
       aria-pressed={added}
       title={`${card.modelName}${card.versionName ? ` — ${card.versionName}` : ''} (${card.baseModel || 'unknown base'})`}
       style={tile(c, added)}
-      className={added ? undefined : 'gm-chip'}
+      className="gm-card-tile"
       data-testid="gm-browse-card"
     >
       <div style={thumbWrap(c)}>
@@ -547,10 +510,16 @@ function CardTile({
         ) : (
           <span style={{ color: c.muted, fontSize: 11 }}>no preview</span>
         )}
-        {added && <span style={addedBadge(c)}>Added</span>}
+        {added && (
+          <span style={{ position: 'absolute', top: 4, right: 4 }}>
+            <Badge size="sm" color="success">
+              Added
+            </Badge>
+          </span>
+        )}
       </div>
       <span style={tileName(c)}>{card.modelName}</span>
-      <span style={{ fontSize: 10, color: c.muted }}>{card.baseModel || '—'}</span>
+      <span style={metaText}>{card.baseModel || '—'}</span>
     </button>
   );
 }
@@ -559,8 +528,8 @@ function SkeletonGrid({ c }: { c: Palette }) {
   // Shimmer tokens (fall back to neutral translucent grays if a caller's
   // palette lacks them — e.g. the harness's minimal palette).
   const skelVars: React.CSSProperties = {
-    ['--gm-skel-base' as string]: c.skelBase ?? 'rgba(128,128,128,0.10)',
-    ['--gm-skel-shine' as string]: c.skelShine ?? 'rgba(128,128,128,0.22)',
+    ['--gm-skel-base' as string]: c.skelBase ?? elevate(4),
+    ['--gm-skel-shine' as string]: c.skelShine ?? elevate(9),
   };
   return (
     <div style={cardGrid} aria-hidden data-testid="gm-browse-skeleton">
@@ -569,11 +538,11 @@ function SkeletonGrid({ c }: { c: Palette }) {
           <div className="gm-skeleton" style={{ ...thumbWrap(c), background: c.inputBg, ...skelVars }} />
           <div
             className="gm-skeleton"
-            style={{ height: 10, background: c.inputBg, borderRadius: 4, width: '80%', ...skelVars }}
+            style={{ height: 10, background: c.inputBg, borderRadius: radius.sm, width: '80%', ...skelVars }}
           />
           <div
             className="gm-skeleton"
-            style={{ height: 8, background: c.inputBg, borderRadius: 4, width: '50%', ...skelVars }}
+            style={{ height: 8, background: c.inputBg, borderRadius: radius.sm, width: '50%', ...skelVars }}
           />
         </div>
       ))}
@@ -595,86 +564,26 @@ function EmptyOrError({
   onNative: () => void;
 }) {
   return (
-    <div style={{ display: 'grid', gap: 10, placeItems: 'center', padding: 24, textAlign: 'center' }}>
-      <strong style={{ fontSize: 14 }}>{title}</strong>
-      <span style={{ ...note(c) }}>{detail}</span>
-      <div style={{ display: 'flex', gap: 8 }}>
-        {onRetry && (
-          <button type="button" onClick={onRetry} style={smallPrimary(c)} data-testid="gm-browse-retry">
-            Retry
-          </button>
-        )}
-        <button type="button" onClick={onNative} style={linkBtn(c)}>
-          Use full picker
-        </button>
+    <Alert color={onRetry ? 'error' : 'info'} title={title}>
+      <div style={{ display: 'grid', gap: 12, justifyItems: 'start' }}>
+        <span style={mutedText}>{detail}</span>
+        <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+          {onRetry && (
+            <Button size="sm" color={c.danger ? 'error' : 'primary'} onClick={onRetry} data-testid="gm-browse-retry">
+              Retry
+            </Button>
+          )}
+          <Button variant="subtle" size="sm" onClick={onNative}>
+            Use full picker
+          </Button>
+        </div>
       </div>
-    </div>
+    </Alert>
   );
 }
 
-// ---- inline styles (host can't inject CSS into the iframe) ----
+// ---- inline styles (token-based; the pack covers the controls) ----
 
-function overlay(c: Palette): React.CSSProperties {
-  return {
-    position: 'fixed',
-    inset: 0,
-    background: 'rgba(0,0,0,0.45)',
-    display: 'grid',
-    placeItems: 'center',
-    padding: 16,
-    zIndex: 50,
-    boxSizing: 'border-box',
-    color: c.fg,
-  };
-}
-function panel(c: Palette): React.CSSProperties {
-  return {
-    background: c.bg,
-    border: `1px solid ${c.border}`,
-    borderRadius: 12,
-    width: '100%',
-    maxWidth: 640,
-    maxHeight: '85dvh',
-    display: 'grid',
-    // header · search · ecosystem-multiselect · compat-note · grid(1fr) · footer.
-    // The compat-note is conditionally rendered; `auto` tracks collapse to 0 when
-    // their child is absent, so the explicit count here is an upper bound.
-    gridTemplateRows: 'auto auto auto auto 1fr auto',
-    gap: 10,
-    padding: 16,
-    boxSizing: 'border-box',
-  };
-}
-const headerRow: React.CSSProperties = {
-  display: 'flex',
-  justifyContent: 'space-between',
-  alignItems: 'center',
-};
-function closeBtn(c: Palette): React.CSSProperties {
-  return {
-    border: `1px solid ${c.border}`,
-    background: 'transparent',
-    color: c.fg,
-    borderRadius: 8,
-    padding: '6px 12px',
-    fontSize: 13,
-    fontWeight: 600,
-    cursor: 'pointer',
-  };
-}
-function searchInput(c: Palette): React.CSSProperties {
-  return {
-    padding: '10px 12px',
-    borderRadius: 8,
-    border: `1px solid ${c.border}`,
-    background: c.inputBg,
-    color: c.fg,
-    fontSize: 14,
-    width: '100%',
-    boxSizing: 'border-box',
-  };
-}
-const gridScroll: React.CSSProperties = { overflowY: 'auto', minHeight: 120 };
 const cardGrid: React.CSSProperties = {
   display: 'grid',
   gridTemplateColumns: 'repeat(auto-fill, minmax(120px, 1fr))',
@@ -686,36 +595,22 @@ function tile(c: Palette, added: boolean): React.CSSProperties {
     gap: 4,
     padding: 6,
     border: `1px solid ${added ? c.accent : c.border}`,
-    borderRadius: 8,
+    borderRadius: radius.md,
     background: c.cardBg,
     color: c.fg,
     textAlign: 'left',
     cursor: added ? 'default' : 'pointer',
-    opacity: added ? 0.7 : 1,
   };
 }
 function thumbWrap(c: Palette): React.CSSProperties {
   return {
     position: 'relative',
     aspectRatio: '1 / 1',
-    borderRadius: 6,
+    borderRadius: radius.md,
     overflow: 'hidden',
     background: c.inputBg,
     display: 'grid',
     placeItems: 'center',
-  };
-}
-function addedBadge(c: Palette): React.CSSProperties {
-  return {
-    position: 'absolute',
-    top: 4,
-    right: 4,
-    background: c.accent,
-    color: c.accentFg,
-    fontSize: 10,
-    fontWeight: 700,
-    borderRadius: 4,
-    padding: '2px 6px',
   };
 }
 function tileName(c: Palette): React.CSSProperties {
@@ -728,128 +623,41 @@ function tileName(c: Palette): React.CSSProperties {
     whiteSpace: 'nowrap',
   };
 }
-function footerRow(c: Palette): React.CSSProperties {
-  return { borderTop: `1px solid ${c.border}`, paddingTop: 10 };
-}
-function linkBtn(c: Palette): React.CSSProperties {
-  return {
-    background: 'transparent',
-    border: 'none',
-    color: c.accent,
-    fontSize: 13,
-    fontWeight: 600,
-    cursor: 'pointer',
-    padding: 0,
-    textDecoration: 'underline',
-  };
-}
-function smallPrimary(c: Palette): React.CSSProperties {
-  return {
-    background: c.accent,
-    color: c.accentFg,
-    border: 'none',
-    borderRadius: 8,
-    padding: '8px 14px',
-    fontSize: 13,
-    fontWeight: 700,
-    cursor: 'pointer',
-  };
-}
-function note(c: Palette): React.CSSProperties {
-  return { fontSize: 13, color: c.muted, lineHeight: 1.5 };
-}
 
 // ---- ecosystem multiselect styles ----
 
-const ecoControlRow: React.CSSProperties = {
-  display: 'flex',
-  flexWrap: 'wrap',
-  gap: 6,
-  alignItems: 'center',
+const ecoPillX: React.CSSProperties = {
+  background: 'transparent',
+  border: 'none',
+  color: 'currentColor',
+  cursor: 'pointer',
+  fontSize: 14,
+  lineHeight: 1,
+  padding: '0 2px',
+  fontWeight: 700,
 };
-function ecoTrigger(c: Palette): React.CSSProperties {
-  return {
-    border: `1px solid ${c.border}`,
-    background: c.inputBg,
-    color: c.fg,
-    borderRadius: 8,
-    padding: '6px 10px',
-    fontSize: 12,
-    fontWeight: 600,
-    cursor: 'pointer',
-    display: 'inline-flex',
-    alignItems: 'center',
-  };
-}
-function ecoPill(c: Palette): React.CSSProperties {
-  return {
-    display: 'inline-flex',
-    alignItems: 'center',
-    gap: 4,
-    background: c.accent,
-    color: c.accentFg,
-    borderRadius: 999,
-    padding: '3px 6px 3px 10px',
-    fontSize: 12,
-    fontWeight: 600,
-  };
-}
-function ecoPillX(c: Palette): React.CSSProperties {
-  return {
-    background: 'transparent',
-    border: 'none',
-    color: c.accentFg,
-    cursor: 'pointer',
-    fontSize: 14,
-    lineHeight: 1,
-    padding: '0 2px',
-    fontWeight: 700,
-  };
-}
-function ecoPopover(c: Palette): React.CSSProperties {
-  return {
-    position: 'absolute',
-    top: '100%',
-    left: 0,
-    marginTop: 4,
-    zIndex: 60,
-    width: 'min(260px, 90%)',
-    background: c.bg,
-    border: `1px solid ${c.border}`,
-    borderRadius: 8,
-    padding: 8,
-    display: 'grid',
-    gap: 6,
-    boxShadow: '0 8px 24px rgba(0,0,0,0.25)',
-  };
-}
-function ecoSearch(c: Palette): React.CSSProperties {
-  return {
-    padding: '7px 10px',
-    borderRadius: 6,
-    border: `1px solid ${c.border}`,
-    background: c.inputBg,
-    color: c.fg,
-    fontSize: 13,
-    width: '100%',
-    boxSizing: 'border-box',
-  };
-}
-const ecoOptionList: React.CSSProperties = {
+const ecoPopover: React.CSSProperties = {
+  position: 'absolute',
+  top: '100%',
+  left: 0,
+  marginTop: 4,
+  zIndex: 60,
+  width: 'min(260px, 90%)',
+  background: token.surface,
+  border: `1px solid ${token.border}`,
+  borderRadius: radius.md,
+  padding: 8,
   display: 'grid',
-  gap: 2,
-  maxHeight: 200,
-  overflowY: 'auto',
+  gap: 6,
+  boxShadow: `0 8px 24px ${elevate(20)}`,
 };
-function ecoOption(c: Palette): React.CSSProperties {
-  return {
-    textAlign: 'left',
-    background: 'transparent',
-    border: 'none',
-    color: c.fg,
-    borderRadius: 6,
-    padding: '7px 8px',
-    fontSize: 13,
-    cursor: 'pointer',
-  };
-}
+const ecoOption: React.CSSProperties = {
+  textAlign: 'left',
+  background: 'transparent',
+  border: 'none',
+  color: token.text,
+  borderRadius: radius.sm,
+  padding: '7px 8px',
+  fontSize: 13,
+  cursor: 'pointer',
+};
