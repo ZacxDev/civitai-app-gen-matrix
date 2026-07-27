@@ -11,7 +11,17 @@ import {
   useRequestSignIn,
   useResourcePicker,
 } from '@civitai/blocks-react';
-import type { BlockWorkflowSnapshot } from '@civitai/app-sdk/blocks';
+import {
+  Alert,
+  Badge,
+  Button,
+  Card,
+  Group,
+  Modal,
+  Stack,
+  Textarea,
+} from '@civitai/blocks-react/ui';
+import type { BlockWorkflowSnapshot, WorkflowBodyTextToImage } from '@civitai/app-sdk/blocks';
 
 import {
   CHECKPOINTS,
@@ -60,6 +70,17 @@ import { ResourceBrowser } from './ResourceBrowser.js';
 import { CatalogCache, defaultKvStore } from './catalog-cache.js';
 import { DEFAULT_LIMIT, fetchCatalog, type CatalogQuery } from './catalog-api.js';
 import { loraBaseModelFilter } from './ecosystem.js';
+import {
+  elevate,
+  metaText,
+  mutedText,
+  pageStyle,
+  palette,
+  radius,
+  token,
+  contentStyle,
+  type Palette,
+} from './theme.js';
 
 /**
  * Stable empty-array identity for ResourceBrowser's `checkpointBaseModels` prop
@@ -87,83 +108,14 @@ const EMPTY_BASE_MODELS: readonly (string | undefined)[] = [];
  * Money safety: a client-side cell cap (MAX_CELLS) + a confirm-before-spend
  * total-cost gate + a concurrency-limited queue. All the load-bearing decisions
  * live in the unit-tested matrix.ts; this component is a thin async driver.
- */
-/**
- * Make a dialog a real modal: move focus into it on open, trap Tab/Shift+Tab
- * inside it, close on Escape, and restore focus to whatever was focused before
- * (the trigger) on close. Markup/behavior only — no money/queue logic.
  *
- * @param ref      the dialog container
- * @param active   whether the dialog is mounted/open
- * @param onClose  called on Escape (cancel)
+ * UI: the design system — `@civitai/blocks-react/ui` components + `@civitai/theme`
+ * `--civitai-*` tokens (light/dark driven by the `[data-theme]` the host sets on
+ * the block root; zero hardcoded colors, no JS light/dark boolean).
  */
-function useModalA11y(
-  ref: React.RefObject<HTMLElement | null>,
-  active: boolean,
-  onClose: () => void,
-) {
-  // Keep the latest onClose without re-binding listeners every render.
-  const onCloseRef = useRef(onClose);
-  onCloseRef.current = onClose;
-
-  useEffect(() => {
-    if (!active) return;
-    const node = ref.current;
-    if (!node) return;
-    const previouslyFocused = document.activeElement as HTMLElement | null;
-
-    const focusables = () =>
-      Array.from(
-        node.querySelectorAll<HTMLElement>(
-          'a[href], button:not([disabled]), textarea:not([disabled]), input:not([disabled]), select:not([disabled]), [tabindex]:not([tabindex="-1"])',
-        ),
-      ).filter((el) => el.offsetParent !== null || el === document.activeElement);
-
-    // Focus the primary action (or the dialog itself) on open.
-    const initial =
-      node.querySelector<HTMLElement>('[data-autofocus]') ?? focusables()[0] ?? node;
-    initial.focus();
-
-    const onKeyDown = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') {
-        e.preventDefault();
-        onCloseRef.current();
-        return;
-      }
-      if (e.key !== 'Tab') return;
-      const items = focusables();
-      if (items.length === 0) {
-        e.preventDefault();
-        return;
-      }
-      const first = items[0];
-      const last = items[items.length - 1];
-      const activeEl = document.activeElement as HTMLElement | null;
-      if (e.shiftKey) {
-        if (activeEl === first || !node.contains(activeEl)) {
-          e.preventDefault();
-          last.focus();
-        }
-      } else if (activeEl === last || !node.contains(activeEl)) {
-        e.preventDefault();
-        first.focus();
-      }
-    };
-
-    node.addEventListener('keydown', onKeyDown);
-    return () => {
-      node.removeEventListener('keydown', onKeyDown);
-      // Restore focus to the trigger on close (if it's still in the DOM).
-      if (previouslyFocused && document.contains(previouslyFocused)) {
-        previouslyFocused.focus();
-      }
-    };
-  }, [active, ref]);
-}
-
 export function App() {
   const { ready, viewer, theme } = useBlockContext();
-  const token = useBlockToken();
+  const token$ = useBlockToken();
   // The block's domain maturity ceiling (fail-closed SFW). Threaded into the
   // anon catalog read so a red-domain block's anon browse can show mature while
   // green/blue stay SFW. The token (signed-in) path ignores it — server clamps.
@@ -174,10 +126,11 @@ export function App() {
   const { openPurchaseModal } = useBuzzPurchase();
   const { open: openResourcePicker } = useResourcePicker();
 
-  const isDark = theme === 'dark';
-  const c = palette(isDark);
+  // The app-chrome palette — every value is a `--civitai-*` var reference, so
+  // light/dark is resolved by CSS off the `[data-theme]` root, not a JS boolean.
+  const c = palette();
   const anon = ready && !viewer;
-  const granted = hasBudgetedScope(token.scopes);
+  const granted = hasBudgetedScope(token$.scopes);
 
   const rootRef = useRef<HTMLDivElement>(null);
   useBlockResize(rootRef);
@@ -433,7 +386,7 @@ export function App() {
   // cells run (concurrency limit), this just executes one.
   const runCell = useCallback(async (cell: MatrixCell) => {
     const { estimate: est, submit: sub } = fns.current;
-    const body = buildCellBody(cell.checkpoint, cell.prompt, cell.modifier);
+    const body: WorkflowBodyTextToImage = buildCellBody(cell.checkpoint, cell.prompt, cell.modifier);
 
     // 1) Estimate (best-effort; failed estimate doesn't block submit). The
     //    first estimate to land seeds the per-cell estimate for the confirm
@@ -654,7 +607,7 @@ export function App() {
   // ---- Render ----
   if (!ready) {
     return (
-      <div ref={rootRef} data-theme={isDark ? 'dark' : 'light'} style={pageStyle(c)}>
+      <div ref={rootRef} data-theme={theme || 'light'} style={pageStyle(c)}>
         <LoadingSkeleton c={c} />
       </div>
     );
@@ -674,16 +627,9 @@ export function App() {
     state.cells.some((cell) => cell.status === 'failed' || cell.status === 'insufficient');
 
   return (
-    <div ref={rootRef} data-theme={isDark ? 'dark' : 'light'} style={pageStyle(c)}>
-      <div style={contentStyle()}>
-        <header style={{ display: 'grid', gap: 8 }}>
-          <h1 style={{ fontSize: 24, margin: 0 }}>Gen Matrix</h1>
-          <p style={{ fontSize: 15, opacity: 0.85, margin: 0, lineHeight: 1.45, fontWeight: 600 }}>
-            Same prompt, every model × style — side by side.
-          </p>
-          {inBuild && <p style={{ ...noteStyle(c), margin: 0 }}>{perCellBudgetCopy()}</p>}
-          {inBuild && <FirstRunExample c={c} />}
-        </header>
+    <div ref={rootRef} data-theme={theme || 'light'} style={pageStyle(c)}>
+      <div style={contentStyle}>
+        <AppHeader inBuild={inBuild} />
 
         {inBuild && (
           <BuildPanel
@@ -714,7 +660,7 @@ export function App() {
             c={c}
             type={browse}
             cache={cacheRef.current}
-            blockToken={token.raw}
+            blockToken={token$.raw}
             domainIsSfw={domainIsSfw}
             onClose={closeBrowse}
             checkpointBaseModels={browse === 'LORA' ? selectedCkptBaseModels : EMPTY_BASE_MODELS}
@@ -731,7 +677,6 @@ export function App() {
 
         {showConfirm && (
           <ConfirmPanel
-            c={c}
             cells={state.cells}
             label={confirmLabel}
             phase={state.phase}
@@ -755,17 +700,81 @@ export function App() {
         )}
 
         {anyInsufficient && (
-          <div style={{ display: 'grid', gap: 6 }}>
-            <p style={noteStyle(c)}>
-              Some cells ran out of Buzz. Top up and run again to fill them.
-            </p>
-            <button type="button" onClick={handleTopUp} style={primaryBtn(c)} data-testid="gm-topup">
-              Top up Buzz
-            </button>
-          </div>
+          <Alert color="warning" title="Some cells ran out of Buzz">
+            <Stack gap={10} align="flex-start">
+              <span style={mutedText}>Top up and run again to fill them.</span>
+              <Button color="warning" onClick={handleTopUp} data-testid="gm-topup">
+                Top up Buzz
+              </Button>
+            </Stack>
+          </Alert>
         )}
       </div>
     </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Header — brand mark + title + hairline divider
+// ---------------------------------------------------------------------------
+
+/**
+ * A tinted `radius.md` brand tile with the manifest `bolt` glyph (primary on
+ * primary-light), the title, and a hairline `borderBottom` divider — the visual
+ * identity anchor the design-system polish calls for.
+ */
+function AppHeader({ inBuild }: { inBuild: boolean }) {
+  return (
+    <header
+      style={{
+        display: 'grid',
+        gap: 10,
+        paddingBottom: 14,
+        borderBottom: `1px solid ${token.border}`,
+      }}
+    >
+      <Group gap={12} wrap={false} align="center">
+        <span
+          aria-hidden
+          style={{
+            flex: 'none',
+            display: 'grid',
+            placeItems: 'center',
+            width: 40,
+            height: 40,
+            borderRadius: radius.md,
+            background: token.primaryLight,
+            color: token.primary,
+          }}
+        >
+          <BoltGlyph />
+        </span>
+        <div style={{ display: 'grid', gap: 2, minWidth: 0 }}>
+          <h1 style={{ fontSize: 19, margin: 0, letterSpacing: '-0.01em', lineHeight: 1.15 }}>
+            Gen Matrix
+          </h1>
+          <p style={metaText}>Same prompt, every model × style — side by side.</p>
+        </div>
+      </Group>
+      {inBuild && (
+        <Group gap={10} align="center">
+          <Badge variant="light" size="sm">
+            budgeted
+          </Badge>
+          <span style={metaText}>{perCellBudgetCopy()}</span>
+        </Group>
+      )}
+      {inBuild && <FirstRunExample />}
+    </header>
+  );
+}
+
+/** The manifest `bolt` icon as an inline glyph (inherits `currentColor`). */
+function BoltGlyph() {
+  return (
+    <svg width={22} height={22} viewBox="0 0 24 24" aria-hidden focusable="false">
+      <path d="M13 2 4 14h6l-1 8 9-12h-6l1-8Z" fill="currentColor" />
+    </svg>
   );
 }
 
@@ -832,101 +841,85 @@ function BuildPanel(props: {
           : `Over the ${MAX_CELLS}-cell limit — deselect some to continue.`;
 
   return (
-    <>
-      <div style={{ display: 'grid', gap: 6 }}>
-        <label htmlFor="gm-prompt" style={{ fontSize: 13, fontWeight: 600 }}>
-          Shared prompt
-        </label>
-        <textarea
-          id="gm-prompt"
-          value={prompt}
-          maxLength={PROMPT_MAX}
-          placeholder="a serene mountain lake at golden hour, highly detailed"
-          onChange={(e) => setPrompt(e.target.value)}
-          aria-label="Shared generation prompt"
-          rows={3}
-          style={textareaStyle(c)}
-        />
-      </div>
+    <Stack gap={18}>
+      <Textarea
+        id="gm-prompt"
+        label="Shared prompt"
+        value={prompt}
+        maxLength={PROMPT_MAX}
+        placeholder="a serene mountain lake at golden hour, highly detailed"
+        onChange={(e) => setPrompt(e.target.value)}
+        aria-label="Shared generation prompt"
+        minRows={3}
+      />
 
-      <fieldset style={fieldsetStyle(c)}>
-        <legend style={legendStyle}>Checkpoints (rows)</legend>
-        <div style={chipRow}>
-          {checkpoints.map((ckpt: CheckpointOption) => (
-            <Chip
-              key={ckpt.versionId}
-              c={c}
-              label={ckpt.label}
-              selected={selectedCkpts.has(ckpt.versionId)}
-              onToggle={() => toggleCkpt(ckpt.versionId)}
-            />
-          ))}
-          <button
-            type="button"
-            onClick={onBrowseCheckpoint}
-            style={browseBtn(c)}
-            className="gm-chip"
-            data-testid="gm-browse-checkpoint"
-          >
-            Browse checkpoints
-          </button>
-          <button
-            type="button"
-            onClick={onPickCheckpoint}
-            disabled={picking}
-            style={pickBtn(c, picking)}
-            className="gm-chip"
-            data-testid="gm-pick-checkpoint"
-          >
-            + All resources
-          </button>
-        </div>
-      </fieldset>
+      <AxisFieldset legend="Checkpoints (rows)">
+        {checkpoints.map((ckpt: CheckpointOption) => (
+          <Chip
+            key={ckpt.versionId}
+            label={ckpt.label}
+            selected={selectedCkpts.has(ckpt.versionId)}
+            onToggle={() => toggleCkpt(ckpt.versionId)}
+          />
+        ))}
+        <Button
+          variant="light"
+          size="sm"
+          onClick={onBrowseCheckpoint}
+          data-testid="gm-browse-checkpoint"
+        >
+          Browse checkpoints
+        </Button>
+        <Button
+          variant="subtle"
+          size="sm"
+          onClick={onPickCheckpoint}
+          loading={picking}
+          leftSection={<span aria-hidden>+</span>}
+          data-testid="gm-pick-checkpoint"
+        >
+          All resources
+        </Button>
+      </AxisFieldset>
 
-      <fieldset style={fieldsetStyle(c)}>
-        <legend style={legendStyle}>Styles (columns)</legend>
-        <div style={chipRow}>
-          {modifiers.map((m: ModifierOption) => (
-            <Chip
-              key={m.key}
-              c={c}
-              label={m.label}
-              selected={selectedMods.has(m.key)}
-              isLora={m.loraVersionId != null}
-              onToggle={() => toggleMod(m.key)}
-            />
-          ))}
-          <button
-            type="button"
-            onClick={onBrowseLora}
-            style={browseBtn(c)}
-            className="gm-chip"
-            data-testid="gm-browse-lora"
-          >
-            Browse LoRAs
-          </button>
-          <button
-            type="button"
-            onClick={onPickLora}
-            disabled={picking}
-            style={pickBtn(c, picking)}
-            className="gm-chip"
-            data-testid="gm-pick-lora"
-          >
-            + All resources
-          </button>
-        </div>
-        <p style={{ ...noteStyle(c), marginTop: 8 }}>
-          <LoraGlyph c={c} /> = a LoRA column (generates as an extra resource on the checkpoint,
-          and may cost a little more). Civitai checks each LoRA × checkpoint pairing — an
-          incompatible one shows as <em>incompatible</em> and costs nothing.
-        </p>
-      </fieldset>
+      <AxisFieldset legend="Styles (columns)">
+        {modifiers.map((m: ModifierOption) => (
+          <Chip
+            key={m.key}
+            label={m.label}
+            selected={selectedMods.has(m.key)}
+            isLora={m.loraVersionId != null}
+            onToggle={() => toggleMod(m.key)}
+          />
+        ))}
+        <Button variant="light" size="sm" onClick={onBrowseLora} data-testid="gm-browse-lora">
+          Browse LoRAs
+        </Button>
+        <Button
+          variant="subtle"
+          size="sm"
+          onClick={onPickLora}
+          loading={picking}
+          leftSection={<span aria-hidden>+</span>}
+          data-testid="gm-pick-lora"
+        >
+          All resources
+        </Button>
+      </AxisFieldset>
 
-      <div
+      <p style={mutedText}>
+        <LoraGlyph /> = a LoRA column (generates as an extra resource on the checkpoint, and may
+        cost a little more). Civitai checks each LoRA × checkpoint pairing — an incompatible one
+        shows as <em>incompatible</em> and costs nothing.
+      </p>
+
+      <Card
+        withBorder
+        padding="sm"
         role="status"
         style={{
-          ...summaryBox(c),
+          fontSize: 14,
+          fontVariantNumeric: 'tabular-nums',
           borderColor: over ? c.danger : c.border,
           color: over ? c.danger : c.fg,
         }}
@@ -935,91 +928,78 @@ function BuildPanel(props: {
           {billable} of {MAX_CELLS}
         </strong>{' '}
         cell{billable === 1 ? '' : 's'} · <strong>{previewLabel.amount}</strong> Buzz
-        {previewLabel.isCeiling && (
-          <span style={{ opacity: 0.7 }}> max — real cost is usually far less</span>
-        )}
-        {over && (
-          <>
-            {' '}
-            — over the {MAX_CELLS}-cell limit. Deselect some to continue.
-          </>
-        )}
-      </div>
+        {previewLabel.isCeiling && <span style={metaText}> max — real cost is usually far less</span>}
+        {over && <> — over the {MAX_CELLS}-cell limit. Deselect some to continue.</>}
+      </Card>
 
-      <div style={{ display: 'grid', gap: 6 }}>
-        <button
-          type="button"
+      <Stack gap={6}>
+        <Button
+          fullWidth
+          size="lg"
           onClick={onGenerate}
           disabled={disabled}
-          style={primaryBtn(c, disabled)}
-          className="gm-chip"
           aria-describedby={disabledReason ? 'gm-generate-reason' : undefined}
           data-testid={anon ? 'gm-signin' : 'gm-generate'}
         >
           {anon
             ? 'Sign in to generate'
             : `Generate Matrix · ${billable} cell${billable === 1 ? '' : 's'}`}
-        </button>
+        </Button>
         {disabledReason && (
           <p
             id="gm-generate-reason"
             role="status"
-            style={{ ...noteStyle(c), textAlign: 'center', margin: 0 }}
+            style={{ ...metaText, textAlign: 'center' }}
             data-testid="gm-generate-reason"
           >
             {disabledReason}
           </p>
         )}
-      </div>
-    </>
+      </Stack>
+    </Stack>
+  );
+}
+
+/** A token-styled fieldset wrapping a wrapping chip row (semantic grouping). */
+function AxisFieldset({ legend, children }: { legend: string; children: React.ReactNode }) {
+  return (
+    <fieldset
+      style={{
+        border: `1px solid ${token.border}`,
+        borderRadius: radius.md,
+        padding: 12,
+        margin: 0,
+      }}
+    >
+      <legend style={{ fontSize: 13, fontWeight: 700, padding: '0 6px' }}>{legend}</legend>
+      <Group gap={8}>{children}</Group>
+    </fieldset>
   );
 }
 
 // ---------------------------------------------------------------------------
-// Confirm panel — explicit spend gate
+// Confirm panel — explicit spend gate (design-system Modal)
 // ---------------------------------------------------------------------------
 
 function ConfirmPanel(props: {
-  c: Palette;
   cells: MatrixCell[];
   label: CostLabel;
   phase: string;
   onConfirm: () => void;
   onCancel: () => void;
 }) {
-  const { c, cells, label, phase, onConfirm, onCancel } = props;
+  const { cells, label, phase, onConfirm, onCancel } = props;
   const billable = billableCellCount(cells);
   const needsConsent = phase === 'needs-consent';
 
-  const dialogRef = useRef<HTMLDivElement>(null);
-  // Real modal: focus moves in on open, is trapped, Escape cancels, and focus
-  // returns to the trigger on close (useModalA11y).
-  useModalA11y(dialogRef, true, onCancel);
-
   return (
-    <div
-      className="gm-backdrop"
-      style={backdropStyle()}
-      // A backdrop click cancels (mousedown on the backdrop itself, not a child).
-      onMouseDown={(e) => {
-        if (e.target === e.currentTarget) onCancel();
-      }}
-      data-testid="gm-confirm-backdrop"
-    >
-      <div
-        ref={dialogRef}
-        role="dialog"
-        aria-modal="true"
-        aria-labelledby="gm-confirm-title"
-        aria-describedby="gm-confirm-desc"
-        className="gm-dialog-enter"
-        style={confirmBox(c)}
-      >
-        <p id="gm-confirm-title" style={{ margin: 0, fontSize: 15 }}>
+    <Modal opened onClose={onCancel} title="Confirm generation" size="sm">
+      <Stack gap={12}>
+        <p style={{ margin: 0, fontSize: 15, color: token.text }}>
           Generate <strong>{billable}</strong> cell{billable === 1 ? '' : 's'} for{' '}
           <strong>{label.amount}</strong> Buzz{label.isCeiling ? ' at most' : ''}?
         </p>
-        <p id="gm-confirm-desc" style={noteStyle(c)}>
+        <p style={mutedText}>
           This spends real Buzz — one charge per cell, only its real cost (usually a few Buzz).
           {label.isCeiling
             ? ` ${PAGE_BUZZ_BUDGET_PER_CELL.toLocaleString()} Buzz per cell is the safety cap, not what you'll spend.`
@@ -1027,34 +1007,21 @@ function ConfirmPanel(props: {
           Nothing is spent until you confirm.
         </p>
         {needsConsent && (
-          <p role="status" style={noteStyle(c)}>
+          <Alert color="info" role="status">
             Grant access to generate — confirm in the Civitai dialog. If you dismissed it, press
             Confirm again.
-          </p>
+          </Alert>
         )}
-        <div style={{ display: 'flex', gap: 8 }}>
-          <button
-            type="button"
-            onClick={onConfirm}
-            style={primaryBtn(c)}
-            className="gm-chip"
-            data-autofocus
-            data-testid="gm-confirm"
-          >
-            {needsConsent ? 'Grant & generate' : 'Confirm & generate'}
-          </button>
-          <button
-            type="button"
-            onClick={onCancel}
-            style={secondaryBtn(c)}
-            className="gm-chip"
-            data-testid="gm-cancel"
-          >
+        <Group gap={8} justify="flex-end">
+          <Button variant="subtle" onClick={onCancel} data-testid="gm-cancel">
             Cancel
-          </button>
-        </div>
-      </div>
-    </div>
+          </Button>
+          <Button onClick={onConfirm} data-testid="gm-confirm">
+            {needsConsent ? 'Grant & generate' : 'Confirm & generate'}
+          </Button>
+        </Group>
+      </Stack>
+    </Modal>
   );
 }
 
@@ -1090,68 +1057,43 @@ function ResultGrid(props: {
   const totalCells = checkpoints.length * modifiers.length;
 
   return (
-    <div style={{ display: 'grid', gap: 12 }}>
-      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 8 }}>
-        <span style={{ fontSize: 14, fontWeight: 600 }} role="status">
+    <Stack gap={12}>
+      <Group justify="space-between" gap={8}>
+        <span style={{ fontSize: 14, fontWeight: 600, fontVariantNumeric: 'tabular-nums' }} role="status">
           {running ? runProgressLabel(cells) : 'Done'} · spent {formatCost(spent)} Buzz
         </span>
-        <div style={{ display: 'flex', gap: 8 }}>
+        <Group gap={8}>
           {running && (
-            <button
-              type="button"
-              onClick={onStop}
-              style={secondaryBtn(c)}
-              className="gm-chip"
-              data-testid="gm-stop"
-            >
+            <Button variant="subtle" color="error" size="sm" onClick={onStop} data-testid="gm-stop">
               Stop
-            </button>
+            </Button>
           )}
           {phase === 'done' && canRetry && (
-            <button
-              type="button"
-              onClick={onRetry}
-              style={primaryBtn(c)}
-              className="gm-chip"
-              data-testid="gm-retry"
-            >
+            <Button size="sm" onClick={onRetry} data-testid="gm-retry">
               Retry failed
-            </button>
+            </Button>
           )}
           {phase === 'done' && (
-            <button
-              type="button"
-              onClick={onReset}
-              style={secondaryBtn(c)}
-              className="gm-chip"
-              data-testid="gm-newrun"
-            >
+            <Button variant="outline" size="sm" onClick={onReset} data-testid="gm-newrun">
               New matrix
-            </button>
+            </Button>
           )}
-        </div>
-      </div>
+        </Group>
+      </Group>
 
       {running && uncancelable > 0 && (
-        <p role="status" style={{ ...noteStyle(c), margin: 0 }} data-testid="gm-stop-warning">
+        <p role="status" style={mutedText} data-testid="gm-stop-warning">
           {stopInProgressWarning()}
         </p>
       )}
 
       {canOverflow && (
-        <p
-          className="gm-swipe-cue"
-          style={{ ...noteStyle(c), alignItems: 'center', gap: 6, margin: 0 }}
-          aria-hidden
-        >
+        <p className="gm-swipe-cue" style={{ ...metaText, alignItems: 'center', gap: 6 }} aria-hidden>
           <span>← swipe to see every style →</span>
         </p>
       )}
 
-      <div
-        className="gm-grid-scroll"
-        style={{ ['--gm-fade-color' as string]: c.fadeColor }}
-      >
+      <div className="gm-grid-scroll" style={{ ['--gm-fade-color' as string]: c.fadeColor }}>
         <table style={{ borderCollapse: 'collapse', width: '100%' }}>
           <thead>
             <tr>
@@ -1180,9 +1122,7 @@ function ResultGrid(props: {
                     <td key={m.key} style={cellTd(c)}>
                       <div
                         className="gm-cell"
-                        style={{
-                          ['--gm-stagger' as string]: `${Math.min(idx, totalCells) * 40}ms`,
-                        }}
+                        style={{ ['--gm-stagger' as string]: `${Math.min(idx, totalCells) * 40}ms` }}
                       >
                         <CellView c={c} cell={cell} />
                       </div>
@@ -1195,7 +1135,7 @@ function ResultGrid(props: {
         </table>
         {canOverflow && <span className="gm-edge-fade" aria-hidden />}
       </div>
-    </div>
+    </Stack>
   );
 }
 
@@ -1203,9 +1143,7 @@ function CellView({ c, cell }: { c: Palette; cell: MatrixCell | undefined }) {
   if (!cell) return <span style={{ color: c.muted }}>—</span>;
   switch (cell.status) {
     case 'blocked':
-      return (
-        <CellBox c={c} label="Incompatible" sub="no charge" tone="muted" />
-      );
+      return <CellBox c={c} label="Incompatible" sub="no charge" tone="muted" />;
     case 'canceled':
       return <CellBox c={c} label="Canceled" sub="no charge" tone="muted" />;
     case 'idle':
@@ -1261,7 +1199,9 @@ function CellView({ c, cell }: { c: Palette; cell: MatrixCell | undefined }) {
             // the snapshot carried no image — show an explicit, non-blank state.
             <CellBox c={c} label="Image unavailable" sub="generated · charged" tone="muted" />
           )}
-          <figcaption style={{ fontSize: 11, color: c.muted, textAlign: 'center' }}>
+          <figcaption
+            style={{ fontSize: 11, color: c.muted, textAlign: 'center', fontVariantNumeric: 'tabular-nums' }}
+          >
             {formatCost(cell.cost)} Buzz
           </figcaption>
         </figure>
@@ -1309,7 +1249,7 @@ function CellImage({ c, src, alt }: { c: Palette; src: string; alt: string }) {
           gap: 4,
           textAlign: 'center',
           background: c.inputBg,
-          borderRadius: 6,
+          borderRadius: radius.md,
           padding: 6,
         }}
       >
@@ -1339,20 +1279,22 @@ function CellImage({ c, src, alt }: { c: Palette; src: string; alt: string }) {
       className={loaded ? 'gm-img-loaded' : undefined}
       style={{
         width: '100%',
-        borderRadius: 6,
+        borderRadius: radius.md,
         display: 'block',
         aspectRatio: '1 / 1',
         objectFit: 'cover',
-        // Hide until decoded so we never flash a half-painted image, then the
-        // class fades it in. (Under reduced-motion the class sets opacity:1.)
+        // Structural reveal (NOT color-muting): hide until decoded so we never
+        // flash a half-painted image, then the class fades it in. (Under
+        // reduced-motion the class sets opacity:1.)
         opacity: loaded ? 1 : 0,
       }}
     />
   );
 }
 
-/** An animated shimmer skeleton with a status label on top (D4.2). */
-function SkeletonCell({ c, label }: { c: Palette; label: string }) {
+/** An animated shimmer skeleton with a status label on top (D4.2). Exported for
+ * the a11y test (asserts the `role="status"` + accessible-name in-flight region). */
+export function SkeletonCell({ c, label }: { c: Palette; label: string }) {
   return (
     <div
       className="gm-skeleton"
@@ -1361,7 +1303,7 @@ function SkeletonCell({ c, label }: { c: Palette; label: string }) {
       style={{
         position: 'relative',
         aspectRatio: '1 / 1',
-        borderRadius: 6,
+        borderRadius: radius.md,
         display: 'grid',
         placeContent: 'center',
         background: c.inputBg,
@@ -1400,7 +1342,7 @@ function CellBox({
         gap: 2,
         textAlign: 'center',
         background: c.inputBg,
-        borderRadius: 6,
+        borderRadius: radius.md,
         padding: 6,
       }}
     >
@@ -1410,54 +1352,45 @@ function CellBox({
   );
 }
 
-function Chip({
-  c,
+/**
+ * A selectable axis chip — the pack `<Button>` (so hover/focus/active/disabled
+ * come from the design system for free) carrying `aria-pressed`. Selected →
+ * `filled`; a LoRA column when unselected → `light` (the faint primary tint marks
+ * it); a plain unselected chip → `outline`.
+ */
+export function Chip({
   label,
   selected,
   isLora = false,
   onToggle,
 }: {
-  c: Palette;
   label: string;
   selected: boolean;
   /** LoRA columns read differently (cost, can be server-blocked) — mark them. */
   isLora?: boolean;
   onToggle: () => void;
 }) {
+  const variant = selected ? 'filled' : isLora ? 'light' : 'outline';
   return (
-    <button
-      type="button"
+    <Button
+      size="sm"
+      variant={variant}
       onClick={onToggle}
       aria-pressed={selected}
-      className="gm-chip"
-      style={{
-        display: 'inline-flex',
-        alignItems: 'center',
-        gap: 6,
-        padding: isLora ? '6px 12px 6px 9px' : '6px 12px',
-        borderRadius: 999,
-        border: `1px solid ${selected ? c.accent : c.border}`,
-        // A faint accent left-tint marks LoRA chips when unselected; selected
-        // chips already read as accent so the marker rides on the glyph.
-        background: selected ? c.accent : isLora ? c.accentTint : 'transparent',
-        color: selected ? c.accentFg : c.fg,
-        fontSize: 13,
-        fontWeight: 600,
-        cursor: 'pointer',
-      }}
+      leftSection={isLora ? <LoraGlyph /> : undefined}
+      data-testid="gm-chip"
     >
-      {isLora && <LoraGlyph c={c} on={selected} />}
       {label}
-    </button>
+    </Button>
   );
 }
 
 /**
- * The small "this is a LoRA" marker — a layered-square resource glyph. Inherits
- * the accent (or accentFg on a selected chip) so it reads in both themes
- * without a paragraph of explanation (S2.2).
+ * The small "this is a LoRA" marker — a layered-square resource glyph. Uses
+ * `currentColor` so it inherits whatever text color its context sets (the chip
+ * button's label color, or the muted note color), reading in both themes.
  */
-function LoraGlyph({ c, on = false }: { c: Palette; on?: boolean }) {
+function LoraGlyph() {
   return (
     <svg
       width={11}
@@ -1467,26 +1400,8 @@ function LoraGlyph({ c, on = false }: { c: Palette; on?: boolean }) {
       focusable="false"
       style={{ flex: 'none', verticalAlign: '-1px' }}
     >
-      <rect
-        x={1}
-        y={3}
-        width={7}
-        height={7}
-        rx={1.5}
-        fill="none"
-        stroke={on ? c.accentFg : c.accent}
-        strokeWidth={1.4}
-      />
-      <rect
-        x={4}
-        y={1}
-        width={7}
-        height={7}
-        rx={1.5}
-        fill="none"
-        stroke={on ? c.accentFg : c.accent}
-        strokeWidth={1.4}
-      />
+      <rect x={1} y={3} width={7} height={7} rx={1.5} fill="none" stroke="currentColor" strokeWidth={1.4} />
+      <rect x={4} y={1} width={7} height={7} rx={1.5} fill="none" stroke="currentColor" strokeWidth={1.4} />
     </svg>
   );
 }
@@ -1500,48 +1415,41 @@ function LoraGlyph({ c, on = false }: { c: Palette; on?: boolean }) {
  * dots labeled by the two axes, so the concept reads instantly without a
  * docs-like paragraph. Decorative — labeled for AT, dots aria-hidden.
  */
-function FirstRunExample({ c }: { c: Palette }) {
+function FirstRunExample() {
   return (
-    <div
-      style={{
-        display: 'flex',
-        alignItems: 'center',
-        gap: 12,
-        border: `1px solid ${c.border}`,
-        borderRadius: 10,
-        background: c.cardBg,
-        padding: '10px 12px',
-      }}
+    <Card
+      withBorder
+      padding="sm"
       aria-label="Example: a 2 by 2 grid of two models across two styles"
     >
-      <div
-        aria-hidden
-        style={{
-          display: 'grid',
-          gridTemplateColumns: 'repeat(2, 18px)',
-          gridAutoRows: '18px',
-          gap: 4,
-          flex: 'none',
-        }}
-      >
-        {[0, 1, 2, 3].map((i) => (
-          <span
-            key={i}
-            style={{
-              borderRadius: 4,
-              background: i % 3 === 0 ? c.accent : c.accentTint,
-              border: `1px solid ${c.accent}`,
-            }}
-          />
-        ))}
-      </div>
-      <div style={{ display: 'grid', gap: 2 }}>
-        <span style={{ fontSize: 13, fontWeight: 600 }}>2 models × 2 styles = 4 cells</span>
-        <span style={{ ...noteStyle(c), margin: 0 }}>
-          Each cell is one real generation — compare them side by side.
-        </span>
-      </div>
-    </div>
+      <Group gap={12} wrap={false} align="center">
+        <div
+          aria-hidden
+          style={{
+            display: 'grid',
+            gridTemplateColumns: 'repeat(2, 18px)',
+            gridAutoRows: '18px',
+            gap: 4,
+            flex: 'none',
+          }}
+        >
+          {[0, 1, 2, 3].map((i) => (
+            <span
+              key={i}
+              style={{
+                borderRadius: radius.sm,
+                background: i % 3 === 0 ? token.primary : token.primaryLight,
+                border: `1px solid ${token.primary}`,
+              }}
+            />
+          ))}
+        </div>
+        <div style={{ display: 'grid', gap: 2, minWidth: 0 }}>
+          <span style={{ fontSize: 13, fontWeight: 600 }}>2 models × 2 styles = 4 cells</span>
+          <span style={metaText}>Each cell is one real generation — compare them side by side.</span>
+        </div>
+      </Group>
+    </Card>
   );
 }
 
@@ -1556,7 +1464,7 @@ function LoadingSkeleton({ c }: { c: Palette }) {
       className="gm-skeleton"
       style={{
         background: c.inputBg,
-        borderRadius: 8,
+        borderRadius: radius.md,
         ['--gm-skel-base' as string]: c.skelBase,
         ['--gm-skel-shine' as string]: c.skelShine,
         ...style,
@@ -1564,244 +1472,43 @@ function LoadingSkeleton({ c }: { c: Palette }) {
     />
   );
   return (
-    <div style={contentStyle()} role="status" aria-label="Loading Gen Matrix" data-testid="gm-loading">
-      {shimmer({ height: 28, width: 180 })}
-      {shimmer({ height: 16, width: '60%' })}
+    <div style={contentStyle} role="status" aria-label="Loading Gen Matrix" data-testid="gm-loading">
+      <Group gap={12} wrap={false} align="center">
+        {shimmer({ height: 40, width: 40, borderRadius: radius.md })}
+        {shimmer({ height: 24, width: 180 })}
+      </Group>
       {shimmer({ height: 72 })}
       <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
-        {shimmer({ height: 32, width: 96, borderRadius: 999 })}
-        {shimmer({ height: 32, width: 96, borderRadius: 999 })}
-        {shimmer({ height: 32, width: 120, borderRadius: 999 })}
+        {shimmer({ height: 32, width: 96 })}
+        {shimmer({ height: 32, width: 96 })}
+        {shimmer({ height: 32, width: 120 })}
       </div>
       <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
-        {shimmer({ height: 32, width: 84, borderRadius: 999 })}
-        {shimmer({ height: 32, width: 84, borderRadius: 999 })}
-        {shimmer({ height: 32, width: 84, borderRadius: 999 })}
-        {shimmer({ height: 32, width: 110, borderRadius: 999 })}
+        {shimmer({ height: 32, width: 84 })}
+        {shimmer({ height: 32, width: 84 })}
+        {shimmer({ height: 32, width: 84 })}
+        {shimmer({ height: 32, width: 110 })}
       </div>
-      {shimmer({ height: 40 })}
+      {shimmer({ height: 44 })}
       {shimmer({ height: 48 })}
     </div>
   );
 }
 
 // ---------------------------------------------------------------------------
-// Theme — host can't inject CSS into the iframe; colors via inline styles.
+// Matrix-table chrome — the design system has no <table> primitive, so these
+// are token-styled off the same `--civitai-*` vars the pack reads (borders in
+// both themes; recessed header via elevate(), never surface-2/gray as a fill).
 // ---------------------------------------------------------------------------
 
-interface Palette {
-  bg: string;
-  fg: string;
-  cardBg: string;
-  border: string;
-  inputBg: string;
-  accent: string;
-  accentFg: string;
-  danger: string;
-  dangerBg: string;
-  muted: string;
-  /** Translucent accent tint — used for the faint LoRA-chip marker. */
-  accentTint: string;
-  /** Skeleton shimmer base + highlight (theme-aware; consumed by index.css). */
-  skelBase: string;
-  skelShine: string;
-  /** The color the mobile edge-fade fades toward (matches the page bg). */
-  fadeColor: string;
-}
-
-function palette(dark: boolean): Palette {
-  return dark
-    ? {
-        bg: '#1a1b1e',
-        fg: '#e9ecef',
-        cardBg: '#25262b',
-        border: '#373a40',
-        inputBg: '#2c2e33',
-        accent: '#fab005',
-        accentFg: '#1a1b1e',
-        danger: '#ff8787',
-        dangerBg: '#2c1f1f',
-        muted: '#909296',
-        accentTint: 'rgba(250, 176, 5, 0.12)',
-        skelBase: 'rgba(255, 255, 255, 0.05)',
-        skelShine: 'rgba(255, 255, 255, 0.13)',
-        fadeColor: '#1a1b1e',
-      }
-    : {
-        bg: '#ffffff',
-        fg: '#1a1b1e',
-        cardBg: '#f8f9fa',
-        border: '#dee2e6',
-        inputBg: '#f1f3f5',
-        accent: '#f08c00',
-        accentFg: '#ffffff',
-        danger: '#e03131',
-        dangerBg: '#fff5f5',
-        muted: '#868e96',
-        accentTint: 'rgba(240, 140, 0, 0.10)',
-        skelBase: 'rgba(0, 0, 0, 0.05)',
-        skelShine: 'rgba(0, 0, 0, 0.11)',
-        fadeColor: '#ffffff',
-      };
-}
-
-function pageStyle(c: Palette): React.CSSProperties {
-  return {
-    fontFamily: 'system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif',
-    background: c.bg,
-    color: c.fg,
-    width: '100%',
-    minHeight: '100dvh',
-    display: 'flex',
-    boxSizing: 'border-box',
-  };
-}
-
-function contentStyle(): React.CSSProperties {
-  return {
-    margin: '0 auto',
-    width: '100%',
-    maxWidth: 820,
-    padding: 24,
-    display: 'grid',
-    gap: 16,
-    alignContent: 'start',
-    boxSizing: 'border-box',
-  };
-}
-
-function textareaStyle(c: Palette): React.CSSProperties {
-  return {
-    resize: 'vertical',
-    padding: 12,
-    borderRadius: 8,
-    border: `1px solid ${c.border}`,
-    background: c.inputBg,
-    color: c.fg,
-    fontSize: 15,
-    lineHeight: 1.5,
-    fontFamily: 'inherit',
-    boxSizing: 'border-box',
-    width: '100%',
-    minHeight: 72,
-  };
-}
-
-function fieldsetStyle(c: Palette): React.CSSProperties {
-  return { border: `1px solid ${c.border}`, borderRadius: 8, padding: 12, margin: 0 };
-}
-
-const legendStyle: React.CSSProperties = { fontSize: 13, fontWeight: 700, padding: '0 6px' };
-const chipRow: React.CSSProperties = { display: 'flex', flexWrap: 'wrap', gap: 8 };
-
-function summaryBox(c: Palette): React.CSSProperties {
-  return {
-    border: `1px solid ${c.border}`,
-    borderRadius: 8,
-    padding: '10px 12px',
-    fontSize: 14,
-    fontVariantNumeric: 'tabular-nums',
-  };
-}
-
-function confirmBox(c: Palette): React.CSSProperties {
-  return {
-    border: `1px solid ${c.accent}`,
-    borderRadius: 12,
-    padding: 16,
-    display: 'grid',
-    gap: 10,
-    background: c.cardBg,
-    width: '100%',
-    maxWidth: 460,
-    boxSizing: 'border-box',
-    boxShadow: '0 8px 32px rgba(0,0,0,0.28)',
-  };
-}
-
-// The modal backdrop — dims the page and centers the dialog. A click on the
-// backdrop itself (handled in ConfirmPanel) cancels.
-function backdropStyle(): React.CSSProperties {
-  return {
-    position: 'fixed',
-    inset: 0,
-    background: 'rgba(0,0,0,0.45)',
-    display: 'grid',
-    placeItems: 'center',
-    padding: 16,
-    zIndex: 60,
-    boxSizing: 'border-box',
-  };
-}
-
-function primaryBtn(c: Palette, disabled = false): React.CSSProperties {
-  return {
-    padding: '12px 18px',
-    border: 'none',
-    borderRadius: 8,
-    background: disabled ? c.border : c.accent,
-    color: disabled ? c.muted : c.accentFg,
-    fontWeight: 700,
-    fontSize: 15,
-    cursor: disabled ? 'not-allowed' : 'pointer',
-  };
-}
-
-function secondaryBtn(c: Palette): React.CSSProperties {
-  return {
-    padding: '12px 18px',
-    border: `1px solid ${c.border}`,
-    borderRadius: 8,
-    background: 'transparent',
-    color: c.fg,
-    fontWeight: 600,
-    fontSize: 15,
-    cursor: 'pointer',
-  };
-}
-
-function noteStyle(c: Palette): React.CSSProperties {
-  return { fontSize: 13, color: c.muted, margin: 0, lineHeight: 1.5 };
-}
-
-// A dashed "add" chip for the resource-picker affordance — visually distinct
-// from a selectable Chip so it reads as an action, not a toggle.
-function pickBtn(c: Palette, busy: boolean): React.CSSProperties {
-  return {
-    padding: '6px 12px',
-    borderRadius: 999,
-    border: `1px dashed ${c.accent}`,
-    background: 'transparent',
-    color: busy ? c.muted : c.accent,
-    fontSize: 13,
-    fontWeight: 600,
-    cursor: busy ? 'wait' : 'pointer',
-  };
-}
-
-// The PRIMARY browse affordance — a filled accent chip (the fast curated path),
-// visually stronger than the dashed "All resources" fallback next to it.
-function browseBtn(c: Palette): React.CSSProperties {
-  return {
-    padding: '6px 12px',
-    borderRadius: 999,
-    border: `1px solid ${c.accent}`,
-    background: c.accent,
-    color: c.accentFg,
-    fontSize: 13,
-    fontWeight: 700,
-    cursor: 'pointer',
-  };
-}
-
 function cornerTh(c: Palette): React.CSSProperties {
-  return { border: `1px solid ${c.border}`, padding: 6, background: c.cardBg, width: 90 };
+  return { border: `1px solid ${c.border}`, padding: 6, background: elevate(4), width: 90 };
 }
 function headTh(c: Palette): React.CSSProperties {
   return {
     border: `1px solid ${c.border}`,
     padding: 8,
-    background: c.cardBg,
+    background: elevate(4),
     fontSize: 12,
     fontWeight: 700,
   };
@@ -1810,7 +1517,7 @@ function rowTh(c: Palette): React.CSSProperties {
   return {
     border: `1px solid ${c.border}`,
     padding: 8,
-    background: c.cardBg,
+    background: elevate(4),
     fontSize: 12,
     fontWeight: 700,
     textAlign: 'left',

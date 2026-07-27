@@ -1,7 +1,11 @@
-:root {
-  color-scheme: light dark;
-}
-
+/* Bare reset only — the @civitai/blocks-react/ui pack injects its own themed
+ * styles (design tokens + component CSS) idempotently on first render, and
+ * @civitai/theme/styles.css (imported in main.tsx) supplies the --civitai-*
+ * tokens. This file carries ONLY the app-specific motion, scroll chrome, and
+ * focus states the pack can't express (keyframes, sticky/overflow table,
+ * :focus-visible on the two remaining custom controls, reduced-motion). Every
+ * color here resolves to a --civitai-* token (via the inline vars the TSX sets
+ * or color-mix on a token) — zero hardcoded colors. */
 html,
 body,
 #root {
@@ -13,18 +17,6 @@ body,
 * {
   box-sizing: border-box;
 }
-
-/* ---------------------------------------------------------------------------
- * Pass 3 — visual polish & animation.
- *
- * The host can't inject CSS into the block iframe, so EVERY animation lives
- * here (bundled with the app) and is keyed by className from App.tsx /
- * ResourceBrowser.tsx. Colors stay in the inline palette() so light/dark keep
- * working — this file only carries motion, layout, and structure that inline
- * styles can't express (keyframes, :active, ::-webkit-scrollbar, media queries,
- * gradient sweeps). All motion is GPU-cheap (transform/opacity only) and is
- * disabled wholesale under prefers-reduced-motion (see the block at the end).
- * ------------------------------------------------------------------------- */
 
 /* --- Staggered entry for grid cells / skeletons (D4.3) ---------------------
  * Each cell sets `--gm-stagger` (index*40ms, capped) inline; the animation
@@ -65,14 +57,15 @@ body,
 
 /* --- Skeleton shimmer (D4.2 / P5.5) ----------------------------------------
  * A diagonal highlight sweeps across a translucent base. The two colors are
- * supplied inline (theme-aware) via --gm-skel-base / --gm-skel-shine so dark
- * mode stays correct; this rule only animates background-position. */
+ * supplied inline (theme-aware, derived from the --civitai-* tokens via the
+ * theme.ts `elevate()` helper) via --gm-skel-base / --gm-skel-shine so both
+ * themes stay correct; this rule only animates background-position. */
 .gm-skeleton {
   background-image: linear-gradient(
     100deg,
-    var(--gm-skel-base, rgba(128, 128, 128, 0.12)) 30%,
-    var(--gm-skel-shine, rgba(128, 128, 128, 0.28)) 50%,
-    var(--gm-skel-base, rgba(128, 128, 128, 0.12)) 70%
+    var(--gm-skel-base) 30%,
+    var(--gm-skel-shine) 50%,
+    var(--gm-skel-base) 70%
   );
   background-size: 200% 100%;
   background-repeat: no-repeat;
@@ -88,49 +81,31 @@ body,
   }
 }
 
-/* --- Confirm-dialog entry (D4.6) ------------------------------------------- */
-@keyframes gm-dialog-in {
-  from {
-    opacity: 0;
-    transform: translateY(8px);
-  }
-  to {
-    opacity: 1;
-    transform: translateY(0);
-  }
-}
-
-.gm-dialog-enter {
-  animation: gm-dialog-in 150ms ease-out both;
-}
-
-/* Backdrop fade for the modal + browser overlay. */
-@keyframes gm-backdrop-in {
-  from {
-    opacity: 0;
-  }
-  to {
-    opacity: 1;
-  }
-}
-
-.gm-backdrop {
-  animation: gm-backdrop-in 150ms ease-out both;
-}
-
-/* --- Chip press (D4.4) -----------------------------------------------------
- * Smooth background/border swap + a tactile press. Applied to selectable chips
- * and the browse/pick buttons. */
-.gm-chip {
+/* --- Focus + hover for the two remaining custom controls -------------------
+ * The resource-browser card tiles and the ecosystem-popover options are
+ * composite/list controls the pack has no primitive for, so they carry their
+ * own visible focus ring (keyboard a11y) + hover, off the design-system tokens.
+ * Every other control is a pack <Button>/<TextInput> with states built in. */
+.gm-card-tile,
+.gm-eco-option {
   transition:
-    background-color 120ms ease,
     border-color 120ms ease,
-    color 120ms ease,
+    background-color 120ms ease,
     transform 120ms ease;
 }
-
-.gm-chip:active {
-  transform: scale(0.96);
+.gm-card-tile:not(:disabled):hover {
+  border-color: var(--civitai-color-primary);
+}
+.gm-card-tile:not(:disabled):active {
+  transform: scale(0.98);
+}
+.gm-eco-option:hover {
+  background: color-mix(in srgb, var(--civitai-color-text) 6%, var(--civitai-color-surface));
+}
+.gm-card-tile:focus-visible,
+.gm-eco-option:focus-visible {
+  outline: 2px solid var(--civitai-color-primary);
+  outline-offset: 2px;
 }
 
 /* --- Mobile results grid (P5.1) -------------------------------------------
@@ -151,7 +126,7 @@ body,
   height: 8px;
 }
 .gm-grid-scroll::-webkit-scrollbar-thumb {
-  background: rgba(128, 128, 128, 0.4);
+  background: color-mix(in srgb, var(--civitai-color-text) 25%, transparent);
   border-radius: 4px;
 }
 
@@ -169,7 +144,7 @@ body,
   bottom: 0;
   width: 28px;
   pointer-events: none;
-  background: linear-gradient(to right, transparent, var(--gm-fade-color, rgba(0, 0, 0, 0.12)));
+  background: linear-gradient(to right, transparent, var(--gm-fade-color, var(--civitai-color-body)));
 }
 
 @media (max-width: 560px) {
@@ -195,9 +170,7 @@ body,
 @media (prefers-reduced-motion: reduce) {
   .gm-cell,
   .gm-img-loaded,
-  .gm-skeleton,
-  .gm-dialog-enter,
-  .gm-backdrop {
+  .gm-skeleton {
     animation: none !important;
   }
   .gm-cell {
@@ -209,15 +182,16 @@ body,
     opacity: 1;
     transform: none;
   }
-  .gm-chip {
+  .gm-card-tile,
+  .gm-eco-option {
     transition: none;
   }
-  .gm-chip:active {
+  .gm-card-tile:not(:disabled):active {
     transform: none;
   }
   /* The shimmer keeps a static tinted background (no sweep). */
   .gm-skeleton {
     background-image: none;
-    background-color: var(--gm-skel-base, rgba(128, 128, 128, 0.16));
+    background-color: var(--gm-skel-base);
   }
 }
