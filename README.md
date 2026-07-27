@@ -6,6 +6,11 @@ model / style changes the output. Pick N checkpoints × M styles, hit **Generate
 Matrix**, and every cell renders side-by-side (rows = checkpoints, columns =
 styles). Each cell spends **real Buzz** via the page money path.
 
+> This is a Civitai **onsite App Block** — it runs in-platform at
+> `gen-matrix.civit.ai`, embedded by the Civitai host. Open it via
+> [`civitai.com/apps/run/gen-matrix`](https://civitai.com/apps/run/gen-matrix),
+> not the bare subdomain. See the [Civitai developer docs](https://developer.civitai.com).
+
 It is the flagship first-party dog-food for the "money on pages" feature
 (civitai #2612) and extends the single-gen
 [`civitai-block-buzz-generator`](../civitai-block-buzz-generator) into a bounded
@@ -187,3 +192,11 @@ and verify real Buzz spend:
 
 `.env.production` bakes the allowed parent origins (`civitai.com`) into the
 bundle at build time — these must be correct for where the app is served.
+
+## Links
+
+- Developer docs — [developer.civitai.com](https://developer.civitai.com)
+- Live app — [gen-matrix.civit.ai](https://gen-matrix.civit.ai)
+- SDK contract — [`@civitai/app-sdk`](https://www.npmjs.com/package/@civitai/app-sdk)
+- React hooks + UI pack — [`@civitai/blocks-react`](https://www.npmjs.com/package/@civitai/blocks-react)
+- CLI — [`github.com/civitai/cli`](https://github.com/civitai/cli)
