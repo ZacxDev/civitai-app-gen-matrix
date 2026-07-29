@@ -1,23 +1,24 @@
 # pnpm's default minimumReleaseAge gate would refuse to install very fresh
-# package versions. The two Civitai SDK packages are pinned and trusted, so
-# exclude them from that gate.
+# package versions. The pinned Civitai SDK + design-system packages are trusted,
+# so exclude them from that gate.
 #
-# These versions ship the PAGE resource picker (with public display names) and
-# the shared SDK mock host:
-#   - @civitai/blocks-react@0.9.0 exports `useResourcePicker()` (host-chrome
-#     native picker for Checkpoint | LORA — civitai-app-starters #44) PLUS the
-#     shared dev mock host under `/testing` (`createMockHost` + `<Harness>` /
-#     `<MockHostProvider>` + `readMockHostUrlOptions`) the gen-matrix reference
-#     block now consumes instead of a hand-rolled harness, PLUS
-#     `useDomainMaturity()` / `<SfwGate>` (domain maturity ceiling from
-#     BLOCK_INIT, civitai #2670) used to gate the anon catalog read's advisory
-#     SFW filter.
-#   - @civitai/app-sdk@0.13.0 carries the OPEN_RESOURCE_PICKER /
-#     RESOURCE_PICKER_RESULT message types + BlockResourceInfo incl.
-#     `modelName`/`versionName` (the names the page picker returns — #2655/#47)
-#     plus the `ColorDomain`/maturity projection in BLOCK_INIT.
-# Both are PUBLISHED on npm and resolve from the registry directly — no local
-# `link:`/`overrides`. See PICKER-WIRING.md.
+# These versions carry what the production-hardened block (v0.8.0) relies on:
+#   - @civitai/blocks-react@0.37.0 — `useResourcePicker()` (native Checkpoint |
+#     LORA picker), the shared `/testing` mock host (`createMockHost` /
+#     `<Harness>`) now seeded with the appWorkflows + storage read-model,
+#     `useDomainMaturity()`/`<SfwGate>` (domain maturity ceiling, BLOCK_INIT),
+#     and — new — `useAppWorkflows()` + `useAppStorage()` (the persistence
+#     read-model behind M1/M2/G1) plus `BlockGate`/`injectBlocksStyles` under
+#     the `/ui` subpath.
+#   - @civitai/app-sdk@0.28.0 — the block message/type contract incl.
+#     `BlockResourceInfo` names, the `ColorDomain`/maturity projection, and the
+#     `AppWorkflow` read-model shape (`images[].nsfwLevel` — the G1 gate source).
+#   - @civitai/theme@0.2.0 — the `--civitai-*` design tokens (theme.ts).
+#     (NOTE: 0.3.0 is NOT published; 0.2.0 is the latest — do not bump blindly.)
+#   - @civitai/components@0.3.0 + @civitai/components-react@0.3.0 — the
+#     attribute-driven CSS + React primitives (Slider/Image/Tooltip/Toast/
+#     SegmentedControl) the UI adopts.
+# All resolve from the npm registry directly — no local `link:`/`overrides`.
 minimumReleaseAgeExclude:
   - '@civitai/app-sdk@0.28.0'
   - '@civitai/blocks-react@0.37.0'

@@ -122,27 +122,96 @@ function isReconcileFinal(status: CellStatus): boolean {
  */
 export function restoreStateFromManifest(manifest: unknown): MatrixState | null {
   if (!isValidManifest(manifest)) return null;
-  const cells: MatrixCell[] = manifest.cells.map((cell) => {
+  const cells: MatrixCell[] = [];
+  for (const raw of manifest.cells) {
+    // Defense-in-depth: the manifest is a per-viewer blob that could be corrupt
+    // or forged. Sanitize each cell to a known-good shape (dropping structurally
+    // broken ones) BEFORE the status normalization, so a bogus blob can never
+    // rebuild a bogus grid. A cell that fails validation is simply omitted.
+    const cell = sanitizeCell(raw);
+    if (!cell) continue;
     const submitted = cell.workflowId != null;
     if (!submitted && (cell.status === 'idle' || cell.status === 'estimating' || cell.status === 'submitting')) {
       // Never submitted → never billed → do NOT auto-run on reload.
-      return { ...cell, status: 'canceled' as CellStatus };
-    }
-    if (submitted && (cell.status === 'estimating' || cell.status === 'submitting' || cell.status === 'polling')) {
+      cells.push({ ...cell, status: 'canceled' });
+    } else if (submitted && (cell.status === 'estimating' || cell.status === 'submitting' || cell.status === 'polling')) {
       // Already submitted + still in flight → recover by re-polling (no re-charge).
-      return { ...cell, status: 'polling' as CellStatus };
+      cells.push({ ...cell, status: 'polling' });
+    } else {
+      cells.push(cell); // terminal (incl. timedout) — keep verbatim
     }
-    return cell; // terminal (incl. timedout) — keep verbatim
-  });
+  }
   const anyResumable = cells.some((c) => c.status === 'polling');
   const phase: MatrixState['phase'] = anyResumable ? 'running' : 'done';
-  return { phase, cells, perCellEstimate: manifest.perCellEstimate };
+  const perCellEstimate =
+    typeof manifest.perCellEstimate === 'number' && Number.isFinite(manifest.perCellEstimate)
+      ? manifest.perCellEstimate
+      : null;
+  return { phase, cells, perCellEstimate };
 }
 
 function isValidManifest(manifest: unknown): manifest is RunManifest {
   if (typeof manifest !== 'object' || manifest === null) return false;
   const m = manifest as Partial<RunManifest>;
   return m.version === RUN_MANIFEST_VERSION && Array.isArray(m.cells);
+}
+
+/** Every valid `CellStatus` — the allow-list a persisted status is clamped to. */
+const VALID_CELL_STATUSES: ReadonlySet<CellStatus> = new Set<CellStatus>([
+  'idle',
+  'estimating',
+  'submitting',
+  'polling',
+  'done',
+  'failed',
+  'insufficient',
+  'blocked',
+  'canceled',
+  'timedout',
+]);
+
+const isObj = (v: unknown): v is Record<string, unknown> =>
+  typeof v === 'object' && v !== null;
+const finite = (v: unknown): v is number => typeof v === 'number' && Number.isFinite(v);
+const strOrNull = (v: unknown): string | null => (typeof v === 'string' ? v : null);
+
+/**
+ * Coerce ONE raw persisted cell into a known-good `MatrixCell`, or `null` if it's
+ * too broken to render (missing a valid checkpoint/modifier identity or a finite
+ * grid position — those would corrupt the grid). The scalar fields are coerced
+ * defensively; an UNKNOWN/forged `status` clamps to `canceled` (a terminal,
+ * non-billable state — NEVER a billable `idle`), and `workflowId`/`imageUrl`/
+ * `error` fall back to `null`, `cost`/`nsfwLevel` to `null`, `prompt` to `''`.
+ */
+function sanitizeCell(raw: unknown): MatrixCell | null {
+  if (!isObj(raw)) return null;
+  const ckpt = raw.checkpoint;
+  const mod = raw.modifier;
+  // Grid identity + position must be structurally valid or the cell is dropped.
+  if (!isObj(ckpt) || !finite(ckpt.versionId) || !finite(ckpt.modelId)) return null;
+  if (!isObj(mod) || typeof mod.key !== 'string') return null;
+  if (!finite(raw.row) || !finite(raw.col)) return null;
+
+  const rawStatus = raw.status;
+  const status: CellStatus =
+    typeof rawStatus === 'string' && VALID_CELL_STATUSES.has(rawStatus as CellStatus)
+      ? (rawStatus as CellStatus)
+      : 'canceled'; // unknown/forged → terminal, non-billable
+
+  return {
+    id: typeof raw.id === 'string' ? raw.id : `${ckpt.versionId}::${mod.key}`,
+    checkpoint: ckpt as unknown as MatrixCell['checkpoint'],
+    modifier: mod as unknown as MatrixCell['modifier'],
+    row: raw.row,
+    col: raw.col,
+    status,
+    prompt: typeof raw.prompt === 'string' ? raw.prompt : '',
+    workflowId: strOrNull(raw.workflowId),
+    imageUrl: strOrNull(raw.imageUrl),
+    cost: finite(raw.cost) ? raw.cost : null,
+    error: strOrNull(raw.error),
+    nsfwLevel: finite(raw.nsfwLevel) ? raw.nsfwLevel : null,
+  };
 }
 
 // ---------------------------------------------------------------------------

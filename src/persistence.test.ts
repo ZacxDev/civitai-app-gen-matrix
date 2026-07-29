@@ -122,6 +122,59 @@ describe('run manifest round-trip (M1)', () => {
     expect(restoreStateFromManifest({ version: 999, cells: [] })).toBeNull();
     expect(restoreStateFromManifest({ version: RUN_MANIFEST_VERSION, cells: 'nope' })).toBeNull();
   });
+
+  it('SANITIZES a corrupt/forged blob: unknown status → non-billable, broken cells dropped, no throw', () => {
+    const good = withStatus(buildMatrix('a cat', [ckpts[0]], [mods[0]])[0], 'done', {
+      workflowId: 'wf_ok',
+      imageUrl: 'i',
+      cost: 8,
+    });
+    const manifest = {
+      version: RUN_MANIFEST_VERSION,
+      savedAt: new Date(0).toISOString(),
+      perCellEstimate: 8,
+      cells: [
+        good,
+        // Forged: a bogus status must NOT become a billable idle cell.
+        { ...good, id: 'x::y', status: 'HACKED_BILLABLE', workflowId: null },
+        // Broken grid position → dropped.
+        { ...good, id: 'bad-row', row: 'NaN', col: 0 },
+        // Missing checkpoint identity → dropped.
+        { ...good, id: 'no-ckpt', checkpoint: { label: 'x' } },
+        // Non-string workflowId → coerced to null (still terminal, kept).
+        { ...good, id: 'weird-wf', status: 'done', workflowId: 42 },
+        // Not even an object → dropped.
+        'garbage',
+        null,
+      ],
+    };
+
+    const restored = restoreStateFromManifest(manifest);
+    expect(restored).not.toBeNull();
+    // Kept: good + the forged-status cell (as canceled) + the weird-wf cell. Dropped: bad-row, no-ckpt, garbage, null.
+    expect(restored!.cells).toHaveLength(3);
+    // No cell is billable `idle`.
+    expect(restored!.cells.some((c) => c.status === 'idle')).toBe(false);
+    // The forged status became terminal `canceled` (non-billable).
+    const forged = restored!.cells.find((c) => c.id === 'x::y');
+    expect(forged?.status).toBe('canceled');
+    // The non-string workflowId was coerced to null.
+    const weird = restored!.cells.find((c) => c.id === 'weird-wf');
+    expect(weird?.workflowId).toBeNull();
+    // Whole run is terminal (no re-pollable cell) → done, and nothing throws.
+    expect(restored!.phase).toBe('done');
+  });
+
+  it('coerces a non-numeric perCellEstimate to null', () => {
+    const good = withStatus(buildMatrix('a cat', [ckpts[0]], [mods[0]])[0], 'done', { workflowId: 'w', cost: 8 });
+    const restored = restoreStateFromManifest({
+      version: RUN_MANIFEST_VERSION,
+      savedAt: '',
+      perCellEstimate: 'lots',
+      cells: [good],
+    });
+    expect(restored!.perCellEstimate).toBeNull();
+  });
 });
 
 // ---------------------------------------------------------------------------

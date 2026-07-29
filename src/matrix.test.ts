@@ -843,6 +843,19 @@ describe('isInsufficientBuzz', () => {
     expect(isInsufficientBuzz('failed to reach the buzz orchestrator')).toBe(false);
     expect(isInsufficientBuzz('render budget for the frame was recalculated')).toBe(false);
   });
+  it('M3: a bare shortfall WITHOUT a money noun is NOT insufficient-Buzz (conjunction rule)', () => {
+    // "insufficient"/"not enough" alone describe non-money failures — they must
+    // NOT trip the Out-of-Buzz CTA (which could induce an unnecessary purchase).
+    expect(isInsufficientBuzz('insufficient VRAM to run this generation')).toBe(false);
+    expect(isInsufficientBuzz('insufficient GPU memory')).toBe(false);
+    expect(isInsufficientBuzz('insufficient permissions')).toBe(false);
+    expect(isInsufficientBuzz('not enough disk space')).toBe(false);
+    // …but WITH a money noun it does classify.
+    expect(isInsufficientBuzz('insufficient buzz to continue')).toBe(true);
+    expect(isInsufficientBuzz('not enough balance')).toBe(true);
+    // …and the real host preflight string still matches.
+    expect(isInsufficientBuzz('insufficient buzz budget: estimate 900 exceeds budget 200')).toBe(true);
+  });
 });
 
 describe('snapshotErrorCode (M3 — client-ready for the upstream structured code)', () => {

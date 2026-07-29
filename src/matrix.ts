@@ -598,19 +598,22 @@ export function snapshotErrorCode(
 export function isInsufficientBuzz(message: string | null | undefined): boolean {
   if (!message) return false;
   const m = message.toLowerCase();
-  // Match money-SPECIFIC phrasings only. Each token below is characteristic of a
-  // funds shortfall; NONE of them is the bare word `buzz`/`budget`/`balance`
-  // (the old over-matchers) — so an unrelated failure that merely mentions "buzz"
-  // ("buzz workflow crashed", "buzz service unavailable") no longer trips a wrong
-  // Top-Up CTA. The real host preflight string
-  // ("insufficient buzz budget: estimate N exceeds budget M") matches on both
-  // `insufficient` and `exceeds budget`.
+  // A "money noun" — a word that grounds a shortfall as a FUNDS shortfall.
+  const moneyNoun =
+    m.includes('buzz') || m.includes('budget') || m.includes('balance') || m.includes('credit');
+  // A generic shortfall token that, on its OWN, can describe a NON-money failure
+  // ("insufficient VRAM", "insufficient permissions", "not enough disk"). It only
+  // counts as insufficient-Buzz in CONJUNCTION with a money noun — this is the
+  // load-bearing rule that keeps a wrong "Out of Buzz — top up" CTA (and the
+  // unnecessary purchase it could induce) off an unrelated failure. The bare
+  // `buzz`/`budget`/`balance` OR-matchers were already removed.
+  const shortfall = m.includes('insufficient') || m.includes('not enough');
   return (
-    m.includes('insufficient') ||
-    m.includes('not enough') ||
-    m.includes('enough buzz') ||
+    (shortfall && moneyNoun) || // "insufficient buzz budget…", "not enough balance"
+    m.includes('enough buzz') || // "you do not have enough Buzz"
     m.includes('out of buzz') ||
-    m.includes('exceeds budget') ||
+    // Budget/balance-SPECIFIC phrases are self-grounding (no separate noun needed):
+    m.includes('exceeds budget') || // the host preflight string's tail
     m.includes('budget exceeded') ||
     m.includes('over budget') ||
     m.includes('low balance') ||
