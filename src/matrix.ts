@@ -355,6 +355,70 @@ export function distinctLoraModifierCount(cells: readonly MatrixCell[]): number 
 }
 
 /**
+ * The billing "kind" of a cell — the equivalence class over which ONE estimate
+ * applies. A non-LoRA (baseline / prompt-style) cell is the cheap base kind
+ * (`'base'`); a LoRA cell's kind is its (`loraVersionId`, `loraStrength`) pair
+ * (a different LoRA — or the same LoRA at a different strength — can cost
+ * differently). Prompt-style suffixes do NOT change the gen cost (same model,
+ * same params shape), so every prompt-style column collapses into `'base'`.
+ *
+ * This is the granularity of the PER-KIND estimate (see `matrixTotalLabelByKind`)
+ * that lets the "≈" real-estimate headline SURVIVE the multi-LoRA compare case:
+ * instead of one representative estimate over the whole matrix (which undercounts
+ * when ≥2 distinct LoRAs differ), we estimate one cell PER kind and sum.
+ *
+ * PURE — display/estimate-plumbing only; never touches the cap or accounting.
+ */
+export function cellKindKey(modifier: ModifierOption): string {
+  return modifier.loraVersionId != null
+    ? `lora:${modifier.loraVersionId}:${modifier.loraStrength ?? DEFAULT_LORA_STRENGTH}`
+    : 'base';
+}
+
+/** The distinct billing kinds present among a matrix's generatable cells. */
+export function distinctCellKinds(cells: readonly MatrixCell[]): string[] {
+  const kinds = new Set<string>();
+  for (const cell of generatableCells(cells)) kinds.add(cellKindKey(cell.modifier));
+  return [...kinds];
+}
+
+/** A per-kind estimate map: kind key (see `cellKindKey`) → per-cell Buzz. */
+export type KindEstimates = Readonly<Record<string, number>>;
+
+/** True when `v` is a usable positive, finite per-cell estimate. */
+function usableEstimate(v: number | null | undefined): v is number {
+  return v != null && Number.isFinite(v) && v > 0;
+}
+
+/**
+ * Sum the matrix total from a PER-KIND estimate map: each generatable cell costs
+ * its own kind's estimate. `complete` is true only when EVERY distinct kind
+ * present has a usable estimate — the caller shows the precise "≈" headline only
+ * then; otherwise it falls back to the conservative cap-based ceiling (a cell
+ * whose kind lacks an estimate is charged the safety cap in the sum, so the
+ * number can never be materially exceeded regardless).
+ *
+ * PURE — drives only the displayed label; never the cap, confirm gate, or spend.
+ */
+export function estimateMatrixTotalByKind(
+  cells: readonly MatrixCell[],
+  kindEstimates: KindEstimates,
+): { total: number; complete: boolean } {
+  let total = 0;
+  let complete = true;
+  for (const cell of generatableCells(cells)) {
+    const est = kindEstimates[cellKindKey(cell.modifier)];
+    if (usableEstimate(est)) {
+      total += est;
+    } else {
+      complete = false;
+      total += PAGE_BUZZ_BUDGET_PER_CELL;
+    }
+  }
+  return { total, complete };
+}
+
+/**
  * Total estimated Buzz for a matrix. Uses the per-cell estimate when known
  * (from the orchestrator estimate call), else the manifest per-cell budget as
  * a conservative fallback. Only generatable (non-blocked) cells cost anything.
@@ -457,14 +521,49 @@ export interface CostLabel {
   amount: string;
   /** True when the number is the cap-based worst case, not a real estimate. */
   isCeiling: boolean;
+  /**
+   * The cap-based safety maximum (per-cell cap × cells), formatted. ALWAYS
+   * present so the UI can demote it to a secondary "safety max N" hint/tooltip
+   * even when the headline is the precise "≈" estimate. When `isCeiling` is true
+   * this equals the headline number.
+   */
+  ceilingAmount: string;
 }
 
+/**
+ * A displayable cost label for a matrix total.
+ *
+ * The second argument accepts EITHER:
+ *  - a single per-cell number (or null) — the LEGACY representative-estimate path
+ *    (one estimate applied to every cell). Honest only when ≤1 distinct LoRA is
+ *    selected; with ≥2 distinct LoRAs a non-first LoRA may cost more than the
+ *    representative, so this path falls back to the cap-based ceiling; or
+ *  - a PER-KIND estimate map (`KindEstimates`) — the preferred path that keeps
+ *    the precise "≈" headline even when the matrix mixes ≥2 distinct LoRAs, by
+ *    estimating one cell per billing kind and summing (`estimateMatrixTotalByKind`).
+ *    The "≈" shows only when every distinct kind has a usable estimate.
+ *
+ * Either way the ceiling (cap × cells) is returned as `ceilingAmount` so the UI
+ * can HEADLINE the real "≈" estimate and demote the ceiling to a "safety max …"
+ * hint rather than anchoring on the ceiling.
+ */
 export function matrixTotalLabel(
   cells: readonly MatrixCell[],
-  perCellEstimate: number | null | undefined,
+  estimate: number | null | undefined | KindEstimates,
 ): CostLabel {
-  const haveEstimate =
-    perCellEstimate != null && Number.isFinite(perCellEstimate) && perCellEstimate > 0;
+  const ceilingAmount = formatCost(estimateMatrixTotal(cells, null));
+
+  // Per-kind path: precise "≈" survives the multi-LoRA compare case.
+  if (estimate != null && typeof estimate === 'object') {
+    const { total, complete } = estimateMatrixTotalByKind(cells, estimate);
+    return complete
+      ? { amount: `≈ ${formatCost(total)}`, isCeiling: false, ceilingAmount }
+      : { amount: `up to ${ceilingAmount}`, isCeiling: true, ceilingAmount };
+  }
+
+  // Legacy single-representative-estimate path (unchanged honesty rule).
+  const perCellEstimate = estimate;
+  const haveEstimate = usableEstimate(perCellEstimate);
   // The representative estimate uses the FIRST (priciest) LoRA, so it over-covers
   // a matrix with ≤1 distinct LoRA. With ≥2 DISTINCT LoRAs a non-first one may
   // cost more → the "≈" could be materially exceeded → show the ceiling instead.
@@ -473,8 +572,8 @@ export function matrixTotalLabel(
   const total = estimateMatrixTotal(cells, known ? perCellEstimate : null);
   const formatted = formatCost(total);
   return known
-    ? { amount: `≈ ${formatted}`, isCeiling: false }
-    : { amount: `up to ${formatted}`, isCeiling: true };
+    ? { amount: `≈ ${formatted}`, isCeiling: false, ceilingAmount }
+    : { amount: `up to ${formatted}`, isCeiling: true, ceilingAmount };
 }
 
 /**
@@ -495,6 +594,29 @@ export function failedCellLabel(): string {
 export function failedCellDetail(error: string | null | undefined): string | undefined {
   const trimmed = error?.trim();
   return trimmed && trimmed.length > 0 ? trimmed : undefined;
+}
+
+/**
+ * A plain-language reason for a `blocked` (server-incompatible) cell, so the
+ * muted "Incompatible" chip isn't a dead end — the user learns WHY and what to
+ * do. When the LoRA carries a `baseModelFamily` we name both families and the
+ * fix ("This LoRA is SDXL; your checkpoint is Pony — pick an SDXL checkpoint").
+ * Falls back to the stored server error, then a generic line, so a tooltip is
+ * ALWAYS available. PURE + constant-ish so the copy is tested in one place.
+ */
+export function incompatibleCellReason(cell: {
+  checkpoint: Pick<CheckpointOption, 'baseModel'>;
+  modifier: Pick<ModifierOption, 'baseModelFamily'>;
+  error?: string | null;
+}): string {
+  const family = cell.modifier.baseModelFamily?.trim();
+  const ckpt = cell.checkpoint.baseModel?.trim();
+  if (family && ckpt) {
+    return `This LoRA is ${family}; your checkpoint is ${ckpt} — pick a ${family} checkpoint (or a LoRA that matches ${ckpt}).`;
+  }
+  const stored = cell.error?.trim();
+  if (stored && stored.length > 0) return stored;
+  return 'This LoRA is not compatible with the selected checkpoint — pick a checkpoint that matches the LoRA, or a compatible LoRA.';
 }
 
 /**

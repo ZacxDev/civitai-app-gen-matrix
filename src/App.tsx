@@ -32,6 +32,9 @@ import {
   billableCellCount,
   buildCellBody,
   buildMatrix,
+  cellKindKey,
+  composeCellPrompt,
+  incompatibleCellReason,
   clampLoraStrength,
   DEFAULT_LORA_STRENGTH,
   LORA_STRENGTH_MAX,
@@ -52,8 +55,6 @@ import {
   nextCellsToStart,
   POLL_MAX_ATTEMPTS,
   timedOutCellLabel,
-  representativeEstimateBody,
-  estimateSignature,
   runProgressLabel,
   isUncancelableInFlight,
   uncancelableInFlightCount,
@@ -220,7 +221,13 @@ export function App() {
   const [selectedCkpts, setSelectedCkpts] = useState<Set<number>>(
     () => new Set([CHECKPOINTS[0]?.versionId].filter((v): v is number => v != null)),
   );
-  const [selectedMods, setSelectedMods] = useState<Set<string>>(() => new Set(['baseline']));
+  // Default-select TWO styles so the out-of-box matrix demonstrates a real
+  // comparison (a 1-cell "matrix" doesn't). Baseline (no-style reference) +
+  // Cinematic — both prompt-style (non-LoRA), so the default run never hinges on
+  // a server compatibility check.
+  const [selectedMods, setSelectedMods] = useState<Set<string>>(
+    () => new Set(['baseline', 'cinematic']),
+  );
 
   // Picker-added axis members. The host's native resource picker
   // (useResourcePicker) returns one resource at a time; each becomes a LoRA
@@ -258,6 +265,16 @@ export function App() {
 
   // ---- Run state (the matrix reducer) ----
   const [state, dispatch] = useReducer(matrixReducer, initialMatrixState);
+
+  // Per-cell enlarge lightbox (shows the UNCROPPED paid output + copy-URL). Null
+  // = closed. Reached only from a revealed/safe thumbnail (see MaturityImage).
+  const [lightbox, setLightbox] = useState<{
+    src: string;
+    alt: string;
+    nsfwLevel: number | null | undefined;
+  } | null>(null);
+  // "New matrix" confirm gate — deleting a paid run must be intentional.
+  const [confirmReset, setConfirmReset] = useState(false);
 
   // Auto-resume intent across the consent round-trip.
   const consentPendingRef = useRef(false);
@@ -346,50 +363,84 @@ export function App() {
   const billable = billableCellCount(previewCells);
   const over = exceedsCap(previewCells);
 
-  // ---- Build-phase representative estimate (best-effort, debounced) ----
-  // Fire ONE estimate() against a REPRESENTATIVE cell while the user is still
-  // building, so the summary + confirm gate can show "≈ N Buzz" instead of the
-  // ~25× over the cap-based "up to M". Best-effort: a slow/failed estimate never
-  // blocks the UI or the Generate button and never changes the cap/spend logic.
-  const [buildEstimate, setBuildEstimate] = useState<number | null>(null);
-  // The signature of the selection bits that materially change the estimate;
-  // re-estimate (debounced) only when it changes.
-  const estSig = estimateSignature(prompt, chosenCheckpoints, chosenModifiers);
-  const buildEstimateBody = useMemo(
-    () => representativeEstimateBody(prompt, chosenCheckpoints, chosenModifiers),
-    [prompt, chosenCheckpoints, chosenModifiers],
-  );
+  // ---- Build-phase PER-KIND estimate (best-effort, debounced) ----
+  // Fire one estimate() per DISTINCT billing kind (baseline/prompt-style = the
+  // 'base' kind; each distinct LoRA = its own kind) while the user is still
+  // building, so the summary + confirm gate can HEADLINE a real "≈ N Buzz" total
+  // — and, crucially, that "≈" SURVIVES the multi-LoRA compare case (a single
+  // representative estimate would undercount when ≥2 distinct LoRAs differ). At
+  // most a few estimates fire (kinds ≤ selected columns ≤ the cell cap).
+  // Best-effort: a slow/failed estimate never blocks the UI or Generate and never
+  // changes the cap/spend logic — a kind with no estimate falls to the ceiling.
+  const [buildKindEstimates, setBuildKindEstimates] = useState<Record<string, number>>({});
+  const firstCheckpoint = chosenCheckpoints[0];
+  // One representative modifier per distinct kind (first wins), stable-keyed.
+  const kindReps = useMemo(() => {
+    const map = new Map<string, ModifierOption>();
+    for (const m of chosenModifiers) {
+      const k = cellKindKey(m);
+      if (!map.has(k)) map.set(k, m);
+    }
+    return map;
+  }, [chosenModifiers]);
+  // The material signature — re-estimate (debounced) only when the prompt, the
+  // representative checkpoint, or the set of distinct kinds changes.
+  const kindSig = [
+    prompt.trim(),
+    firstCheckpoint?.versionId ?? 'none',
+    [...kindReps.keys()].sort().join(','),
+  ].join('|');
   useEffect(() => {
-    // Nothing meaningful to estimate yet (empty prompt / no checkpoint) → keep
-    // the cap-based fallback. Don't clear a prior estimate to null on every
-    // keystroke gap; just skip until there's something to price.
-    if (!buildEstimateBody) return;
+    if (prompt.trim().length === 0 || !firstCheckpoint || kindReps.size === 0) return;
     let cancelled = false;
     const handle = setTimeout(() => {
-      fns.current
-        .estimate(buildEstimateBody)
-        .then((e) => {
-          if (cancelled) return;
-          const total = e.cost?.total;
-          if (total != null && Number.isFinite(total) && total > 0) setBuildEstimate(total);
-        })
-        .catch(() => {
-          /* best-effort — leave the cap-based fallback in place */
-        });
+      const reps = [...kindReps.entries()];
+      Promise.all(
+        reps.map(async ([kind, modifier]) => {
+          const body = buildCellBody(firstCheckpoint, composeCellPrompt(prompt, modifier), modifier);
+          try {
+            const e = await fns.current.estimate(body);
+            const total = e.cost?.total;
+            if (total != null && Number.isFinite(total) && total > 0) {
+              return [kind, total] as const;
+            }
+          } catch {
+            /* best-effort — this kind falls to the ceiling in the total */
+          }
+          return null;
+        }),
+      ).then((results) => {
+        if (cancelled) return;
+        // Replace wholesale for this signature so a stale kind's estimate can't
+        // linger after the prompt/checkpoint (which changes ALL costs) changes.
+        const next: Record<string, number> = {};
+        for (const r of results) if (r) next[r[0]] = r[1];
+        setBuildKindEstimates(next);
+      });
     }, 500);
     return () => {
       cancelled = true;
       clearTimeout(handle);
     };
-    // estSig captures the material selection bits; buildEstimateBody is derived
-    // from the same inputs. Keying the effect on estSig debounces per-material-change.
+    // kindSig captures the material selection bits; the effect body reads the
+    // current prompt/checkpoint/kindReps. Keying on kindSig debounces per-change.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [estSig]);
+  }, [kindSig]);
 
-  // The preview total uses the real build-phase estimate once it has landed
-  // (→ "≈ N"); until then it's the cap-based MAXIMUM ("up to M"). matrixTotalLabel
-  // tags it so the UI never presents the ceiling as what you'll spend.
-  const previewLabel = matrixTotalLabel(previewCells, buildEstimate);
+  // A single representative per-cell number (the priciest known kind, so it
+  // over-covers) to seed the run + the Top-Up suggestion. The DISPLAY total uses
+  // the full per-kind map (below); this is only the run/topup scalar.
+  const repCellEstimate = useMemo(() => {
+    const vals = Object.values(buildKindEstimates).filter(
+      (v) => Number.isFinite(v) && v > 0,
+    );
+    return vals.length ? Math.max(...vals) : null;
+  }, [buildKindEstimates]);
+
+  // The preview total HEADLINES the real per-kind "≈ N" once estimates land
+  // (surviving multi-LoRA); until then it's the cap-based MAXIMUM ("up to M"),
+  // with the ceiling always available as a demoted "safety max" hint.
+  const previewLabel = matrixTotalLabel(previewCells, buildKindEstimates);
 
   // ---- Selection toggles ----
   const toggleCkpt = useCallback((versionId: number) => {
@@ -778,11 +829,11 @@ export function App() {
     // landed) so it shows "≈ N" immediately instead of the cap-based "up to M".
     // BUILD resets perCellEstimate to null, so re-apply it here; the first cell's
     // own estimate will refine it during the run. Best-effort: null is fine.
-    if (buildEstimate != null) {
-      dispatch({ type: 'SET_PER_CELL_ESTIMATE', estimate: buildEstimate });
+    if (repCellEstimate != null) {
+      dispatch({ type: 'SET_PER_CELL_ESTIMATE', estimate: repCellEstimate });
     }
     dispatch({ type: 'REQUEST_CONFIRM' });
-  }, [viewer, over, billable, prompt, chosenCheckpoints, chosenModifiers, buildEstimate, requestSignIn]);
+  }, [viewer, over, billable, prompt, chosenCheckpoints, chosenModifiers, repCellEstimate, requestSignIn]);
 
   const startRun = useCallback(() => {
     if (!granted) {
@@ -894,10 +945,10 @@ export function App() {
   const inBuild = state.phase === 'building';
   const showConfirm = state.phase === 'confirming' || state.phase === 'needs-consent';
   const showGrid = state.phase === 'running' || state.phase === 'done';
-  // The confirm gate uses the REAL per-cell estimate once it has landed
-  // (perCellEstimate, seeded by the first cell's estimate call); until then it
-  // is a cap-based maximum, surfaced as "up to N" rather than expected spend.
-  const confirmLabel = matrixTotalLabel(state.cells, state.perCellEstimate);
+  // The confirm gate HEADLINES the real per-kind "≈ N" once estimates have landed
+  // (surviving the multi-LoRA compare case); until then it is a cap-based maximum,
+  // surfaced as "up to N" with the ceiling demoted to a "safety max" hint.
+  const confirmLabel = matrixTotalLabel(state.cells, buildKindEstimates);
   const anyInsufficient = state.cells.some((cell) => cell.status === 'insufficient');
   // Retry is offered once the run is done and at least one cell is retryable.
   const canRetry =
@@ -982,10 +1033,43 @@ export function App() {
             phase={state.phase}
             canRetry={canRetry}
             maturityGate={maturityGate}
-            onReset={handleReset}
+            onReset={() => setConfirmReset(true)}
             onStop={handleStop}
             onRetry={handleRetryFailed}
             onRecheck={handleRecheckTimedout}
+            onEnlarge={(cell) =>
+              cell.imageUrl &&
+              setLightbox({
+                src: cell.imageUrl,
+                alt: `${cell.checkpoint.label} · ${cell.modifier.label}`,
+                nsfwLevel: cell.nsfwLevel,
+              })
+            }
+          />
+        )}
+
+        {confirmReset && (
+          <ResetConfirmDialog
+            c={c}
+            onConfirm={() => {
+              setConfirmReset(false);
+              handleReset();
+            }}
+            onCancel={() => setConfirmReset(false)}
+          />
+        )}
+
+        {lightbox && (
+          <Lightbox
+            c={c}
+            src={lightbox.src}
+            alt={lightbox.alt}
+            nsfwLevel={lightbox.nsfwLevel}
+            gate={maturityGate}
+            onClose={() => setLightbox(null)}
+            onCopied={() =>
+              toastRef.current?.show({ message: 'Image URL copied', color: 'success' })
+            }
           />
         )}
 
@@ -1090,7 +1174,7 @@ export function BuildPanel(props: {
       </div>
 
       <fieldset style={fieldsetStyle(c)}>
-        <legend style={legendStyle}>Checkpoints (rows)</legend>
+        <legend style={legendStyle}>Models (checkpoints)</legend>
         <div style={chipRow}>
           {checkpoints.map((ckpt: CheckpointOption) => (
             <Chip
@@ -1195,8 +1279,22 @@ export function BuildPanel(props: {
           {billable} of {MAX_CELLS}
         </strong>{' '}
         cell{billable === 1 ? '' : 's'} · <strong>{previewLabel.amount}</strong> Buzz
-        {previewLabel.isCeiling && (
+        {previewLabel.isCeiling ? (
           <span style={{ opacity: 0.7 }}> max — real cost is usually far less</span>
+        ) : (
+          // The "≈" real estimate is the headline; the cap-based ceiling is
+          // demoted to a small "safety max" hint (never the anchor). I3.
+          <Tooltip
+            label={`Safety max ${previewLabel.ceilingAmount} Buzz — the per-cell safety cap × cells. Real cost is usually far less.`}
+          >
+            <span
+              tabIndex={0}
+              data-testid="gm-safety-max"
+              style={{ opacity: 0.7, marginLeft: 6, cursor: 'help', fontSize: 12 }}
+            >
+              safety max {previewLabel.ceilingAmount}
+            </span>
+          </Tooltip>
         )}
         {over && (
           <>
@@ -1283,7 +1381,7 @@ export function ConfirmPanel(props: {
           This spends real Buzz — one charge per cell, only its real cost (usually a few Buzz).
           {label.isCeiling
             ? ` ${PAGE_BUZZ_BUDGET_PER_CELL.toLocaleString()} Buzz per cell is the safety cap, not what you'll spend.`
-            : ''}{' '}
+            : ` Safety max ${label.ceilingAmount} Buzz total.`}{' '}
           Nothing is spent until you confirm.
         </p>
         {needsConsent && (
@@ -1319,6 +1417,206 @@ export function ConfirmPanel(props: {
 }
 
 // ---------------------------------------------------------------------------
+// Enlarge lightbox + copy-image-URL (the only sandbox-legal "keep" path)
+// ---------------------------------------------------------------------------
+
+/**
+ * Copy a URL to the clipboard from inside the opaque-origin sandboxed iframe.
+ * Prefers the async Clipboard API; falls back to a hidden-textarea +
+ * `document.execCommand('copy')` because the async API can be unavailable in an
+ * `allow-scripts`-only iframe. A real file download is a host-bridge capability
+ * (out of scope) — copying the URL is the sandbox-legal "keep" action. Returns
+ * whether the copy succeeded.
+ */
+export async function copyImageUrl(url: string): Promise<boolean> {
+  try {
+    if (typeof navigator !== 'undefined' && navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(url);
+      return true;
+    }
+  } catch {
+    /* fall through to the execCommand fallback */
+  }
+  try {
+    const ta = document.createElement('textarea');
+    ta.value = url;
+    ta.setAttribute('readonly', '');
+    ta.style.position = 'fixed';
+    ta.style.top = '0';
+    ta.style.left = '0';
+    ta.style.opacity = '0';
+    document.body.appendChild(ta);
+    ta.focus();
+    ta.select();
+    const ok = document.execCommand('copy');
+    document.body.removeChild(ta);
+    return ok;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Per-cell enlarge lightbox (I1): shows the FULL paid output UNCROPPED (the grid
+ * thumbnail force-crops to a square) + a copy-image-URL action. A real modal
+ * (focus trap / Escape / restore via useModalA11y). The image renders through
+ * the SAME `MaturityImage` gate (fail-closed blur preserved) with `crop={false}`.
+ */
+export function Lightbox({
+  c,
+  src,
+  alt,
+  nsfwLevel,
+  gate,
+  onClose,
+  onCopied,
+}: {
+  c: Palette;
+  src: string;
+  alt: string;
+  nsfwLevel: number | null | undefined;
+  gate: MaturityGate;
+  onClose: () => void;
+  onCopied: () => void;
+}) {
+  const dialogRef = useRef<HTMLDivElement>(null);
+  useModalA11y(dialogRef, true, onClose);
+  const [copied, setCopied] = useState(false);
+  const copiedTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useEffect(
+    () => () => {
+      if (copiedTimer.current) clearTimeout(copiedTimer.current);
+    },
+    [],
+  );
+  const handleCopy = useCallback(async () => {
+    const ok = await copyImageUrl(src);
+    if (!ok) return;
+    setCopied(true);
+    onCopied();
+    if (copiedTimer.current) clearTimeout(copiedTimer.current);
+    copiedTimer.current = setTimeout(() => setCopied(false), 1600);
+  }, [src, onCopied]);
+
+  return (
+    <div
+      className="gm-backdrop"
+      style={backdropStyle()}
+      onMouseDown={(e) => {
+        if (e.target === e.currentTarget) onClose();
+      }}
+      data-testid="gm-lightbox-backdrop"
+    >
+      <div
+        ref={dialogRef}
+        role="dialog"
+        aria-modal="true"
+        aria-label={`Enlarged image: ${alt}`}
+        className="gm-dialog-enter"
+        style={lightboxBox(c)}
+        data-testid="gm-lightbox"
+      >
+        <MaturityImage src={src} alt={alt} nsfwLevel={nsfwLevel} gate={gate} crop={false} />
+        <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end', flexWrap: 'wrap' }}>
+          <button
+            type="button"
+            onClick={handleCopy}
+            style={primaryBtn(c)}
+            className="gm-chip"
+            data-autofocus
+            data-testid="gm-copy-url"
+          >
+            {copied ? 'Copied!' : 'Copy image URL'}
+          </button>
+          <button
+            type="button"
+            onClick={onClose}
+            style={secondaryBtn(c)}
+            className="gm-chip"
+            data-testid="gm-lightbox-close"
+          >
+            Close
+          </button>
+        </div>
+        {/* The raw URL is shown so it can be selected/copied by hand if the
+            clipboard write is blocked by the sandbox. */}
+        <p
+          style={{ ...noteStyle(c), margin: 0, wordBreak: 'break-all' }}
+          data-testid="gm-lightbox-url"
+        >
+          {src}
+        </p>
+      </div>
+    </div>
+  );
+}
+
+/**
+ * "New matrix" confirm gate (I2): `handleReset` deletes the paid run, so require
+ * an explicit confirm first. A real modal (useModalA11y).
+ */
+export function ResetConfirmDialog({
+  c,
+  onConfirm,
+  onCancel,
+}: {
+  c: Palette;
+  onConfirm: () => void;
+  onCancel: () => void;
+}) {
+  const dialogRef = useRef<HTMLDivElement>(null);
+  useModalA11y(dialogRef, true, onCancel);
+  return (
+    <div
+      className="gm-backdrop"
+      style={backdropStyle()}
+      onMouseDown={(e) => {
+        if (e.target === e.currentTarget) onCancel();
+      }}
+      data-testid="gm-reset-backdrop"
+    >
+      <div
+        ref={dialogRef}
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="gm-reset-title"
+        aria-describedby="gm-reset-desc"
+        className="gm-dialog-enter"
+        style={confirmBox(c)}
+      >
+        <p id="gm-reset-title" style={{ margin: 0, fontSize: 15 }}>
+          Start a new matrix?
+        </p>
+        <p id="gm-reset-desc" style={noteStyle(c)}>
+          Your current results will be cleared.
+        </p>
+        <div style={{ display: 'flex', gap: 8 }}>
+          <button
+            type="button"
+            onClick={onConfirm}
+            style={primaryBtn(c)}
+            className="gm-chip"
+            data-autofocus
+            data-testid="gm-reset-confirm"
+          >
+            Start new matrix
+          </button>
+          <button
+            type="button"
+            onClick={onCancel}
+            style={secondaryBtn(c)}
+            className="gm-chip"
+            data-testid="gm-reset-cancel"
+          >
+            Cancel
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
 // Result grid — rows=checkpoints, cols=modifiers
 // ---------------------------------------------------------------------------
 
@@ -1334,8 +1632,9 @@ export function ResultGrid(props: {
   onStop: () => void;
   onRetry: () => void;
   onRecheck: (cell: MatrixCell) => void;
+  onEnlarge: (cell: MatrixCell) => void;
 }) {
-  const { c, cells, checkpoints, modifiers, phase, canRetry, maturityGate, onReset, onStop, onRetry, onRecheck } =
+  const { c, cells, checkpoints, modifiers, phase, canRetry, maturityGate, onReset, onStop, onRetry, onRecheck, onEnlarge } =
     props;
   const byId = new Map(cells.map((cell) => [`${cell.row}:${cell.col}`, cell]));
   const spent = totalSpent(cells);
@@ -1447,7 +1746,7 @@ export function ResultGrid(props: {
                           ['--gm-stagger' as string]: `${Math.min(idx, totalCells) * 40}ms`,
                         }}
                       >
-                        <CellView c={c} cell={cell} maturityGate={maturityGate} onRecheck={onRecheck} />
+                        <CellView c={c} cell={cell} maturityGate={maturityGate} onRecheck={onRecheck} onEnlarge={onEnlarge} />
                       </div>
                     </td>
                   );
@@ -1467,18 +1766,28 @@ export function CellView({
   cell,
   maturityGate,
   onRecheck,
+  onEnlarge,
 }: {
   c: Palette;
   cell: MatrixCell | undefined;
   maturityGate: MaturityGate;
   onRecheck: (cell: MatrixCell) => void;
+  onEnlarge: (cell: MatrixCell) => void;
 }) {
   if (!cell) return <span style={{ color: c.muted }}>—</span>;
   switch (cell.status) {
-    case 'blocked':
+    case 'blocked': {
+      // Give the muted "Incompatible" chip a reason (I5) — WHY it's blocked and
+      // what to change — in a design-system Tooltip so the cell isn't a dead end.
+      const reason = incompatibleCellReason(cell);
       return (
-        <CellBox c={c} label="Incompatible" sub="no charge" tone="muted" />
+        <Tooltip label={reason}>
+          <span tabIndex={0} data-testid="gm-incompatible-detail" style={{ display: 'block' }}>
+            <CellBox c={c} label="Incompatible" sub="no charge" tone="muted" />
+          </span>
+        </Tooltip>
       );
+    }
     case 'canceled':
       return <CellBox c={c} label="Canceled" sub="no charge" tone="muted" />;
     case 'idle':
@@ -1557,6 +1866,7 @@ export function CellView({
               alt={`${cell.checkpoint.label} · ${cell.modifier.label}`}
               nsfwLevel={cell.nsfwLevel}
               gate={maturityGate}
+              onEnlarge={() => onEnlarge(cell)}
               fallback={<span style={{ fontSize: 12, color: c.muted }}>Image unavailable</span>}
             />
           ) : (
@@ -1888,6 +2198,21 @@ function confirmBox(c: Palette): React.CSSProperties {
     background: c.cardBg,
     width: '100%',
     maxWidth: 460,
+    boxSizing: 'border-box',
+    boxShadow: '0 8px 32px rgba(0,0,0,0.28)',
+  };
+}
+
+function lightboxBox(c: Palette): React.CSSProperties {
+  return {
+    border: `1px solid ${c.border}`,
+    borderRadius: 12,
+    padding: 12,
+    display: 'grid',
+    gap: 10,
+    background: c.cardBg,
+    width: '100%',
+    maxWidth: 720,
     boxSizing: 'border-box',
     boxShadow: '0 8px 32px rgba(0,0,0,0.28)',
   };

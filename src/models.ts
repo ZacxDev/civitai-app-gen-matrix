@@ -99,7 +99,9 @@ export interface ModifierOption {
  */
 export const BASELINE_MODIFIER: ModifierOption = {
   key: 'baseline',
-  label: 'Baseline',
+  // "No style (plain prompt)" reads far clearer than the jargon "Baseline" — it
+  // is literally the shared prompt with no modifier applied (the reference cell).
+  label: 'No style (plain prompt)',
   promptSuffix: '',
   loraVersionId: null,
 };

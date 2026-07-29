@@ -23,12 +23,16 @@ import {
   buildCellBody,
   buildMatrix,
   cellId,
+  cellKindKey,
   cellStatusForSnapshot,
   clampPrompt,
   composeCellPrompt,
+  distinctCellKinds,
   distinctLoraModifierCount,
   estimateMatrixTotal,
+  estimateMatrixTotalByKind,
   estimateSignature,
+  incompatibleCellReason,
   exceedsCap,
   failedCellDetail,
   failedCellLabel,
@@ -684,6 +688,137 @@ describe('matrixTotalLabel — mixed-LoRA falls back to the ceiling', () => {
   it('no estimate yet still shows the cap-based ceiling (unchanged behavior)', () => {
     const cells = buildMatrix('a cat', [ckptA], [modLoraCompat, modLoraB]);
     expect(matrixTotalLabel(cells, null).isCeiling).toBe(true);
+  });
+
+  it('every label carries a ceilingAmount for the demoted "safety max" hint (I3)', () => {
+    const cells = buildMatrix('a cat', [ckptA, ckptB], [modBase, modCine]); // 4 cells
+    // Ceiling = cap × 4 cells regardless of whether a real estimate landed.
+    const expected = formatCost(4 * PAGE_BUZZ_BUDGET_PER_CELL);
+    expect(matrixTotalLabel(cells, 8).ceilingAmount).toBe(expected);
+    expect(matrixTotalLabel(cells, null).ceilingAmount).toBe(expected);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// I3 — PER-KIND estimate: the real "≈" headline SURVIVES the multi-LoRA compare
+// case (a single representative estimate would fall back to the ceiling).
+// ---------------------------------------------------------------------------
+
+describe('cellKindKey + distinctCellKinds', () => {
+  it('collapses all non-LoRA (prompt-style) cells into the single "base" kind', () => {
+    expect(cellKindKey(modBase)).toBe('base');
+    expect(cellKindKey(modCine)).toBe('base');
+    const cells = buildMatrix('a cat', [ckptA, ckptB], [modBase, modCine]);
+    expect(distinctCellKinds(cells)).toEqual(['base']);
+  });
+
+  it('keys a LoRA kind by (versionId, strength) — same LoRA at a diff strength is distinct', () => {
+    // modLora = 407532@1, modLoraCompat = 407532@0.8 (see fixtures)
+    expect(cellKindKey(modLora)).not.toBe(cellKindKey(modLoraCompat));
+    const cells = buildMatrix('a cat', [ckptA], [modBase, modLora, modLoraCompat]);
+    // base + two distinct LoRA kinds.
+    expect(new Set(distinctCellKinds(cells)).size).toBe(3);
+  });
+
+  it('excludes blocked + canceled cells from the distinct kinds', () => {
+    const cells = buildMatrix('a cat', [ckptA], [modLoraCompat, modLoraB]).map((c) =>
+      c.modifier.key === 'lora-b' ? { ...c, status: 'blocked' as const } : c,
+    );
+    expect(distinctCellKinds(cells)).toEqual([cellKindKey(modLoraCompat)]);
+  });
+});
+
+describe('estimateMatrixTotalByKind', () => {
+  it('sums each cell at its own kind estimate and reports complete when all kinds priced', () => {
+    const cells = buildMatrix('a cat', [ckptA], [modBase, modLora, modLoraB]); // 3 kinds, 3 cells
+    const kindEstimates = {
+      base: 5,
+      [cellKindKey(modLora)]: 12,
+      [cellKindKey(modLoraB)]: 20,
+    };
+    const { total, complete } = estimateMatrixTotalByKind(cells, kindEstimates);
+    expect(total).toBe(5 + 12 + 20);
+    expect(complete).toBe(true);
+  });
+
+  it('is INCOMPLETE when a kind lacks an estimate, and charges that cell the cap (never under)', () => {
+    const cells = buildMatrix('a cat', [ckptA], [modBase, modLoraB]); // base + lora-b
+    const kindEstimates = { base: 5 }; // lora-b unpriced
+    const { total, complete } = estimateMatrixTotalByKind(cells, kindEstimates);
+    expect(complete).toBe(false);
+    expect(total).toBe(5 + PAGE_BUZZ_BUDGET_PER_CELL);
+  });
+});
+
+describe('matrixTotalLabel — PER-KIND map keeps "≈" across multiple distinct LoRAs (I3)', () => {
+  it('multi-DISTINCT-LoRA matrix now shows a precise "≈" when every kind is priced', () => {
+    const cells = buildMatrix('a cat', [ckptA], [modLoraCompat, modLoraB]); // 2 distinct LoRAs
+    const kindEstimates = {
+      [cellKindKey(modLoraCompat)]: 9,
+      [cellKindKey(modLoraB)]: 11,
+    };
+    const label = matrixTotalLabel(cells, kindEstimates);
+    expect(label.isCeiling).toBe(false);
+    expect(label.amount).toContain('≈');
+    expect(label.amount).toContain(formatCost(20)); // 9 + 11
+    // The ceiling is still available for the demoted "safety max" hint.
+    expect(label.ceilingAmount).toBe(formatCost(2 * PAGE_BUZZ_BUDGET_PER_CELL));
+  });
+
+  it('falls back to the ceiling when a kind is still unpriced (never an undercounting "≈")', () => {
+    const cells = buildMatrix('a cat', [ckptA], [modLoraCompat, modLoraB]);
+    const label = matrixTotalLabel(cells, { [cellKindKey(modLoraCompat)]: 9 }); // lora-b missing
+    expect(label.isCeiling).toBe(true);
+    expect(label.amount.toLowerCase()).toContain('up to');
+    expect(label.amount).not.toContain('≈');
+  });
+
+  it('an empty per-kind map reads as no estimate → the cap-based ceiling', () => {
+    const cells = buildMatrix('a cat', [ckptA, ckptB], [modBase, modCine]);
+    const label = matrixTotalLabel(cells, {});
+    expect(label.isCeiling).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// I5 — a blocked (incompatible) cell explains WHY + the fix.
+// ---------------------------------------------------------------------------
+
+describe('incompatibleCellReason', () => {
+  it('names both families and the fix when the LoRA carries a baseModelFamily', () => {
+    const reason = incompatibleCellReason({
+      checkpoint: { baseModel: 'Pony' },
+      modifier: { baseModelFamily: 'SDXL 1.0' },
+    });
+    expect(reason).toContain('SDXL 1.0');
+    expect(reason).toContain('Pony');
+    expect(reason.toLowerCase()).toContain('pick');
+  });
+
+  it('falls back to the stored server error when no family is known', () => {
+    const reason = incompatibleCellReason({
+      checkpoint: { baseModel: '' },
+      modifier: {},
+      error: 'not compatible with the checkpoint base model',
+    });
+    expect(reason).toBe('not compatible with the checkpoint base model');
+  });
+
+  it('always yields a non-empty generic reason as a last resort', () => {
+    const reason = incompatibleCellReason({ checkpoint: { baseModel: '' }, modifier: {} });
+    expect(reason.length).toBeGreaterThan(0);
+    expect(reason.toLowerCase()).toContain('compatible');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// I6 — terminology.
+// ---------------------------------------------------------------------------
+
+describe('terminology (I6)', () => {
+  it('the baseline column reads "No style (plain prompt)", not the jargon "Baseline"', () => {
+    expect(BASELINE_MODIFIER.label).toBe('No style (plain prompt)');
+    expect(MODIFIERS[0].label).toBe('No style (plain prompt)');
   });
 });
 
