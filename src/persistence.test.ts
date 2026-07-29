@@ -4,6 +4,7 @@ import {
   buildMatrix,
   matrixReducer,
   initialMatrixState,
+  MAX_CELLS,
   type CellStatus,
   type MatrixCell,
   type MatrixState,
@@ -105,6 +106,47 @@ describe('run manifest round-trip (M1)', () => {
     expect(restored.phase).toBe('running');
   });
 
+  it('WEDGE-FIX (A): a non-terminal cell (e.g. polling) WITHOUT a workflowId reclassifies to canceled — never left polling/running', () => {
+    // A corrupt/forged blob: `polling` implies it was submitted, but there is no
+    // workflowId to poll. Left verbatim it would drive phase:'running' yet could
+    // never be polled, completed, or stopped — a permanent wedge. It must be
+    // reclassified to the terminal, non-billable `canceled`.
+    const base = buildMatrix('a cat', ckpts, [mods[0]]);
+    const cells = [
+      withStatus(base[0], 'done', { workflowId: 'wf_0', imageUrl: 'i', cost: 8 }),
+      withStatus(base[1], 'polling', { workflowId: null }), // non-terminal but no id → wedge candidate
+    ];
+    const restored = restoreStateFromManifest(buildRunManifest(runningState(cells)))!;
+    const wedged = restored.cells.find((c) => c.id === base[1].id)!;
+    expect(wedged.status).toBe('canceled');
+    // No resumable cell remains → the run is terminal, not stuck in 'running'.
+    expect(restored.cells.some((c) => c.status === 'polling')).toBe(false);
+    expect(restored.phase).toBe('done');
+  });
+
+  it('MONEY-HONESTY (B): a `submitting` cell WITHOUT a workflowId restores to the non-committal timedout state — NEVER "no charge"', () => {
+    // The real-spend submit was in flight when we persisted; it may have reached
+    // the server and been charged. So it must NOT claim "no charge" (canceled) —
+    // it maps to the same non-committal "may still finish — check your Buzz"
+    // terminal state as a timed-out gen. An `estimating` cell without an id (an
+    // estimate does not charge) stays honest "no charge" canceled.
+    const base = buildMatrix('a cat', ckpts, mods); // 4 cells
+    const cells = [
+      withStatus(base[0], 'done', { workflowId: 'wf_0', imageUrl: 'i', cost: 8 }),
+      withStatus(base[1], 'submitting', { workflowId: null }), // may-have-charged
+      withStatus(base[2], 'estimating', { workflowId: null }), // estimate never charges
+      withStatus(base[3], 'idle', { workflowId: null }), // never started
+    ];
+    const restored = restoreStateFromManifest(buildRunManifest(runningState(cells)))!;
+    // submitting-without-id → timedout (may-have-charged), NOT canceled.
+    expect(restored.cells.find((c) => c.id === base[1].id)!.status).toBe('timedout');
+    // estimating / idle without an id → honest "no charge" canceled.
+    expect(restored.cells.find((c) => c.id === base[2].id)!.status).toBe('canceled');
+    expect(restored.cells.find((c) => c.id === base[3].id)!.status).toBe('canceled');
+    // timedout is terminal-ish (not resumable) → no re-poll, no re-charge on restore.
+    expect(restored.cells.some((c) => c.status === 'polling')).toBe(false);
+  });
+
   it('a timedout cell restores verbatim (its own recheck path handles it)', () => {
     const base = buildMatrix('a cat', ckpts, [mods[0]]);
     const cells = [
@@ -163,6 +205,26 @@ describe('run manifest round-trip (M1)', () => {
     expect(weird?.workflowId).toBeNull();
     // Whole run is terminal (no re-pollable cell) → done, and nothing throws.
     expect(restored!.phase).toBe('done');
+  });
+
+  it('DoS-BOUND (D): a forged giant grid is clamped to MAX_CELLS cells on restore', () => {
+    const one = withStatus(buildMatrix('a cat', [ckpts[0]], [mods[0]])[0], 'done', {
+      workflowId: 'w',
+      imageUrl: 'i',
+      cost: 8,
+    });
+    // A legit startable grid can never exceed MAX_CELLS total; forge 10× that.
+    const giant = Array.from({ length: MAX_CELLS * 10 }, (_, i) => ({
+      ...one,
+      id: `forged::${i}`,
+    }));
+    const restored = restoreStateFromManifest({
+      version: RUN_MANIFEST_VERSION,
+      savedAt: new Date(0).toISOString(),
+      perCellEstimate: 8,
+      cells: giant,
+    })!;
+    expect(restored.cells.length).toBeLessThanOrEqual(MAX_CELLS);
   });
 
   it('coerces a non-numeric perCellEstimate to null', () => {

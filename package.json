@@ -1,6 +1,6 @@
 {
   "name": "gen-matrix",
-  "version": "0.8.0",
+  "version": "0.8.1",
   "private": true,
   "description": "Gen Matrix — a Civitai App Block (W10 full-page) that generates a bounded grid of (checkpoint × modifier) cells so users can compare how each model/style changes the output. Spends real Buzz per cell via the page money path (estimate → consent → submit → poll), with a concurrency-limited queue, a client-side cell cap, and a confirm-before-spend total-cost gate. The LoRA second axis submits checkpoint + LoRA pairings live; compatibility is deferred to the server (incompatible pairings are rejected pre-spend and shown as muted/blocked, costing 0).",
   "type": "module",

@@ -20,6 +20,7 @@ import {
   type MatrixCell,
   type MatrixState,
   isRunComplete,
+  MAX_CELLS,
 } from './matrix.js';
 
 /** The per-viewer `useAppStorage` key the current run is persisted under. */
@@ -123,7 +124,12 @@ function isReconcileFinal(status: CellStatus): boolean {
 export function restoreStateFromManifest(manifest: unknown): MatrixState | null {
   if (!isValidManifest(manifest)) return null;
   const cells: MatrixCell[] = [];
-  for (const raw of manifest.cells) {
+  // Bound a forged-giant-grid render DoS: a legit STARTABLE grid can never exceed
+  // MAX_CELLS total cells (exceedsCap blocks a run start when total idle cells >
+  // MAX_CELLS, and no transition ADDS cells), so a manifest with more cells than
+  // that is corrupt/forged. Clamp before we sanitize+render the whole array.
+  const rawCells = manifest.cells.slice(0, MAX_CELLS);
+  for (const raw of rawCells) {
     // Defense-in-depth: the manifest is a per-viewer blob that could be corrupt
     // or forged. Sanitize each cell to a known-good shape (dropping structurally
     // broken ones) BEFORE the status normalization, so a bogus blob can never
@@ -131,9 +137,26 @@ export function restoreStateFromManifest(manifest: unknown): MatrixState | null 
     const cell = sanitizeCell(raw);
     if (!cell) continue;
     const submitted = cell.workflowId != null;
-    if (!submitted && (cell.status === 'idle' || cell.status === 'estimating' || cell.status === 'submitting')) {
-      // Never submitted → never billed → do NOT auto-run on reload.
-      cells.push({ ...cell, status: 'canceled' });
+    if (!submitted && !isTerminalCell(cell.status)) {
+      // Never acquired a workflowId → never got past the client. Two HONEST
+      // outcomes, split by how far the interrupted cell had progressed:
+      if (cell.status === 'submitting') {
+        // The real-spend `sub(body)` call was in flight when we persisted — it
+        // MAY have reached the server and been charged. So this is NOT "no
+        // charge": use the same non-committal, terminal-ish "may still finish —
+        // check your Buzz" state as a timed-out gen (mirrors the honest
+        // stopInProgressWarning wording). NEVER re-submits, NEVER re-charges.
+        cells.push({ ...cell, status: 'timedout' });
+      } else {
+        // idle / estimating / polling without an id → never billed (an estimate
+        // does not charge; a `polling`/other non-terminal status with a null
+        // workflowId is a corrupt/forged cell that never actually ran). Flip to
+        // an honest "no charge" cancel. This is status-agnostic on purpose: a
+        // forged non-terminal blob (e.g. `polling` sans id) would otherwise fall
+        // through, be pushed verbatim, drive phase:'running', and WEDGE the grid
+        // in a state that can never be polled, completed, or stopped.
+        cells.push({ ...cell, status: 'canceled' });
+      }
     } else if (submitted && (cell.status === 'estimating' || cell.status === 'submitting' || cell.status === 'polling')) {
       // Already submitted + still in flight → recover by re-polling (no re-charge).
       cells.push({ ...cell, status: 'polling' });
@@ -279,7 +302,9 @@ export function reconcileCells(
     if (cell.workflowId == null) return cell;
     const wf = byId.get(cell.workflowId);
     if (!wf) return cell;
-    const img = wf.images[0];
+    // A forged / partial host row may omit `images` entirely — optional-chain so
+    // the reconcile effect can't throw on a missing array.
+    const img = wf.images?.[0];
     if (isReconcileFinal(cell.status)) {
       // Enrich-only: fill gaps (notably nsfwLevel for the maturity gate), keep status.
       return {

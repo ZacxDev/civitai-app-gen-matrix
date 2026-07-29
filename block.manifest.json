@@ -1,7 +1,7 @@
 {
   "$schema": "https://civitai.com/schemas/app-block/v1.json",
   "blockId": "gen-matrix",
-  "version": "0.8.0",
+  "version": "0.8.1",
   "name": "Gen Matrix",
   "type": "block",
   "scopes": ["ai:write:budgeted"],
