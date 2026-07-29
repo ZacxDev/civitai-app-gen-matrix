@@ -5,6 +5,9 @@
   "name": "Gen Matrix",
   "type": "block",
   "scopes": ["ai:write:budgeted"],
+  "scopeJustifications": {
+    "ai:write:budgeted": "Spends the viewer's Buzz to generate each matrix cell's image, capped by page.buzzBudgetPerGen and confirmed behind an explicit per-run estimate + Confirm step."
+  },
   "page": {
     "path": "/",
     "title": "Gen Matrix",
