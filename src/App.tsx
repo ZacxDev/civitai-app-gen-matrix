@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from 'react';
 
 import {
+  useAppStorage,
+  useAppWorkflows,
   useBlockContext,
   useBlockResize,
   useBlockToken,
@@ -11,6 +13,7 @@ import {
   useRequestSignIn,
   useResourcePicker,
 } from '@civitai/blocks-react';
+import { Slider, Tooltip, useToast } from '@civitai/components-react';
 import type { BlockWorkflowSnapshot } from '@civitai/app-sdk/blocks';
 
 import {
@@ -29,6 +32,10 @@ import {
   billableCellCount,
   buildCellBody,
   buildMatrix,
+  clampLoraStrength,
+  DEFAULT_LORA_STRENGTH,
+  LORA_STRENGTH_MAX,
+  LORA_STRENGTH_MIN,
   exceedsCap,
   failedCellDetail,
   failedCellLabel,
@@ -60,6 +67,17 @@ import { ResourceBrowser } from './ResourceBrowser.js';
 import { CatalogCache, defaultKvStore } from './catalog-cache.js';
 import { DEFAULT_LIMIT, fetchCatalog, type CatalogQuery } from './catalog-api.js';
 import { loraBaseModelFilter } from './ecosystem.js';
+import { palette, type Palette } from './theme.js';
+import { MaturityImage } from './MaturityImage.js';
+import {
+  RUN_STORAGE_KEY,
+  buildRunManifest,
+  isPersistableRun,
+  reconcileCells,
+  restoreStateFromManifest,
+  type AppWorkflowLike,
+  type MaturityGate,
+} from './persistence.js';
 
 /**
  * Stable empty-array identity for ResourceBrowser's `checkpointBaseModels` prop
@@ -167,12 +185,27 @@ export function App() {
   // The block's domain maturity ceiling (fail-closed SFW). Threaded into the
   // anon catalog read so a red-domain block's anon browse can show mature while
   // green/blue stay SFW. The token (signed-in) path ignores it — server clamps.
-  const { isSfw: domainIsSfw } = useDomainMaturity();
+  // ALSO drives the G1 result-image maturity gate (below).
+  const domainMaturity = useDomainMaturity();
+  const { isSfw: domainIsSfw } = domainMaturity;
   const { estimate, submit, poll, cancel } = useBuzzWorkflow();
   const { requestConsent } = useRequestConsent();
   const { requestSignIn } = useRequestSignIn();
   const { openPurchaseModal } = useBuzzPurchase();
   const { open: openResourcePicker } = useResourcePicker();
+  // M1 — the persistent read-model. `useAppStorage` (per-viewer KV that survives
+  // reload) holds the run manifest; `useAppWorkflows` is the host's authoritative,
+  // per-app-tag-scoped list we reconcile against for status/image/nsfwLevel/cost.
+  const storage = useAppStorage();
+  const { workflows: appWorkflows, refetch: refetchWorkflows } = useAppWorkflows();
+  const toast = useToast();
+
+  // G1 — the domain ceiling the result-image gate consults (stable identity for
+  // deps). `isLevelAllowed`/`isSfw` are re-read live from useDomainMaturity.
+  const maturityGate = useMemo<MaturityGate>(
+    () => ({ isLevelAllowed: domainMaturity.isLevelAllowed, isSfw: domainMaturity.isSfw }),
+    [domainMaturity.isLevelAllowed, domainMaturity.isSfw],
+  );
 
   const isDark = theme === 'dark';
   const c = palette(isDark);
@@ -216,6 +249,13 @@ export function App() {
   );
   const allModifiers = useMemo<ModifierOption[]>(() => [...MODIFIERS, ...pickedMods], [pickedMods]);
 
+  // Per-LoRA strength overrides (design-system Slider). Keyed by modifier key so
+  // a picked/curated LoRA column's strength is user-tunable before spend. Applied
+  // when composing the chosen modifiers; server-clamped to [-1, 2] regardless.
+  const [strengthOverrides, setStrengthOverrides] = useState<Map<string, number>>(
+    () => new Map(),
+  );
+
   // ---- Run state (the matrix reducer) ----
   const [state, dispatch] = useReducer(matrixReducer, initialMatrixState);
 
@@ -223,11 +263,27 @@ export function App() {
   const consentPendingRef = useRef(false);
   // Per-cell poll cancellation tokens, torn down on unmount / reset.
   const pollTokensRef = useRef<Map<string, { cancelled: boolean }>>(new Map());
+  // M4 — submit idempotency guard. Cell ids that have entered `runCell` this run,
+  // so a StrictMode double-invoke / re-entrant queue tick can't fire a SECOND
+  // submit (a second real spend) for the same cell. Belt-and-suspenders: the
+  // platform's per-app Redis idempotency cap is the authoritative backstop, but
+  // this stops a duplicate leaving the client at all. Cleared on BUILD / RESET.
+  const submittedRef = useRef<Set<string>>(new Set());
+  // M1 — guards so the mount-time restore fires once and reconcile re-runs only
+  // when the read-model actually changes.
+  const restoredRef = useRef(false);
+  const reconciledSigRef = useRef<string>('');
 
   // Keep the latest hook fns in refs so the queue driver (an effect) always
   // calls the current instances without re-subscribing.
   const fns = useRef({ estimate, submit, poll, cancel });
   fns.current = { estimate, submit, poll, cancel };
+  // Toast API in a ref so the stable runCell/poll callbacks reach the current one.
+  const toastRef = useRef(toast);
+  toastRef.current = toast;
+  // refetch in a ref so the done-count effect doesn't churn on hook identity.
+  const refetchRef = useRef(refetchWorkflows);
+  refetchRef.current = refetchWorkflows;
 
   useEffect(() => {
     const tokens = pollTokensRef.current;
@@ -241,9 +297,46 @@ export function App() {
     [allCheckpoints, selectedCkpts],
   );
   const chosenModifiers = useMemo(
-    () => allModifiers.filter((m) => selectedMods.has(m.key)),
-    [allModifiers, selectedMods],
+    () =>
+      allModifiers
+        .filter((m) => selectedMods.has(m.key))
+        .map((m) =>
+          // Apply a user LoRA-strength override (Slider) to the selected column.
+          m.loraVersionId != null && strengthOverrides.has(m.key)
+            ? { ...m, loraStrength: clampLoraStrength(strengthOverrides.get(m.key)) }
+            : m,
+        ),
+    [allModifiers, selectedMods, strengthOverrides],
   );
+
+  // The selected LoRA columns whose strength the Slider can tune (build phase).
+  const selectedLoraModifiers = useMemo(
+    () => chosenModifiers.filter((m) => m.loraVersionId != null),
+    [chosenModifiers],
+  );
+  const setLoraStrength = useCallback((key: string, value: number) => {
+    setStrengthOverrides((prev) => {
+      const next = new Map(prev);
+      next.set(key, clampLoraStrength(value));
+      return next;
+    });
+  }, []);
+
+  // The result-grid axes are derived FROM the run's cells (their row/col), not
+  // the live selection — so a RESTORED run (M1) renders its own grid even though
+  // the build-panel selection has reset to the default. row/col are contiguous
+  // from buildMatrix, so the sorted maps reproduce the original axes.
+  const { gridCheckpoints, gridModifiers } = useMemo(() => {
+    const ckMap = new Map<number, CheckpointOption>();
+    const modMap = new Map<number, ModifierOption>();
+    for (const cell of state.cells) {
+      if (!ckMap.has(cell.row)) ckMap.set(cell.row, cell.checkpoint);
+      if (!modMap.has(cell.col)) modMap.set(cell.col, cell.modifier);
+    }
+    const byIndex = <T,>(m: Map<number, T>): T[] =>
+      [...m.entries()].sort((a, b) => a[0] - b[0]).map(([, v]) => v);
+    return { gridCheckpoints: byIndex(ckMap), gridModifiers: byIndex(modMap) };
+  }, [state.cells]);
 
   // Preview cells (for the count / cost gate) — independent of the run state.
   const previewCells = useMemo(
@@ -432,6 +525,12 @@ export function App() {
   // transitions go through the reducer; the queue effect below decides WHICH
   // cells run (concurrency limit), this just executes one.
   const runCell = useCallback(async (cell: MatrixCell) => {
+    // M4 — idempotency guard: never enter the estimate→submit path twice for the
+    // same cell in a run (StrictMode double-invoke / re-entrant queue tick). The
+    // first entry claims the id; a second is a no-op, so it can never re-spend.
+    if (submittedRef.current.has(cell.id)) return;
+    submittedRef.current.add(cell.id);
+
     const { estimate: est, submit: sub } = fns.current;
     const body = buildCellBody(cell.checkpoint, cell.prompt, cell.modifier);
 
@@ -472,13 +571,19 @@ export function App() {
       snap = await sub(body);
     } catch (err) {
       const msg = err instanceof Error ? err.message : 'submit failed';
-      dispatch({
-        type: 'CELL_ERROR',
-        id: cell.id,
-        error: msg,
-        insufficient: isInsufficientBuzz(msg),
-        incompatible: isIncompatibleResourceError(msg),
-      });
+      const insufficient = isInsufficientBuzz(msg);
+      const incompatible = isIncompatibleResourceError(msg);
+      dispatch({ type: 'CELL_ERROR', id: cell.id, error: msg, insufficient, incompatible });
+      // A genuine failure (not the expected pre-spend `blocked`, not the
+      // Top-Up-handled `insufficient`) gets a non-blocking Toast so it's noticed
+      // even if the cell scrolled out of view. Design-system Toast (STEP 2).
+      if (!insufficient && !incompatible) {
+        toastRef.current?.show({
+          title: 'A cell failed to generate',
+          message: `${cell.checkpoint.label} · ${cell.modifier.label} — you can Retry failed.`,
+          color: 'error',
+        });
+      }
       return;
     }
 
@@ -555,6 +660,107 @@ export function App() {
     }
   }, [state.phase, state.cells, runCell]);
 
+  // Re-attach a poll loop to any `polling` cell that has a workflowId but no live
+  // poll token (a restored / reconciled in-flight cell). runPollLoop cancels any
+  // stale token first, so this is idempotent. M2's recovery path.
+  const resumePolling = useCallback(
+    (cells: readonly MatrixCell[]) => {
+      for (const cell of cells) {
+        if (cell.status !== 'polling' || cell.workflowId == null) continue;
+        const tok = pollTokensRef.current.get(cell.id);
+        if (tok && !tok.cancelled) continue; // already polling
+        runPollLoop(cell.id, cell.workflowId);
+      }
+    },
+    [runPollLoop],
+  );
+
+  // ---- M1 — restore a prior run on mount (once, for a signed-in viewer) ----
+  // Reload / device-switch rebuilds the in-flight + done matrix from the
+  // persisted manifest so paid outputs are never "lost". No auto-spend: an
+  // un-submitted cell restores as `canceled` (see restoreStateFromManifest).
+  useEffect(() => {
+    if (restoredRef.current || !ready || !viewer) return;
+    restoredRef.current = true;
+    let cancelled = false;
+    storage
+      .get<unknown>(RUN_STORAGE_KEY)
+      .then((raw) => {
+        if (cancelled) return;
+        const restored = restoreStateFromManifest(raw);
+        if (!restored) return;
+        // Mark every already-submitted cell so the M4 guard won't re-submit it.
+        for (const cell of restored.cells) {
+          if (cell.workflowId != null) submittedRef.current.add(cell.id);
+        }
+        dispatch({ type: 'RESTORE', state: restored });
+        resumePolling(restored.cells);
+        refetchWorkflows();
+      })
+      .catch(() => {
+        /* best-effort — a missing/malformed manifest just starts fresh */
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [ready, viewer, storage, resumePolling, refetchWorkflows]);
+
+  // ---- M1/M2 — reconcile against the authoritative read-model ----
+  // Whenever useAppWorkflows changes, merge status/image/nsfwLevel/cost onto the
+  // matrix cells (by workflowId) and resume polling anything still running
+  // server-side. Only acts on cells that carry a workflowId, and never during a
+  // fresh (unstarted) build — reconcile can't re-charge.
+  useEffect(() => {
+    if (appWorkflows.length === 0) return;
+    if (!state.cells.some((c) => c.workflowId != null)) return;
+    // Re-run only when the read-model actually changed (avoid a reconcile loop).
+    const sig = appWorkflows.map((w) => `${w.workflowId}:${w.status}`).join('|');
+    if (reconciledSigRef.current === sig) return;
+    reconciledSigRef.current = sig;
+    const { cells, resumableIds } = reconcileCells(
+      state.cells,
+      appWorkflows as unknown as AppWorkflowLike[],
+    );
+    dispatch({ type: 'RECONCILE', cells });
+    if (resumableIds.length > 0) resumePolling(cells);
+    // state.cells intentionally omitted: keyed on the read-model signature so a
+    // reconcile-driven cell change doesn't immediately re-fire this effect.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [appWorkflows, resumePolling]);
+
+  // ---- M1 — persist the run as it progresses (signed-in only) ----
+  // Written on every material state change so a reload mid-run recovers. anon /
+  // over-quota writes reject silently (best-effort).
+  useEffect(() => {
+    if (!viewer) return;
+    if (!isPersistableRun(state)) return;
+    let cancelled = false;
+    const handle = setTimeout(() => {
+      if (cancelled) return;
+      storage.set(RUN_STORAGE_KEY, buildRunManifest(state)).catch(() => undefined);
+    }, 250);
+    return () => {
+      cancelled = true;
+      clearTimeout(handle);
+    };
+  }, [state, viewer, storage]);
+
+  // ---- G1 — pull maturity for freshly-completed cells ----
+  // The LIVE poll snapshot carries NO nsfwLevel, so a just-finished result is
+  // fail-closed BLURRED on a SFW domain until the read-model confirms its
+  // maturity. Refetch useAppWorkflows shortly after each new `done` cell so the
+  // reconcile effect fills nsfwLevel and a safe image auto-reveals (a mature one
+  // stays blurred). Keyed on the done-count so it only fires as results land.
+  const doneCount = useMemo(
+    () => state.cells.filter((cell) => cell.status === 'done').length,
+    [state.cells],
+  );
+  useEffect(() => {
+    if (doneCount === 0 || !viewer) return;
+    const handle = setTimeout(() => refetchRef.current(), 400);
+    return () => clearTimeout(handle);
+  }, [doneCount, viewer]);
+
   // ---- Actions ----
   const handleGenerateClick = useCallback(() => {
     if (!viewer) {
@@ -562,6 +768,10 @@ export function App() {
       return;
     }
     if (over || billable === 0) return; // gated by the cap / empty selection
+    // A brand-new run: reset the M4 submit guard + reconcile signature so this
+    // build's cells can submit cleanly (and don't inherit a prior run's ids).
+    submittedRef.current.clear();
+    reconciledSigRef.current = '';
     // Build the matrix and move to the confirm gate (show total + confirm).
     dispatch({ type: 'BUILD', cells: buildMatrix(prompt, chosenCheckpoints, chosenModifiers) });
     // Seed the confirm gate with the build-phase representative estimate (if it
@@ -601,8 +811,12 @@ export function App() {
   const handleReset = useCallback(() => {
     pollTokensRef.current.forEach((t) => (t.cancelled = true));
     pollTokensRef.current.clear();
+    submittedRef.current.clear();
+    reconciledSigRef.current = '';
+    // Drop the persisted run — a fresh "New matrix" shouldn't rebuild the old one.
+    storage.delete(RUN_STORAGE_KEY).catch(() => undefined);
     dispatch({ type: 'RESET' });
-  }, []);
+  }, [storage]);
 
   // Stop the run: mark not-yet-started cells `canceled` (no spend) and fire the
   // orchestrator cancel() for every in-flight cell that has a workflowId. The
@@ -640,8 +854,25 @@ export function App() {
   // their costs/images are preserved and NOT re-charged (RETRY_FAILED re-queues
   // just the retryable subset to idle and resumes the run).
   const handleRetryFailed = useCallback(() => {
+    // Release the M4 guard for the cells about to be re-queued so they CAN run
+    // again — without this, the idempotency guard would block their retry. Only
+    // failed/insufficient cells re-run (done cells are never touched → never
+    // re-charged; RETRY_FAILED enforces that in the reducer).
+    for (const cell of state.cells) {
+      if (cell.status === 'failed' || cell.status === 'insufficient') {
+        submittedRef.current.delete(cell.id);
+      }
+    }
     dispatch({ type: 'RETRY_FAILED' });
-  }, []);
+  }, [state.cells]);
+
+  // M2 — re-check a `timedout` cell by re-polling its existing workflow (never a
+  // re-submit → never a re-charge). Flip it back to polling + re-attach the loop.
+  const handleRecheckTimedout = useCallback((cell: MatrixCell) => {
+    if (cell.status !== 'timedout' || cell.workflowId == null) return;
+    dispatch({ type: 'RECHECK_TIMEDOUT', id: cell.id });
+    runPollLoop(cell.id, cell.workflowId);
+  }, [runPollLoop]);
 
   const handleTopUp = useCallback(() => {
     // Suggest an amount proportionate to the run's actual cost (landed per-cell
@@ -701,6 +932,8 @@ export function App() {
             previewLabel={previewLabel}
             anon={anon}
             picking={picking}
+            loraModifiers={selectedLoraModifiers}
+            setLoraStrength={setLoraStrength}
             onPickLora={handlePickLora}
             onPickCheckpoint={handlePickCheckpoint}
             onBrowseLora={() => openBrowse('LORA')}
@@ -744,13 +977,15 @@ export function App() {
           <ResultGrid
             c={c}
             cells={state.cells}
-            checkpoints={chosenCheckpoints}
-            modifiers={chosenModifiers}
+            checkpoints={gridCheckpoints}
+            modifiers={gridModifiers}
             phase={state.phase}
             canRetry={canRetry}
+            maturityGate={maturityGate}
             onReset={handleReset}
             onStop={handleStop}
             onRetry={handleRetryFailed}
+            onRecheck={handleRecheckTimedout}
           />
         )}
 
@@ -773,7 +1008,7 @@ export function App() {
 // Build panel — selection + cost preview + cap gate
 // ---------------------------------------------------------------------------
 
-function BuildPanel(props: {
+export function BuildPanel(props: {
   c: Palette;
   prompt: string;
   setPrompt: (v: string) => void;
@@ -788,6 +1023,9 @@ function BuildPanel(props: {
   previewLabel: CostLabel;
   anon: boolean;
   picking: boolean;
+  /** Selected LoRA columns whose strength the Slider can tune (STEP 2). */
+  loraModifiers: ModifierOption[];
+  setLoraStrength: (key: string, value: number) => void;
   onPickLora: () => void;
   onPickCheckpoint: () => void;
   onBrowseLora: () => void;
@@ -809,6 +1047,8 @@ function BuildPanel(props: {
     previewLabel,
     anon,
     picking,
+    loraModifiers,
+    setLoraStrength,
     onPickLora,
     onPickCheckpoint,
     onBrowseLora,
@@ -921,6 +1161,26 @@ function BuildPanel(props: {
           and may cost a little more). Civitai checks each LoRA × checkpoint pairing — an
           incompatible one shows as <em>incompatible</em> and costs nothing.
         </p>
+        {loraModifiers.length > 0 && (
+          <div style={{ display: 'grid', gap: 10, marginTop: 12 }} data-testid="gm-lora-strengths">
+            {loraModifiers.map((m) => {
+              const strength = m.loraStrength ?? DEFAULT_LORA_STRENGTH;
+              return (
+                <Slider
+                  key={m.key}
+                  data-testid={`gm-lora-strength-${m.key}`}
+                  label={`${m.label} strength`}
+                  min={LORA_STRENGTH_MIN}
+                  max={LORA_STRENGTH_MAX}
+                  step={0.1}
+                  value={strength}
+                  valueLabel={strength.toFixed(1)}
+                  onChange={(e) => setLoraStrength(m.key, Number(e.currentTarget.value))}
+                />
+              );
+            })}
+          </div>
+        )}
       </fieldset>
 
       <div
@@ -979,7 +1239,7 @@ function BuildPanel(props: {
 // Confirm panel — explicit spend gate
 // ---------------------------------------------------------------------------
 
-function ConfirmPanel(props: {
+export function ConfirmPanel(props: {
   c: Palette;
   cells: MatrixCell[];
   label: CostLabel;
@@ -1062,18 +1322,21 @@ function ConfirmPanel(props: {
 // Result grid — rows=checkpoints, cols=modifiers
 // ---------------------------------------------------------------------------
 
-function ResultGrid(props: {
+export function ResultGrid(props: {
   c: Palette;
   cells: MatrixCell[];
   checkpoints: CheckpointOption[];
   modifiers: ModifierOption[];
   phase: string;
   canRetry: boolean;
+  maturityGate: MaturityGate;
   onReset: () => void;
   onStop: () => void;
   onRetry: () => void;
+  onRecheck: (cell: MatrixCell) => void;
 }) {
-  const { c, cells, checkpoints, modifiers, phase, canRetry, onReset, onStop, onRetry } = props;
+  const { c, cells, checkpoints, modifiers, phase, canRetry, maturityGate, onReset, onStop, onRetry, onRecheck } =
+    props;
   const byId = new Map(cells.map((cell) => [`${cell.row}:${cell.col}`, cell]));
   const spent = totalSpent(cells);
   const running = phase === 'running';
@@ -1184,7 +1447,7 @@ function ResultGrid(props: {
                           ['--gm-stagger' as string]: `${Math.min(idx, totalCells) * 40}ms`,
                         }}
                       >
-                        <CellView c={c} cell={cell} />
+                        <CellView c={c} cell={cell} maturityGate={maturityGate} onRecheck={onRecheck} />
                       </div>
                     </td>
                   );
@@ -1199,7 +1462,17 @@ function ResultGrid(props: {
   );
 }
 
-function CellView({ c, cell }: { c: Palette; cell: MatrixCell | undefined }) {
+export function CellView({
+  c,
+  cell,
+  maturityGate,
+  onRecheck,
+}: {
+  c: Palette;
+  cell: MatrixCell | undefined;
+  maturityGate: MaturityGate;
+  onRecheck: (cell: MatrixCell) => void;
+}) {
   if (!cell) return <span style={{ color: c.muted }}>—</span>;
   switch (cell.status) {
     case 'blocked':
@@ -1235,26 +1508,56 @@ function CellView({ c, cell }: { c: Palette; cell: MatrixCell | undefined }) {
       return <CellBox c={c} label="Out of Buzz" sub="top up & retry" tone="danger" />;
     case 'timedout':
       // Polling gave up; the gen may still finish + bill — so it's a muted
-      // "still working" state, never a failure and never "no charge".
-      return <CellBox c={c} label={timedOutCellLabel()} sub="may still finish" tone="muted" />;
-    case 'failed':
-      // Friendly label; keep the raw server detail in the tooltip so it's never lost.
+      // "still working" state, never a failure and never "no charge". M2: a
+      // Re-check re-polls the SAME workflow (no re-submit → no re-charge).
       return (
-        <CellBox
-          c={c}
-          label={failedCellLabel()}
-          tone="danger"
-          title={failedCellDetail(cell.error)}
-        />
+        <CellBox c={c} label={timedOutCellLabel()} sub="may still finish" tone="muted">
+          <button
+            type="button"
+            onClick={() => onRecheck(cell)}
+            className="gm-chip"
+            data-testid="gm-recheck"
+            style={{
+              marginTop: 4,
+              padding: '3px 10px',
+              borderRadius: 999,
+              border: `1px solid ${c.accent}`,
+              background: 'transparent',
+              color: c.accent,
+              fontSize: 11,
+              fontWeight: 700,
+              cursor: 'pointer',
+            }}
+          >
+            Re-check
+          </button>
+        </CellBox>
       );
+    case 'failed': {
+      // Friendly label; keep the raw server detail in a design-system Tooltip so
+      // it's never lost — just demoted from the primary label (STEP 2).
+      const detail = failedCellDetail(cell.error);
+      const box = <CellBox c={c} label={failedCellLabel()} tone="danger" />;
+      return detail ? (
+        <Tooltip label={detail}>
+          <span tabIndex={0} data-testid="gm-failed-detail" style={{ display: 'block' }}>
+            {box}
+          </span>
+        </Tooltip>
+      ) : (
+        box
+      );
+    }
     case 'done':
       return (
         <figure style={{ margin: 0, display: 'grid', gap: 4 }}>
           {cell.imageUrl ? (
-            <CellImage
-              c={c}
+            <MaturityImage
               src={cell.imageUrl}
               alt={`${cell.checkpoint.label} · ${cell.modifier.label}`}
+              nsfwLevel={cell.nsfwLevel}
+              gate={maturityGate}
+              fallback={<span style={{ fontSize: 12, color: c.muted }}>Image unavailable</span>}
             />
           ) : (
             // A `done` cell with no imageUrl: the gen succeeded + was charged but
@@ -1269,87 +1572,10 @@ function CellView({ c, cell }: { c: Palette; cell: MatrixCell | undefined }) {
   }
 }
 
-/**
- * A cell image that fades + scales in once the bytes have DECODED (D4.1) — the
- * gm-img-loaded class (gated behind prefers-reduced-motion) is added on onLoad
- * so the animation runs on the painted image, not the empty element. A cached
- * image that's already complete on mount gets the class immediately.
- *
- * MONEY HONESTY (HIGH-1): a `done` cell is one the user was CHARGED for. The
- * `<img>` uses `opacity:0` until decoded, so without an error path a load
- * failure (expired/missing/NSFW-gated CDN edge, transient network) would leave
- * the paid cell PERMANENTLY blank — and "Retry failed" never picks it up (it's
- * `done`, not failed). `onError` therefore swaps the image for an explicit
- * "Image unavailable" box with an "Open image" link, so the cell is never blank
- * and the parent figure's "N Buzz" caption still tells the user they were
- * charged and the gen exists.
- */
-function CellImage({ c, src, alt }: { c: Palette; src: string; alt: string }) {
-  const [loaded, setLoaded] = useState(false);
-  const [errored, setErrored] = useState(false);
-  const imgRef = useRef<HTMLImageElement>(null);
-  useEffect(() => {
-    // Re-arm on a new src (e.g. cell reuse) and fast-path a cached/instantly-
-    // complete image (onLoad may not fire for an already-decoded image).
-    setErrored(false);
-    if (imgRef.current?.complete && imgRef.current.naturalWidth > 0) setLoaded(true);
-  }, [src]);
-
-  if (errored) {
-    // Visibly non-blank, conveys "you were charged; image didn't load", and
-    // offers a way to re-open the underlying image directly.
-    return (
-      <div
-        role="img"
-        aria-label={`${alt} — image unavailable`}
-        style={{
-          aspectRatio: '1 / 1',
-          display: 'grid',
-          placeContent: 'center',
-          gap: 4,
-          textAlign: 'center',
-          background: c.inputBg,
-          borderRadius: 6,
-          padding: 6,
-        }}
-      >
-        <span style={{ fontSize: 12, fontWeight: 600, color: c.fg }}>Image unavailable</span>
-        <a
-          href={src}
-          target="_blank"
-          rel="noopener noreferrer"
-          style={{ fontSize: 10, color: c.accent }}
-          data-testid="gm-cell-open-image"
-        >
-          Open image
-        </a>
-      </div>
-    );
-  }
-
-  return (
-    <img
-      ref={imgRef}
-      src={src}
-      alt={alt}
-      onLoad={() => setLoaded(true)}
-      // A failed load must NOT leave the cell at opacity:0 forever — surface the
-      // explicit unavailable affordance instead (the user was already charged).
-      onError={() => setErrored(true)}
-      className={loaded ? 'gm-img-loaded' : undefined}
-      style={{
-        width: '100%',
-        borderRadius: 6,
-        display: 'block',
-        aspectRatio: '1 / 1',
-        objectFit: 'cover',
-        // Hide until decoded so we never flash a half-painted image, then the
-        // class fades it in. (Under reduced-motion the class sets opacity:1.)
-        opacity: loaded ? 1 : 0,
-      }}
-    />
-  );
-}
+// The result image now renders through `MaturityImage` (G1), which wraps the
+// design-system `<Image>` primitive — it owns the decode fade, the load-error
+// fallback (a paid `done` cell is never left blank), AND the maturity gate. The
+// old hand-rolled `CellImage` was replaced by it (STEP 2 primitive adoption).
 
 /** An animated shimmer skeleton with a status label on top (D4.2). */
 function SkeletonCell({ c, label }: { c: Palette; label: string }) {
@@ -1381,13 +1607,16 @@ function CellBox({
   sub,
   tone,
   title,
+  children,
 }: {
   c: Palette;
   label: string;
   sub?: string;
   tone: 'muted' | 'busy' | 'danger';
-  /** Optional tooltip — used to preserve the raw failure detail on a failed cell. */
+  /** Optional native tooltip — legacy detail hint on a cell. */
   title?: string;
+  /** Optional extra content (e.g. the timedout Re-check button). */
+  children?: React.ReactNode;
 }) {
   const color = tone === 'danger' ? c.danger : tone === 'busy' ? c.accent : c.muted;
   return (
@@ -1406,6 +1635,7 @@ function CellBox({
     >
       <span style={{ fontSize: 12, fontWeight: 600, color }}>{label}</span>
       {sub && <span style={{ fontSize: 10, color: c.muted, lineHeight: 1.3 }}>{sub}</span>}
+      {children}
     </div>
   );
 }
@@ -1585,65 +1815,9 @@ function LoadingSkeleton({ c }: { c: Palette }) {
   );
 }
 
-// ---------------------------------------------------------------------------
-// Theme — host can't inject CSS into the iframe; colors via inline styles.
-// ---------------------------------------------------------------------------
-
-interface Palette {
-  bg: string;
-  fg: string;
-  cardBg: string;
-  border: string;
-  inputBg: string;
-  accent: string;
-  accentFg: string;
-  danger: string;
-  dangerBg: string;
-  muted: string;
-  /** Translucent accent tint — used for the faint LoRA-chip marker. */
-  accentTint: string;
-  /** Skeleton shimmer base + highlight (theme-aware; consumed by index.css). */
-  skelBase: string;
-  skelShine: string;
-  /** The color the mobile edge-fade fades toward (matches the page bg). */
-  fadeColor: string;
-}
-
-function palette(dark: boolean): Palette {
-  return dark
-    ? {
-        bg: '#1a1b1e',
-        fg: '#e9ecef',
-        cardBg: '#25262b',
-        border: '#373a40',
-        inputBg: '#2c2e33',
-        accent: '#fab005',
-        accentFg: '#1a1b1e',
-        danger: '#ff8787',
-        dangerBg: '#2c1f1f',
-        muted: '#909296',
-        accentTint: 'rgba(250, 176, 5, 0.12)',
-        skelBase: 'rgba(255, 255, 255, 0.05)',
-        skelShine: 'rgba(255, 255, 255, 0.13)',
-        fadeColor: '#1a1b1e',
-      }
-    : {
-        bg: '#ffffff',
-        fg: '#1a1b1e',
-        cardBg: '#f8f9fa',
-        border: '#dee2e6',
-        inputBg: '#f1f3f5',
-        accent: '#f08c00',
-        accentFg: '#ffffff',
-        danger: '#e03131',
-        dangerBg: '#fff5f5',
-        muted: '#868e96',
-        accentTint: 'rgba(240, 140, 0, 0.10)',
-        skelBase: 'rgba(0, 0, 0, 0.05)',
-        skelShine: 'rgba(0, 0, 0, 0.11)',
-        fadeColor: '#ffffff',
-      };
-}
+// The theme palette (design-system `--civitai-*` tokens) now lives in theme.ts,
+// imported at the top of the file. `palette()` is token-driven + theme-invariant
+// (light/dark resolve from the root `data-theme` the tokens switch on).
 
 function pageStyle(c: Palette): React.CSSProperties {
   return {

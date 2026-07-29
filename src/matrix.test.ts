@@ -53,6 +53,7 @@ import {
   representativeEstimateBody,
   representativeModifier,
   runProgress,
+  snapshotErrorCode,
   runProgressLabel,
   stopInProgressWarning,
   suggestedTopUpAmount,
@@ -822,11 +823,51 @@ describe('isInsufficientBuzz', () => {
     expect(isInsufficientBuzz('budget exceeded')).toBe(true);
     expect(isInsufficientBuzz('Low balance')).toBe(true);
   });
+  it('matches the exact host preflight string', () => {
+    // The literal string blocks.router mints when estimate > budget (M3).
+    expect(
+      isInsufficientBuzz('insufficient buzz budget: estimate 900 exceeds budget 200'),
+    ).toBe(true);
+  });
   it('is false for unrelated / empty errors', () => {
     expect(isInsufficientBuzz('prompt was rejected by the audit')).toBe(false);
     expect(isInsufficientBuzz(null)).toBe(false);
     expect(isInsufficientBuzz(undefined)).toBe(false);
     expect(isInsufficientBuzz('')).toBe(false);
+  });
+  it('M3: does NOT over-match an unrelated error that merely mentions buzz/budget', () => {
+    // These are the false-positives the tightened sniff eliminates — none is a
+    // funds shortfall, so none should surface a (wrong) Top-Up CTA.
+    expect(isInsufficientBuzz('buzz workflow crashed')).toBe(false);
+    expect(isInsufficientBuzz('the buzz service is temporarily unavailable')).toBe(false);
+    expect(isInsufficientBuzz('failed to reach the buzz orchestrator')).toBe(false);
+    expect(isInsufficientBuzz('render budget for the frame was recalculated')).toBe(false);
+  });
+});
+
+describe('snapshotErrorCode (M3 — client-ready for the upstream structured code)', () => {
+  it('reads a known structured code off the snapshot when present', () => {
+    expect(snapshotErrorCode({ status: 'failed', errorCode: 'INSUFFICIENT_BUZZ' })).toBe(
+      'INSUFFICIENT_BUZZ',
+    );
+    expect(snapshotErrorCode({ status: 'failed', errorCode: 'WORKFLOW_FAILED' })).toBe(
+      'WORKFLOW_FAILED',
+    );
+  });
+  it('is undefined when absent (today) or unrecognized', () => {
+    expect(snapshotErrorCode({ status: 'failed' })).toBeUndefined();
+    expect(snapshotErrorCode({ status: 'failed', errorCode: 'SOMETHING_ELSE' })).toBeUndefined();
+  });
+  it('cellStatusForSnapshot PREFERS the structured code over the text sniff', () => {
+    // A failed snapshot whose free-text says nothing about money, but whose
+    // structured code IS insufficient → insufficient (structured wins).
+    expect(
+      cellStatusForSnapshot(snap({ status: 'failed', error: 'generic', errorCode: 'INSUFFICIENT_BUZZ' } as never)),
+    ).toBe('insufficient');
+    // A structured WORKFLOW_FAILED with money-ish text → still failed (code wins).
+    expect(
+      cellStatusForSnapshot(snap({ status: 'failed', error: 'insufficient', errorCode: 'WORKFLOW_FAILED' } as never)),
+    ).toBe('failed');
   });
 });
 

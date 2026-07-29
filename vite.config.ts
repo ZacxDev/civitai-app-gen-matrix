@@ -21,9 +21,29 @@ export default defineConfig({
     rollupOptions: { output: { manualChunks: undefined } },
   },
   test: {
-    // Pure-logic unit tests run in node; the matrix/queue/cost/cap helpers
-    // don't touch the DOM.
-    environment: 'node',
-    include: ['src/**/*.test.ts'],
+    // Two projects in one `vitest run`:
+    //  - `node`: pure-logic unit tests (*.test.ts) — matrix/queue/cost/cap/
+    //    persistence helpers; no DOM.
+    //  - `dom`: component + integration tests (*.test.tsx) rendered with
+    //    @testing-library/react in jsdom, against the SDK mock `<Harness>` or
+    //    with injected props. (jsdom rather than Vitest browser-mode: it is the
+    //    exact pattern the sibling design-system blocks ship, and browser-mode
+    //    /playwright doesn't run reliably in this environment — the DOM coverage
+    //    of the confirm/build/result panels + resource browser is equivalent.)
+    projects: [
+      {
+        extends: true,
+        test: { name: 'node', environment: 'node', include: ['src/**/*.test.ts'] },
+      },
+      {
+        extends: true,
+        test: {
+          name: 'dom',
+          environment: 'jsdom',
+          include: ['src/**/*.test.tsx'],
+          setupFiles: ['./src/test-setup.ts'],
+        },
+      },
+    ],
   },
 });

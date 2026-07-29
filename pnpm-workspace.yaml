@@ -19,5 +19,8 @@
 # Both are PUBLISHED on npm and resolve from the registry directly — no local
 # `link:`/`overrides`. See PICKER-WIRING.md.
 minimumReleaseAgeExclude:
-  - '@civitai/app-sdk@0.13.0'
-  - '@civitai/blocks-react@0.9.0'
+  - '@civitai/app-sdk@0.28.0'
+  - '@civitai/blocks-react@0.37.0'
+  - '@civitai/theme@0.2.0'
+  - '@civitai/components@0.3.0'
+  - '@civitai/components-react@0.3.0'

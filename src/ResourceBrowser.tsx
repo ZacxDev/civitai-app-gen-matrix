@@ -13,6 +13,8 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
+import { SegmentedControl } from '@civitai/components-react';
+
 import {
   DEFAULT_LIMIT,
   THUMB_WIDTH,
@@ -167,7 +169,7 @@ export function ResourceBrowser(props: ResourceBrowserProps) {
   }, []);
 
   const [rawQuery, setRawQuery] = useState('');
-  const [sort] = useState<CatalogSort>('Highest Rated');
+  const [sort, setSort] = useState<CatalogSort>('Highest Rated');
   const query = useDebounced(rawQuery, SEARCH_DEBOUNCE_MS);
   const [state, setState] = useState<LoadState>({ kind: 'loading' });
   const [compatibleCount, setCompatibleCount] = useState<number | null>(null);
@@ -319,6 +321,19 @@ export function ResourceBrowser(props: ResourceBrowserProps) {
           onChange={(e) => setRawQuery(e.target.value)}
           style={searchInput(c)}
           data-testid="gm-browse-search"
+        />
+
+        <SegmentedControl
+          aria-label="Sort results"
+          data-testid="gm-browse-sort"
+          value={sort}
+          onChange={(v) => setSort(v as CatalogSort)}
+          size="sm"
+          data={[
+            { value: 'Highest Rated', label: 'Top rated' },
+            { value: 'Most Downloaded', label: 'Most used' },
+            { value: 'Newest', label: 'Newest' },
+          ]}
         />
 
         <EcosystemMultiselect

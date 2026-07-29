@@ -225,6 +225,19 @@ export interface MatrixCell {
   /** Actual Buzz spent (from the succeeded snapshot). */
   cost: number | null;
   error: string | null;
+  /**
+   * Per-image maturity level for the result image (G1). `null` = unknown.
+   *
+   * The LIVE poll/submit path (`BlockWorkflowSnapshot`) carries NO maturity, so
+   * this stays `null` for a cell finalized purely from a poll snapshot. It is
+   * populated when the cell is reconciled against the persistent read-model
+   * (`useAppWorkflows` → `AppWorkflowImage.nsfwLevel`), which the host DOES
+   * project. The result image is maturity-gated off this + the domain ceiling
+   * (`shouldBlurResult`): a known level above the ceiling — or, fail-closed, an
+   * UNKNOWN level on a SFW domain — is blurred-until-revealed so a `g`-rated
+   * page never renders ungated mature pixels.
+   */
+  nsfwLevel?: number | null;
 }
 
 /**
@@ -266,6 +279,7 @@ export function buildMatrix(
         imageUrl: null,
         cost: null,
         error: null,
+        nsfwLevel: null,
       });
     });
   });
@@ -541,21 +555,66 @@ export function runProgressLabel(cells: readonly MatrixCell[]): string {
 // ---------------------------------------------------------------------------
 
 /**
+ * Structured failure discriminator on the snapshot.
+ *
+ * TODAY the published `BlockWorkflowSnapshot` carries only a free-text `error`
+ * (no `error.code`); the host mints the insufficient-Buzz message itself as a
+ * preflight string ("insufficient buzz budget: estimate N exceeds budget M").
+ * A follow-up civitai PR is scoped to add a structured `errorCode` to the
+ * snapshot (schema `blocks/workflow.schema.ts` + the SDK `blocks/types.d.ts`
+ * mirror, set at the two router over-budget return sites + `failureSnapshot`).
+ *
+ * This reader is the CLIENT SIDE of that fix, shipped now: it reads `errorCode`
+ * off the snapshot DEFENSIVELY (the field is optional / absent on today's SDK),
+ * so the moment the host starts emitting it, classification becomes exact with
+ * no further client change. Until then the tightened text sniff below is used.
+ */
+export type BlockErrorCode = 'INSUFFICIENT_BUZZ' | 'WORKFLOW_FAILED' | 'INCOMPATIBLE_RESOURCE';
+
+export function snapshotErrorCode(
+  snapshot: Pick<BlockWorkflowSnapshot, 'status'> & { errorCode?: unknown },
+): BlockErrorCode | undefined {
+  const code = snapshot.errorCode;
+  if (code === 'INSUFFICIENT_BUZZ' || code === 'WORKFLOW_FAILED' || code === 'INCOMPATIBLE_RESOURCE') {
+    return code;
+  }
+  return undefined;
+}
+
+/**
  * Sniff a workflow failure / error string for insufficient-Buzz language so a
- * cell can swap to a Top-Up CTA. There is NO structured error.code on the
- * BlockWorkflowSnapshot (only a free-text `error`), and a page CANNOT read the
- * balance (`buzz:read:self` is PAGE-forbidden), so a `failed` snapshot is the
- * only signal. Substring heuristic, mirrors the buzz-generator reference.
+ * cell can swap to a Top-Up CTA.
+ *
+ * TIGHTENED (M3): the old heuristic OR-matched bare substrings `budget`,
+ * `balance`, `buzz` — so ANY failure text containing the word "buzz" (e.g. "buzz
+ * workflow crashed", "buzz service unavailable") was mis-classified as
+ * insufficient and shown a wrong Top-Up CTA. The host's real preflight string is
+ * `insufficient buzz budget: estimate N exceeds budget M`. Require the
+ * load-bearing CONJUNCTION — "insufficient"/"not enough" WITH a money noun, or
+ * the literal "exceeds budget" — so an unrelated error mentioning "buzz" can no
+ * longer over-match. Prefer `snapshotErrorCode()` when the structured field is
+ * present; this text path is the fallback for today's free-text-only snapshot.
  */
 export function isInsufficientBuzz(message: string | null | undefined): boolean {
   if (!message) return false;
   const m = message.toLowerCase();
+  // Match money-SPECIFIC phrasings only. Each token below is characteristic of a
+  // funds shortfall; NONE of them is the bare word `buzz`/`budget`/`balance`
+  // (the old over-matchers) — so an unrelated failure that merely mentions "buzz"
+  // ("buzz workflow crashed", "buzz service unavailable") no longer trips a wrong
+  // Top-Up CTA. The real host preflight string
+  // ("insufficient buzz budget: estimate N exceeds budget M") matches on both
+  // `insufficient` and `exceeds budget`.
   return (
     m.includes('insufficient') ||
     m.includes('not enough') ||
-    m.includes('budget') ||
-    m.includes('balance') ||
-    m.includes('buzz')
+    m.includes('enough buzz') ||
+    m.includes('out of buzz') ||
+    m.includes('exceeds budget') ||
+    m.includes('budget exceeded') ||
+    m.includes('over budget') ||
+    m.includes('low balance') ||
+    m.includes('balance too low')
   );
 }
 
@@ -614,8 +673,14 @@ export function cellStatusForSnapshot(snapshot: BlockWorkflowSnapshot): CellStat
     case 'canceled':
       return 'canceled';
     case 'failed':
-    case 'expired':
+    case 'expired': {
+      // Prefer the structured discriminator when the host emits it (client-ready
+      // for the scoped upstream fix); else fall back to the tightened text sniff.
+      const code = snapshotErrorCode(snapshot);
+      if (code === 'INSUFFICIENT_BUZZ') return 'insufficient';
+      if (code === 'WORKFLOW_FAILED' || code === 'INCOMPATIBLE_RESOURCE') return 'failed';
       return isInsufficientBuzz(snapshot.error) ? 'insufficient' : 'failed';
+    }
     case 'pending':
     case 'processing':
       return 'polling';
@@ -682,6 +747,30 @@ export type MatrixAction =
    * and their CELL_RESULT / CELL_ERROR lands them in a terminal state.
    */
   | { type: 'STOP_RUN' }
+  /**
+   * M1 — rehydrate a prior run wholesale from the persisted read-model on mount
+   * (see persistence.ts). Replaces the entire state (cells + phase + estimate)
+   * so a reload / device-switch rebuilds the in-flight + done matrix instead of
+   * losing paid outputs. No spend — pure state reconstruction.
+   */
+  | { type: 'RESTORE'; state: MatrixState }
+  /**
+   * M1/M2 — reconcile the rebuilt cells against the authoritative
+   * `useAppWorkflows` read-model (status / image / nsfwLevel / cost). Replaces
+   * the cells array with the merged result (the pure `reconcileCells` decides
+   * precedence — a terminal read-model row wins over a stale stored `polling`),
+   * then finalizes. No submit → no re-charge; a workflow that completed while the
+   * app was closed is simply picked up.
+   */
+  | { type: 'RECONCILE'; cells: MatrixCell[] }
+  /**
+   * M2 — a `timedout` cell (polling gave up; the gen may still be running
+   * server-side) is re-checked by RE-POLLING its retained `workflowId`. Flip it
+   * back to `polling` so the App's poll loop re-attaches. MONEY-SAFE: it re-polls
+   * an EXISTING workflow — it never re-submits, so it can never re-charge. No-op
+   * unless the cell is actually `timedout` and has a workflowId.
+   */
+  | { type: 'RECHECK_TIMEDOUT'; id: string }
   | { type: 'RESET' };
 
 export const initialMatrixState: MatrixState = {
@@ -803,6 +892,18 @@ export function matrixReducer(state: MatrixState, action: MatrixAction): MatrixS
       );
       // finalize so a stop with nothing in-flight reaches `done` immediately.
       return finalize({ ...state, cells });
+    }
+    case 'RESTORE':
+      return action.state;
+    case 'RECONCILE':
+      return finalize({ ...state, cells: action.cells });
+    case 'RECHECK_TIMEDOUT': {
+      const cell = state.cells.find((c) => c.id === action.id);
+      if (!cell || cell.status !== 'timedout' || cell.workflowId == null) return state;
+      // Re-poll an existing workflow — never a re-submit. Re-enter `running` so
+      // the poll loop re-attaches; finalize() flips back to `done` when it lands.
+      const cells = patchCell(state.cells, action.id, { status: 'polling' });
+      return { ...state, phase: 'running', cells };
     }
     case 'RESET':
       return initialMatrixState;
