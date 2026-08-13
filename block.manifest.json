@@ -3,6 +3,8 @@
   "blockId": "gen-matrix",
   "version": "0.7.3",
   "name": "Gen Matrix",
+  "tagline": "Every model. Every style. Side by side.",
+  "category": "generation",
   "type": "block",
   "scopes": [
     "ai:write:budgeted"
