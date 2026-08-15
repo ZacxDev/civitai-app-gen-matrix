@@ -1,5 +1,17 @@
 # Screenshots — design-system migration + polish
 
+> 🔴 **The PNGs described below were removed from the working tree; they remain in git
+> history at `12ba32d` (#1) and can be restored with
+> `git checkout 12ba32d -- docs/screenshots/`.**
+>
+> They were 8.1 MB of the repo, and `civitai app submit` packages the whole tree — which
+> pushed the release bundle to 8.20 MB and made the app **unreleasable**. The server
+> rejected it with `400: Invalid JSON` (an error naming neither size nor the bundle);
+> a known-good control bundle is 2.32 MB, so the real server ceiling sits between those
+> two. The CLI's own client-side cap is 50 MiB, ~12× too permissive to catch it.
+>
+> One-time review evidence does not belong in a tree that ships on every release.
+
 `before/` = `main` (the hand-rolled, amber-accented proof-of-concept).
 `after/`  = this branch (migrated onto `@civitai/blocks-react@0.35.2` `/ui` +
 `@civitai/theme@0.2.0` tokens, polished).
