@@ -19,6 +19,13 @@
 #     attribute-driven CSS + React primitives (Slider/Image/Tooltip/Toast/
 #     SegmentedControl) the UI adopts.
 # All resolve from the npm registry directly — no local `link:`/`overrides`.
+#
+# Single-package repo: declare the root explicitly so pnpm and setup-node's
+# `cache: pnpm` don't error "packages field missing or empty". The deployed
+# 0.8.x bundle dropped this line; CI only exists in this repo (.github/ is not
+# part of the submitted bundle), so nothing upstream could have caught it.
+packages:
+  - '.'
 minimumReleaseAgeExclude:
   - '@civitai/app-sdk@0.28.0'
   - '@civitai/blocks-react@0.37.0'
