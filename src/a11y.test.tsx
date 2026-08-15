@@ -18,12 +18,14 @@ const c = palette();
 
 describe('Chip (axis toggle)', () => {
   it('exposes aria-pressed reflecting the selected state, in BOTH states', () => {
-    const { rerender } = render(<Chip label="JuggernautXL" selected={false} onToggle={() => {}} />);
+    const { rerender } = render(
+      <Chip c={c} label="JuggernautXL" selected={false} onToggle={() => {}} />,
+    );
     const btn = screen.getByRole('button', { name: 'JuggernautXL' });
     // Unselected → aria-pressed="false" (announced as a toggle, off).
     expect(btn).toHaveAttribute('aria-pressed', 'false');
 
-    rerender(<Chip label="JuggernautXL" selected onToggle={() => {}} />);
+    rerender(<Chip c={c} label="JuggernautXL" selected onToggle={() => {}} />);
     // Selected → aria-pressed="true".
     expect(screen.getByRole('button', { name: 'JuggernautXL' })).toHaveAttribute(
       'aria-pressed',
@@ -34,7 +36,7 @@ describe('Chip (axis toggle)', () => {
   it('has an accessible name from its label and fires onToggle on click', async () => {
     const user = userEvent.setup();
     const onToggle = vi.fn();
-    render(<Chip label="Anime" selected={false} isLora onToggle={onToggle} />);
+    render(<Chip c={c} label="Anime" selected={false} isLora onToggle={onToggle} />);
     const btn = screen.getByRole('button', { name: 'Anime' });
     expect(btn).toBeInTheDocument();
     await user.click(btn);

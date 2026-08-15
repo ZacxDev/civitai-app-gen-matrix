@@ -4,11 +4,7 @@
 // concurrency limiting, insufficient-Buzz detection, dedup/idempotency) live in
 // one tested place.
 
-import type {
-  BlockWorkflowSnapshot,
-  BlockTextToImageParams,
-  WorkflowBodyTextToImage,
-} from '@civitai/app-sdk/blocks';
+import type { BlockWorkflowSnapshot } from '@civitai/app-sdk/blocks';
 import type { CheckpointOption, ModifierOption } from './models.js';
 
 // ---------------------------------------------------------------------------
@@ -99,19 +95,18 @@ export function buildCellBody(
   checkpoint: CheckpointOption,
   prompt: string,
   modifier?: ModifierOption,
-): WorkflowBodyTextToImage {
-  // 🔴 app-sdk 0.26 turned `WorkflowBody` into a discriminated union
-  // (WorkflowBodyTextToImage | WorkflowBodyCustomComfy, keyed by `kind`). Type
-  // the builder to the specific `textToImage` member so its variant-only fields
-  // (modelVersionId / params / additionalResources) stay readable and it remains
-  // assignable to the `WorkflowBody` that estimate()/submit() take — behavior-
-  // preserving, no logic change.
-  const params: BlockTextToImageParams = { prompt: clampPrompt(prompt.trim()) };
-  const body: WorkflowBodyTextToImage = {
-    kind: 'textToImage',
+) {
+  const body: {
+    kind: 'textToImage';
+    modelId: number;
+    modelVersionId: number;
+    params: { prompt: string };
+    additionalResources?: Array<{ modelVersionId: number; strength: number }>;
+  } = {
+    kind: 'textToImage' as const,
     modelId: checkpoint.modelId,
     modelVersionId: checkpoint.versionId,
-    params,
+    params: { prompt: clampPrompt(prompt.trim()) },
   };
   if (modifier?.loraVersionId != null) {
     body.additionalResources = [
@@ -230,6 +225,19 @@ export interface MatrixCell {
   /** Actual Buzz spent (from the succeeded snapshot). */
   cost: number | null;
   error: string | null;
+  /**
+   * Per-image maturity level for the result image (G1). `null` = unknown.
+   *
+   * The LIVE poll/submit path (`BlockWorkflowSnapshot`) carries NO maturity, so
+   * this stays `null` for a cell finalized purely from a poll snapshot. It is
+   * populated when the cell is reconciled against the persistent read-model
+   * (`useAppWorkflows` → `AppWorkflowImage.nsfwLevel`), which the host DOES
+   * project. The result image is maturity-gated off this + the domain ceiling
+   * (`shouldBlurResult`): a known level above the ceiling — or, fail-closed, an
+   * UNKNOWN level on a SFW domain — is blurred-until-revealed so a `g`-rated
+   * page never renders ungated mature pixels.
+   */
+  nsfwLevel?: number | null;
 }
 
 /**
@@ -271,6 +279,7 @@ export function buildMatrix(
         imageUrl: null,
         cost: null,
         error: null,
+        nsfwLevel: null,
       });
     });
   });
@@ -343,6 +352,70 @@ export function distinctLoraModifierCount(cells: readonly MatrixCell[]): number 
     }
   }
   return loras.size;
+}
+
+/**
+ * The billing "kind" of a cell — the equivalence class over which ONE estimate
+ * applies. A non-LoRA (baseline / prompt-style) cell is the cheap base kind
+ * (`'base'`); a LoRA cell's kind is its (`loraVersionId`, `loraStrength`) pair
+ * (a different LoRA — or the same LoRA at a different strength — can cost
+ * differently). Prompt-style suffixes do NOT change the gen cost (same model,
+ * same params shape), so every prompt-style column collapses into `'base'`.
+ *
+ * This is the granularity of the PER-KIND estimate (see `matrixTotalLabelByKind`)
+ * that lets the "≈" real-estimate headline SURVIVE the multi-LoRA compare case:
+ * instead of one representative estimate over the whole matrix (which undercounts
+ * when ≥2 distinct LoRAs differ), we estimate one cell PER kind and sum.
+ *
+ * PURE — display/estimate-plumbing only; never touches the cap or accounting.
+ */
+export function cellKindKey(modifier: ModifierOption): string {
+  return modifier.loraVersionId != null
+    ? `lora:${modifier.loraVersionId}:${modifier.loraStrength ?? DEFAULT_LORA_STRENGTH}`
+    : 'base';
+}
+
+/** The distinct billing kinds present among a matrix's generatable cells. */
+export function distinctCellKinds(cells: readonly MatrixCell[]): string[] {
+  const kinds = new Set<string>();
+  for (const cell of generatableCells(cells)) kinds.add(cellKindKey(cell.modifier));
+  return [...kinds];
+}
+
+/** A per-kind estimate map: kind key (see `cellKindKey`) → per-cell Buzz. */
+export type KindEstimates = Readonly<Record<string, number>>;
+
+/** True when `v` is a usable positive, finite per-cell estimate. */
+function usableEstimate(v: number | null | undefined): v is number {
+  return v != null && Number.isFinite(v) && v > 0;
+}
+
+/**
+ * Sum the matrix total from a PER-KIND estimate map: each generatable cell costs
+ * its own kind's estimate. `complete` is true only when EVERY distinct kind
+ * present has a usable estimate — the caller shows the precise "≈" headline only
+ * then; otherwise it falls back to the conservative cap-based ceiling (a cell
+ * whose kind lacks an estimate is charged the safety cap in the sum, so the
+ * number can never be materially exceeded regardless).
+ *
+ * PURE — drives only the displayed label; never the cap, confirm gate, or spend.
+ */
+export function estimateMatrixTotalByKind(
+  cells: readonly MatrixCell[],
+  kindEstimates: KindEstimates,
+): { total: number; complete: boolean } {
+  let total = 0;
+  let complete = true;
+  for (const cell of generatableCells(cells)) {
+    const est = kindEstimates[cellKindKey(cell.modifier)];
+    if (usableEstimate(est)) {
+      total += est;
+    } else {
+      complete = false;
+      total += PAGE_BUZZ_BUDGET_PER_CELL;
+    }
+  }
+  return { total, complete };
 }
 
 /**
@@ -448,14 +521,49 @@ export interface CostLabel {
   amount: string;
   /** True when the number is the cap-based worst case, not a real estimate. */
   isCeiling: boolean;
+  /**
+   * The cap-based safety maximum (per-cell cap × cells), formatted. ALWAYS
+   * present so the UI can demote it to a secondary "safety max N" hint/tooltip
+   * even when the headline is the precise "≈" estimate. When `isCeiling` is true
+   * this equals the headline number.
+   */
+  ceilingAmount: string;
 }
 
+/**
+ * A displayable cost label for a matrix total.
+ *
+ * The second argument accepts EITHER:
+ *  - a single per-cell number (or null) — the LEGACY representative-estimate path
+ *    (one estimate applied to every cell). Honest only when ≤1 distinct LoRA is
+ *    selected; with ≥2 distinct LoRAs a non-first LoRA may cost more than the
+ *    representative, so this path falls back to the cap-based ceiling; or
+ *  - a PER-KIND estimate map (`KindEstimates`) — the preferred path that keeps
+ *    the precise "≈" headline even when the matrix mixes ≥2 distinct LoRAs, by
+ *    estimating one cell per billing kind and summing (`estimateMatrixTotalByKind`).
+ *    The "≈" shows only when every distinct kind has a usable estimate.
+ *
+ * Either way the ceiling (cap × cells) is returned as `ceilingAmount` so the UI
+ * can HEADLINE the real "≈" estimate and demote the ceiling to a "safety max …"
+ * hint rather than anchoring on the ceiling.
+ */
 export function matrixTotalLabel(
   cells: readonly MatrixCell[],
-  perCellEstimate: number | null | undefined,
+  estimate: number | null | undefined | KindEstimates,
 ): CostLabel {
-  const haveEstimate =
-    perCellEstimate != null && Number.isFinite(perCellEstimate) && perCellEstimate > 0;
+  const ceilingAmount = formatCost(estimateMatrixTotal(cells, null));
+
+  // Per-kind path: precise "≈" survives the multi-LoRA compare case.
+  if (estimate != null && typeof estimate === 'object') {
+    const { total, complete } = estimateMatrixTotalByKind(cells, estimate);
+    return complete
+      ? { amount: `≈ ${formatCost(total)}`, isCeiling: false, ceilingAmount }
+      : { amount: `up to ${ceilingAmount}`, isCeiling: true, ceilingAmount };
+  }
+
+  // Legacy single-representative-estimate path (unchanged honesty rule).
+  const perCellEstimate = estimate;
+  const haveEstimate = usableEstimate(perCellEstimate);
   // The representative estimate uses the FIRST (priciest) LoRA, so it over-covers
   // a matrix with ≤1 distinct LoRA. With ≥2 DISTINCT LoRAs a non-first one may
   // cost more → the "≈" could be materially exceeded → show the ceiling instead.
@@ -464,8 +572,8 @@ export function matrixTotalLabel(
   const total = estimateMatrixTotal(cells, known ? perCellEstimate : null);
   const formatted = formatCost(total);
   return known
-    ? { amount: `≈ ${formatted}`, isCeiling: false }
-    : { amount: `up to ${formatted}`, isCeiling: true };
+    ? { amount: `≈ ${formatted}`, isCeiling: false, ceilingAmount }
+    : { amount: `up to ${formatted}`, isCeiling: true, ceilingAmount };
 }
 
 /**
@@ -486,6 +594,29 @@ export function failedCellLabel(): string {
 export function failedCellDetail(error: string | null | undefined): string | undefined {
   const trimmed = error?.trim();
   return trimmed && trimmed.length > 0 ? trimmed : undefined;
+}
+
+/**
+ * A plain-language reason for a `blocked` (server-incompatible) cell, so the
+ * muted "Incompatible" chip isn't a dead end — the user learns WHY and what to
+ * do. When the LoRA carries a `baseModelFamily` we name both families and the
+ * fix ("This LoRA is SDXL; your checkpoint is Pony — pick an SDXL checkpoint").
+ * Falls back to the stored server error, then a generic line, so a tooltip is
+ * ALWAYS available. PURE + constant-ish so the copy is tested in one place.
+ */
+export function incompatibleCellReason(cell: {
+  checkpoint: Pick<CheckpointOption, 'baseModel'>;
+  modifier: Pick<ModifierOption, 'baseModelFamily'>;
+  error?: string | null;
+}): string {
+  const family = cell.modifier.baseModelFamily?.trim();
+  const ckpt = cell.checkpoint.baseModel?.trim();
+  if (family && ckpt) {
+    return `This LoRA is ${family}; your checkpoint is ${ckpt} — pick a ${family} checkpoint (or a LoRA that matches ${ckpt}).`;
+  }
+  const stored = cell.error?.trim();
+  if (stored && stored.length > 0) return stored;
+  return 'This LoRA is not compatible with the selected checkpoint — pick a checkpoint that matches the LoRA, or a compatible LoRA.';
 }
 
 /**
@@ -546,21 +677,69 @@ export function runProgressLabel(cells: readonly MatrixCell[]): string {
 // ---------------------------------------------------------------------------
 
 /**
+ * Structured failure discriminator on the snapshot.
+ *
+ * TODAY the published `BlockWorkflowSnapshot` carries only a free-text `error`
+ * (no `error.code`); the host mints the insufficient-Buzz message itself as a
+ * preflight string ("insufficient buzz budget: estimate N exceeds budget M").
+ * A follow-up civitai PR is scoped to add a structured `errorCode` to the
+ * snapshot (schema `blocks/workflow.schema.ts` + the SDK `blocks/types.d.ts`
+ * mirror, set at the two router over-budget return sites + `failureSnapshot`).
+ *
+ * This reader is the CLIENT SIDE of that fix, shipped now: it reads `errorCode`
+ * off the snapshot DEFENSIVELY (the field is optional / absent on today's SDK),
+ * so the moment the host starts emitting it, classification becomes exact with
+ * no further client change. Until then the tightened text sniff below is used.
+ */
+export type BlockErrorCode = 'INSUFFICIENT_BUZZ' | 'WORKFLOW_FAILED' | 'INCOMPATIBLE_RESOURCE';
+
+export function snapshotErrorCode(
+  snapshot: Pick<BlockWorkflowSnapshot, 'status'> & { errorCode?: unknown },
+): BlockErrorCode | undefined {
+  const code = snapshot.errorCode;
+  if (code === 'INSUFFICIENT_BUZZ' || code === 'WORKFLOW_FAILED' || code === 'INCOMPATIBLE_RESOURCE') {
+    return code;
+  }
+  return undefined;
+}
+
+/**
  * Sniff a workflow failure / error string for insufficient-Buzz language so a
- * cell can swap to a Top-Up CTA. There is NO structured error.code on the
- * BlockWorkflowSnapshot (only a free-text `error`), and a page CANNOT read the
- * balance (`buzz:read:self` is PAGE-forbidden), so a `failed` snapshot is the
- * only signal. Substring heuristic, mirrors the buzz-generator reference.
+ * cell can swap to a Top-Up CTA.
+ *
+ * TIGHTENED (M3): the old heuristic OR-matched bare substrings `budget`,
+ * `balance`, `buzz` — so ANY failure text containing the word "buzz" (e.g. "buzz
+ * workflow crashed", "buzz service unavailable") was mis-classified as
+ * insufficient and shown a wrong Top-Up CTA. The host's real preflight string is
+ * `insufficient buzz budget: estimate N exceeds budget M`. Require the
+ * load-bearing CONJUNCTION — "insufficient"/"not enough" WITH a money noun, or
+ * the literal "exceeds budget" — so an unrelated error mentioning "buzz" can no
+ * longer over-match. Prefer `snapshotErrorCode()` when the structured field is
+ * present; this text path is the fallback for today's free-text-only snapshot.
  */
 export function isInsufficientBuzz(message: string | null | undefined): boolean {
   if (!message) return false;
   const m = message.toLowerCase();
+  // A "money noun" — a word that grounds a shortfall as a FUNDS shortfall.
+  const moneyNoun =
+    m.includes('buzz') || m.includes('budget') || m.includes('balance') || m.includes('credit');
+  // A generic shortfall token that, on its OWN, can describe a NON-money failure
+  // ("insufficient VRAM", "insufficient permissions", "not enough disk"). It only
+  // counts as insufficient-Buzz in CONJUNCTION with a money noun — this is the
+  // load-bearing rule that keeps a wrong "Out of Buzz — top up" CTA (and the
+  // unnecessary purchase it could induce) off an unrelated failure. The bare
+  // `buzz`/`budget`/`balance` OR-matchers were already removed.
+  const shortfall = m.includes('insufficient') || m.includes('not enough');
   return (
-    m.includes('insufficient') ||
-    m.includes('not enough') ||
-    m.includes('budget') ||
-    m.includes('balance') ||
-    m.includes('buzz')
+    (shortfall && moneyNoun) || // "insufficient buzz budget…", "not enough balance"
+    m.includes('enough buzz') || // "you do not have enough Buzz"
+    m.includes('out of buzz') ||
+    // Budget/balance-SPECIFIC phrases are self-grounding (no separate noun needed):
+    m.includes('exceeds budget') || // the host preflight string's tail
+    m.includes('budget exceeded') ||
+    m.includes('over budget') ||
+    m.includes('low balance') ||
+    m.includes('balance too low')
   );
 }
 
@@ -619,8 +798,14 @@ export function cellStatusForSnapshot(snapshot: BlockWorkflowSnapshot): CellStat
     case 'canceled':
       return 'canceled';
     case 'failed':
-    case 'expired':
+    case 'expired': {
+      // Prefer the structured discriminator when the host emits it (client-ready
+      // for the scoped upstream fix); else fall back to the tightened text sniff.
+      const code = snapshotErrorCode(snapshot);
+      if (code === 'INSUFFICIENT_BUZZ') return 'insufficient';
+      if (code === 'WORKFLOW_FAILED' || code === 'INCOMPATIBLE_RESOURCE') return 'failed';
       return isInsufficientBuzz(snapshot.error) ? 'insufficient' : 'failed';
+    }
     case 'pending':
     case 'processing':
       return 'polling';
@@ -687,6 +872,30 @@ export type MatrixAction =
    * and their CELL_RESULT / CELL_ERROR lands them in a terminal state.
    */
   | { type: 'STOP_RUN' }
+  /**
+   * M1 — rehydrate a prior run wholesale from the persisted read-model on mount
+   * (see persistence.ts). Replaces the entire state (cells + phase + estimate)
+   * so a reload / device-switch rebuilds the in-flight + done matrix instead of
+   * losing paid outputs. No spend — pure state reconstruction.
+   */
+  | { type: 'RESTORE'; state: MatrixState }
+  /**
+   * M1/M2 — reconcile the rebuilt cells against the authoritative
+   * `useAppWorkflows` read-model (status / image / nsfwLevel / cost). Replaces
+   * the cells array with the merged result (the pure `reconcileCells` decides
+   * precedence — a terminal read-model row wins over a stale stored `polling`),
+   * then finalizes. No submit → no re-charge; a workflow that completed while the
+   * app was closed is simply picked up.
+   */
+  | { type: 'RECONCILE'; cells: MatrixCell[] }
+  /**
+   * M2 — a `timedout` cell (polling gave up; the gen may still be running
+   * server-side) is re-checked by RE-POLLING its retained `workflowId`. Flip it
+   * back to `polling` so the App's poll loop re-attaches. MONEY-SAFE: it re-polls
+   * an EXISTING workflow — it never re-submits, so it can never re-charge. No-op
+   * unless the cell is actually `timedout` and has a workflowId.
+   */
+  | { type: 'RECHECK_TIMEDOUT'; id: string }
   | { type: 'RESET' };
 
 export const initialMatrixState: MatrixState = {
@@ -808,6 +1017,18 @@ export function matrixReducer(state: MatrixState, action: MatrixAction): MatrixS
       );
       // finalize so a stop with nothing in-flight reaches `done` immediately.
       return finalize({ ...state, cells });
+    }
+    case 'RESTORE':
+      return action.state;
+    case 'RECONCILE':
+      return finalize({ ...state, cells: action.cells });
+    case 'RECHECK_TIMEDOUT': {
+      const cell = state.cells.find((c) => c.id === action.id);
+      if (!cell || cell.status !== 'timedout' || cell.workflowId == null) return state;
+      // Re-poll an existing workflow — never a re-submit. Re-enter `running` so
+      // the poll loop re-attaches; finalize() flips back to `done` when it lands.
+      const cells = patchCell(state.cells, action.id, { status: 'polling' });
+      return { ...state, phase: 'running', cells };
     }
     case 'RESET':
       return initialMatrixState;

@@ -9,11 +9,17 @@ importers:
   .:
     dependencies:
       '@civitai/app-sdk':
-        specifier: ^0.26.0
-        version: 0.26.0
+        specifier: ^0.28.0
+        version: 0.28.0
       '@civitai/blocks-react':
-        specifier: ^0.35.2
-        version: 0.35.2(@civitai/app-sdk@0.26.0)(react@19.2.7)
+        specifier: ^0.37.0
+        version: 0.37.0(@civitai/app-sdk@0.28.0)(react@19.2.7)
+      '@civitai/components':
+        specifier: ^0.3.0
+        version: 0.3.0
+      '@civitai/components-react':
+        specifier: ^0.3.0
+        version: 0.3.0(react-dom@19.2.7(react@19.2.7))(react@19.2.7)
       '@civitai/theme':
         specifier: ^0.2.0
         version: 0.2.0
@@ -25,8 +31,8 @@ importers:
         version: 19.2.7(react@19.2.7)
     devDependencies:
       '@testing-library/jest-dom':
-        specifier: ^6.6.0
-        version: 6.10.0(@testing-library/dom@10.4.1)
+        specifier: 6.9.1
+        version: 6.9.1
       '@testing-library/react':
         specifier: ^16.1.0
         version: 16.3.2(@testing-library/dom@10.4.1)(@types/react-dom@19.2.3(@types/react@19.2.17))(@types/react@19.2.17)(react-dom@19.2.7(react@19.2.7))(react@19.2.7)
@@ -46,7 +52,7 @@ importers:
         specifier: ^6.0.2
         version: 6.0.2(vite@8.0.16(@types/node@25.9.3))
       '@vitest/coverage-v8':
-        specifier: ^4.1.9
+        specifier: 4.1.9
         version: 4.1.9(vitest@4.1.9)
       jsdom:
         specifier: ^25.0.0
@@ -58,7 +64,7 @@ importers:
         specifier: ^8.0.14
         version: 8.0.16(@types/node@25.9.3)
       vitest:
-        specifier: ^4.1.9
+        specifier: ^4.1.7
         version: 4.1.9(@types/node@25.9.3)(@vitest/coverage-v8@4.1.9)(jsdom@25.0.1(supports-color@7.2.0))(vite@8.0.16(@types/node@25.9.3))
 
 packages:
@@ -98,19 +104,26 @@ packages:
     resolution: {integrity: sha512-6zABk/ECA/QYSCQ1NGiVwwbQerUCZ+TQbp64Q3AgmfNvurHH0j8TtXa1qbShXA6qqkpAj4V5W8pP6mLe1mcMqA==}
     engines: {node: '>=18'}
 
-  '@civitai/app-sdk@0.26.0':
-    resolution: {integrity: sha512-sOLZhaKJnSehTu0cM33W1R9Wwm+gamnJLNTl9rDdyJ1Qd5cShOyMeEbSTq7IU33HZ8YXZxRjQ1j3Ow2ERkaiYw==}
+  '@civitai/app-sdk@0.28.0':
+    resolution: {integrity: sha512-MeNJDM5mrNeU3jKWXSS27Zw6J7uFHCQL5qKresHJuroJ2ZKwe3a9R4k/jpkcPhQzW8Ey4ACate1+qTH+aVcaQQ==}
     engines: {node: '>=20'}
 
-  '@civitai/blocks-react@0.35.2':
-    resolution: {integrity: sha512-dFKh5DYnMJ3DI7pXD1fSXavWDRyeAifaCjm32HT+V6SZK6ne+RmnnXyd7BLeaRqCoyksnR4ggh84/oQj3QKZqg==}
+  '@civitai/blocks-react@0.37.0':
+    resolution: {integrity: sha512-eFJfLiuZIdZz5IOovT0n3Lvrsrm39yTsjahR6aYgz4tQPxdkO0STzgnFEUFtFE9oMqtjMCudWjtkEPeYA9bF0A==}
     engines: {node: '>=20'}
     peerDependencies:
-      '@civitai/app-sdk': ^0.26.0
+      '@civitai/app-sdk': ^0.28.0
       react: ^18.0.0 || ^19.0.0
 
-  '@civitai/components@0.2.1':
-    resolution: {integrity: sha512-HRLftwBdtj+lNZM3rRBbO4T+2pd6Xd9o6o3LvQ4pFsVy2ofNFGn2XrL2OZXlc/+6FCs8q7++EyumOqn6A2MX+A==}
+  '@civitai/components-react@0.3.0':
+    resolution: {integrity: sha512-Knv38Ou7tmI0BDmVmoiwMRLSEEttp5n6Em4fyBOjQASK5cM4uY9AktXpYfL1I/0X/TvQgxXYtMDVOFw7FwqrtQ==}
+    engines: {node: '>=20'}
+    peerDependencies:
+      react: ^18.0.0 || ^19.0.0
+      react-dom: ^18.0.0 || ^19.0.0
+
+  '@civitai/components@0.3.0':
+    resolution: {integrity: sha512-nQzqTNVOR9oZiJuUcJX9OE1j0qNQSfse/3mL9PwI4gGSvYU/yskLGDRO9rOuvZJ9T/BR0hfhuY+ZHBFw4MEVtA==}
     engines: {node: '>=20'}
 
   '@civitai/theme@0.2.0':
@@ -278,12 +291,9 @@ packages:
     resolution: {integrity: sha512-o4PXJQidqJl82ckFaXUeoAW+XysPLauYI43Abki5hABd853iMhitooc6znOnczgbTYmEP6U6/y1ZyKAIsvMKGg==}
     engines: {node: '>=18'}
 
-  '@testing-library/jest-dom@6.10.0':
-    resolution: {integrity: sha512-HQwu0KaB2zyT0iLzBL+8CLyZDL3KlZlZJ+2iyc9uCUnlJVskJU/UlPuVCyIPhtukjPQdT2QNoR5nCP5FqTmmDQ==}
-    engines: {node: '>=22', npm: '>=6', yarn: '>=1'}
-    deprecated: Incorrect minor release with breaking changes (Node >=22 and required @testing-library/dom peer). Use 6.9.1 for the 6.x line, or upgrade to 7.0.0.
-    peerDependencies:
-      '@testing-library/dom': '>=10 <11'
+  '@testing-library/jest-dom@6.9.1':
+    resolution: {integrity: sha512-zIcONa+hVtVSSep9UT3jZ5rizo2BsxgyDYU7WFD5eICBE7no3881HGeb/QkGfsJs6JTkY1aQhT7rIPC7e+0nnA==}
+    engines: {node: '>=14', npm: '>=6', yarn: '>=1'}
 
   '@testing-library/react@16.3.2':
     resolution: {integrity: sha512-XU5/SytQM+ykqMnAnvB2umaJNIOsLF3PVv//1Ew4CTcpz0/BRyy/af40qqrt7SjKpDdT1saBMc42CUok5gaw+g==}
@@ -1025,16 +1035,23 @@ snapshots:
 
   '@bcoe/v8-coverage@1.0.2': {}
 
-  '@civitai/app-sdk@0.26.0': {}
+  '@civitai/app-sdk@0.28.0': {}
 
-  '@civitai/blocks-react@0.35.2(@civitai/app-sdk@0.26.0)(react@19.2.7)':
+  '@civitai/blocks-react@0.37.0(@civitai/app-sdk@0.28.0)(react@19.2.7)':
     dependencies:
-      '@civitai/app-sdk': 0.26.0
-      '@civitai/components': 0.2.1
+      '@civitai/app-sdk': 0.28.0
+      '@civitai/components': 0.3.0
       '@civitai/theme': 0.2.0
       react: 19.2.7
 
-  '@civitai/components@0.2.1':
+  '@civitai/components-react@0.3.0(react-dom@19.2.7(react@19.2.7))(react@19.2.7)':
+    dependencies:
+      '@civitai/components': 0.3.0
+      '@civitai/theme': 0.2.0
+      react: 19.2.7
+      react-dom: 19.2.7(react@19.2.7)
+
+  '@civitai/components@0.3.0':
     dependencies:
       '@civitai/theme': 0.2.0
 
@@ -1158,10 +1175,9 @@ snapshots:
       picocolors: 1.1.1
       pretty-format: 27.5.1
 
-  '@testing-library/jest-dom@6.10.0(@testing-library/dom@10.4.1)':
+  '@testing-library/jest-dom@6.9.1':
     dependencies:
       '@adobe/css-tools': 4.5.0
-      '@testing-library/dom': 10.4.1
       aria-query: 5.3.2
       css.escape: 1.5.1
       dom-accessibility-api: 0.6.3

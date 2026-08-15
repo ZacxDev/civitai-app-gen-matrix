@@ -1,7 +1,7 @@
 {
   "$schema": "https://civitai.com/schemas/app-block/v1.json",
   "blockId": "gen-matrix",
-  "version": "0.7.3",
+  "version": "0.8.2",
   "name": "Gen Matrix",
   "tagline": "Every model. Every style. Side by side.",
   "category": "generation",
@@ -9,6 +9,9 @@
   "scopes": [
     "ai:write:budgeted"
   ],
+  "scopeJustifications": {
+    "ai:write:budgeted": "Spends the viewer's Buzz to generate each matrix cell's image, capped by page.buzzBudgetPerGen and confirmed behind an explicit per-run estimate + Confirm step."
+  },
   "page": {
     "path": "/",
     "title": "Gen Matrix",

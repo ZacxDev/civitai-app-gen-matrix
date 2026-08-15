@@ -23,12 +23,16 @@ import {
   buildCellBody,
   buildMatrix,
   cellId,
+  cellKindKey,
   cellStatusForSnapshot,
   clampPrompt,
   composeCellPrompt,
+  distinctCellKinds,
   distinctLoraModifierCount,
   estimateMatrixTotal,
+  estimateMatrixTotalByKind,
   estimateSignature,
+  incompatibleCellReason,
   exceedsCap,
   failedCellDetail,
   failedCellLabel,
@@ -53,6 +57,7 @@ import {
   representativeEstimateBody,
   representativeModifier,
   runProgress,
+  snapshotErrorCode,
   runProgressLabel,
   stopInProgressWarning,
   suggestedTopUpAmount,
@@ -684,6 +689,137 @@ describe('matrixTotalLabel — mixed-LoRA falls back to the ceiling', () => {
     const cells = buildMatrix('a cat', [ckptA], [modLoraCompat, modLoraB]);
     expect(matrixTotalLabel(cells, null).isCeiling).toBe(true);
   });
+
+  it('every label carries a ceilingAmount for the demoted "safety max" hint (I3)', () => {
+    const cells = buildMatrix('a cat', [ckptA, ckptB], [modBase, modCine]); // 4 cells
+    // Ceiling = cap × 4 cells regardless of whether a real estimate landed.
+    const expected = formatCost(4 * PAGE_BUZZ_BUDGET_PER_CELL);
+    expect(matrixTotalLabel(cells, 8).ceilingAmount).toBe(expected);
+    expect(matrixTotalLabel(cells, null).ceilingAmount).toBe(expected);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// I3 — PER-KIND estimate: the real "≈" headline SURVIVES the multi-LoRA compare
+// case (a single representative estimate would fall back to the ceiling).
+// ---------------------------------------------------------------------------
+
+describe('cellKindKey + distinctCellKinds', () => {
+  it('collapses all non-LoRA (prompt-style) cells into the single "base" kind', () => {
+    expect(cellKindKey(modBase)).toBe('base');
+    expect(cellKindKey(modCine)).toBe('base');
+    const cells = buildMatrix('a cat', [ckptA, ckptB], [modBase, modCine]);
+    expect(distinctCellKinds(cells)).toEqual(['base']);
+  });
+
+  it('keys a LoRA kind by (versionId, strength) — same LoRA at a diff strength is distinct', () => {
+    // modLora = 407532@1, modLoraCompat = 407532@0.8 (see fixtures)
+    expect(cellKindKey(modLora)).not.toBe(cellKindKey(modLoraCompat));
+    const cells = buildMatrix('a cat', [ckptA], [modBase, modLora, modLoraCompat]);
+    // base + two distinct LoRA kinds.
+    expect(new Set(distinctCellKinds(cells)).size).toBe(3);
+  });
+
+  it('excludes blocked + canceled cells from the distinct kinds', () => {
+    const cells = buildMatrix('a cat', [ckptA], [modLoraCompat, modLoraB]).map((c) =>
+      c.modifier.key === 'lora-b' ? { ...c, status: 'blocked' as const } : c,
+    );
+    expect(distinctCellKinds(cells)).toEqual([cellKindKey(modLoraCompat)]);
+  });
+});
+
+describe('estimateMatrixTotalByKind', () => {
+  it('sums each cell at its own kind estimate and reports complete when all kinds priced', () => {
+    const cells = buildMatrix('a cat', [ckptA], [modBase, modLora, modLoraB]); // 3 kinds, 3 cells
+    const kindEstimates = {
+      base: 5,
+      [cellKindKey(modLora)]: 12,
+      [cellKindKey(modLoraB)]: 20,
+    };
+    const { total, complete } = estimateMatrixTotalByKind(cells, kindEstimates);
+    expect(total).toBe(5 + 12 + 20);
+    expect(complete).toBe(true);
+  });
+
+  it('is INCOMPLETE when a kind lacks an estimate, and charges that cell the cap (never under)', () => {
+    const cells = buildMatrix('a cat', [ckptA], [modBase, modLoraB]); // base + lora-b
+    const kindEstimates = { base: 5 }; // lora-b unpriced
+    const { total, complete } = estimateMatrixTotalByKind(cells, kindEstimates);
+    expect(complete).toBe(false);
+    expect(total).toBe(5 + PAGE_BUZZ_BUDGET_PER_CELL);
+  });
+});
+
+describe('matrixTotalLabel — PER-KIND map keeps "≈" across multiple distinct LoRAs (I3)', () => {
+  it('multi-DISTINCT-LoRA matrix now shows a precise "≈" when every kind is priced', () => {
+    const cells = buildMatrix('a cat', [ckptA], [modLoraCompat, modLoraB]); // 2 distinct LoRAs
+    const kindEstimates = {
+      [cellKindKey(modLoraCompat)]: 9,
+      [cellKindKey(modLoraB)]: 11,
+    };
+    const label = matrixTotalLabel(cells, kindEstimates);
+    expect(label.isCeiling).toBe(false);
+    expect(label.amount).toContain('≈');
+    expect(label.amount).toContain(formatCost(20)); // 9 + 11
+    // The ceiling is still available for the demoted "safety max" hint.
+    expect(label.ceilingAmount).toBe(formatCost(2 * PAGE_BUZZ_BUDGET_PER_CELL));
+  });
+
+  it('falls back to the ceiling when a kind is still unpriced (never an undercounting "≈")', () => {
+    const cells = buildMatrix('a cat', [ckptA], [modLoraCompat, modLoraB]);
+    const label = matrixTotalLabel(cells, { [cellKindKey(modLoraCompat)]: 9 }); // lora-b missing
+    expect(label.isCeiling).toBe(true);
+    expect(label.amount.toLowerCase()).toContain('up to');
+    expect(label.amount).not.toContain('≈');
+  });
+
+  it('an empty per-kind map reads as no estimate → the cap-based ceiling', () => {
+    const cells = buildMatrix('a cat', [ckptA, ckptB], [modBase, modCine]);
+    const label = matrixTotalLabel(cells, {});
+    expect(label.isCeiling).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// I5 — a blocked (incompatible) cell explains WHY + the fix.
+// ---------------------------------------------------------------------------
+
+describe('incompatibleCellReason', () => {
+  it('names both families and the fix when the LoRA carries a baseModelFamily', () => {
+    const reason = incompatibleCellReason({
+      checkpoint: { baseModel: 'Pony' },
+      modifier: { baseModelFamily: 'SDXL 1.0' },
+    });
+    expect(reason).toContain('SDXL 1.0');
+    expect(reason).toContain('Pony');
+    expect(reason.toLowerCase()).toContain('pick');
+  });
+
+  it('falls back to the stored server error when no family is known', () => {
+    const reason = incompatibleCellReason({
+      checkpoint: { baseModel: '' },
+      modifier: {},
+      error: 'not compatible with the checkpoint base model',
+    });
+    expect(reason).toBe('not compatible with the checkpoint base model');
+  });
+
+  it('always yields a non-empty generic reason as a last resort', () => {
+    const reason = incompatibleCellReason({ checkpoint: { baseModel: '' }, modifier: {} });
+    expect(reason.length).toBeGreaterThan(0);
+    expect(reason.toLowerCase()).toContain('compatible');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// I6 — terminology.
+// ---------------------------------------------------------------------------
+
+describe('terminology (I6)', () => {
+  it('the baseline column reads "No style (plain prompt)", not the jargon "Baseline"', () => {
+    expect(BASELINE_MODIFIER.label).toBe('No style (plain prompt)');
+    expect(MODIFIERS[0].label).toBe('No style (plain prompt)');
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -822,11 +958,64 @@ describe('isInsufficientBuzz', () => {
     expect(isInsufficientBuzz('budget exceeded')).toBe(true);
     expect(isInsufficientBuzz('Low balance')).toBe(true);
   });
+  it('matches the exact host preflight string', () => {
+    // The literal string blocks.router mints when estimate > budget (M3).
+    expect(
+      isInsufficientBuzz('insufficient buzz budget: estimate 900 exceeds budget 200'),
+    ).toBe(true);
+  });
   it('is false for unrelated / empty errors', () => {
     expect(isInsufficientBuzz('prompt was rejected by the audit')).toBe(false);
     expect(isInsufficientBuzz(null)).toBe(false);
     expect(isInsufficientBuzz(undefined)).toBe(false);
     expect(isInsufficientBuzz('')).toBe(false);
+  });
+  it('M3: does NOT over-match an unrelated error that merely mentions buzz/budget', () => {
+    // These are the false-positives the tightened sniff eliminates — none is a
+    // funds shortfall, so none should surface a (wrong) Top-Up CTA.
+    expect(isInsufficientBuzz('buzz workflow crashed')).toBe(false);
+    expect(isInsufficientBuzz('the buzz service is temporarily unavailable')).toBe(false);
+    expect(isInsufficientBuzz('failed to reach the buzz orchestrator')).toBe(false);
+    expect(isInsufficientBuzz('render budget for the frame was recalculated')).toBe(false);
+  });
+  it('M3: a bare shortfall WITHOUT a money noun is NOT insufficient-Buzz (conjunction rule)', () => {
+    // "insufficient"/"not enough" alone describe non-money failures — they must
+    // NOT trip the Out-of-Buzz CTA (which could induce an unnecessary purchase).
+    expect(isInsufficientBuzz('insufficient VRAM to run this generation')).toBe(false);
+    expect(isInsufficientBuzz('insufficient GPU memory')).toBe(false);
+    expect(isInsufficientBuzz('insufficient permissions')).toBe(false);
+    expect(isInsufficientBuzz('not enough disk space')).toBe(false);
+    // …but WITH a money noun it does classify.
+    expect(isInsufficientBuzz('insufficient buzz to continue')).toBe(true);
+    expect(isInsufficientBuzz('not enough balance')).toBe(true);
+    // …and the real host preflight string still matches.
+    expect(isInsufficientBuzz('insufficient buzz budget: estimate 900 exceeds budget 200')).toBe(true);
+  });
+});
+
+describe('snapshotErrorCode (M3 — client-ready for the upstream structured code)', () => {
+  it('reads a known structured code off the snapshot when present', () => {
+    expect(snapshotErrorCode({ status: 'failed', errorCode: 'INSUFFICIENT_BUZZ' })).toBe(
+      'INSUFFICIENT_BUZZ',
+    );
+    expect(snapshotErrorCode({ status: 'failed', errorCode: 'WORKFLOW_FAILED' })).toBe(
+      'WORKFLOW_FAILED',
+    );
+  });
+  it('is undefined when absent (today) or unrecognized', () => {
+    expect(snapshotErrorCode({ status: 'failed' })).toBeUndefined();
+    expect(snapshotErrorCode({ status: 'failed', errorCode: 'SOMETHING_ELSE' })).toBeUndefined();
+  });
+  it('cellStatusForSnapshot PREFERS the structured code over the text sniff', () => {
+    // A failed snapshot whose free-text says nothing about money, but whose
+    // structured code IS insufficient → insufficient (structured wins).
+    expect(
+      cellStatusForSnapshot(snap({ status: 'failed', error: 'generic', errorCode: 'INSUFFICIENT_BUZZ' } as never)),
+    ).toBe('insufficient');
+    // A structured WORKFLOW_FAILED with money-ish text → still failed (code wins).
+    expect(
+      cellStatusForSnapshot(snap({ status: 'failed', error: 'insufficient', errorCode: 'WORKFLOW_FAILED' } as never)),
+    ).toBe('failed');
   });
 });
 
