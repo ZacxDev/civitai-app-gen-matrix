@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from 'react';
 
 import {
+  useAppStorage,
+  useAppWorkflows,
   useBlockContext,
   useBlockResize,
   useBlockToken,
@@ -11,17 +13,8 @@ import {
   useRequestSignIn,
   useResourcePicker,
 } from '@civitai/blocks-react';
-import {
-  Alert,
-  Badge,
-  Button,
-  Card,
-  Group,
-  Modal,
-  Stack,
-  Textarea,
-} from '@civitai/blocks-react/ui';
-import type { BlockWorkflowSnapshot, WorkflowBodyTextToImage } from '@civitai/app-sdk/blocks';
+import { Slider, Tooltip, useToast } from '@civitai/components-react';
+import type { BlockWorkflowSnapshot } from '@civitai/app-sdk/blocks';
 
 import {
   CHECKPOINTS,
@@ -39,6 +32,13 @@ import {
   billableCellCount,
   buildCellBody,
   buildMatrix,
+  cellKindKey,
+  composeCellPrompt,
+  incompatibleCellReason,
+  clampLoraStrength,
+  DEFAULT_LORA_STRENGTH,
+  LORA_STRENGTH_MAX,
+  LORA_STRENGTH_MIN,
   exceedsCap,
   failedCellDetail,
   failedCellLabel,
@@ -55,8 +55,6 @@ import {
   nextCellsToStart,
   POLL_MAX_ATTEMPTS,
   timedOutCellLabel,
-  representativeEstimateBody,
-  estimateSignature,
   runProgressLabel,
   isUncancelableInFlight,
   uncancelableInFlightCount,
@@ -70,17 +68,17 @@ import { ResourceBrowser } from './ResourceBrowser.js';
 import { CatalogCache, defaultKvStore } from './catalog-cache.js';
 import { DEFAULT_LIMIT, fetchCatalog, type CatalogQuery } from './catalog-api.js';
 import { loraBaseModelFilter } from './ecosystem.js';
+import { palette, type Palette } from './theme.js';
+import { MaturityImage } from './MaturityImage.js';
 import {
-  elevate,
-  metaText,
-  mutedText,
-  pageStyle,
-  palette,
-  radius,
-  token,
-  contentStyle,
-  type Palette,
-} from './theme.js';
+  RUN_STORAGE_KEY,
+  buildRunManifest,
+  isPersistableRun,
+  reconcileCells,
+  restoreStateFromManifest,
+  type AppWorkflowLike,
+  type MaturityGate,
+} from './persistence.js';
 
 /**
  * Stable empty-array identity for ResourceBrowser's `checkpointBaseModels` prop
@@ -108,29 +106,112 @@ const EMPTY_BASE_MODELS: readonly (string | undefined)[] = [];
  * Money safety: a client-side cell cap (MAX_CELLS) + a confirm-before-spend
  * total-cost gate + a concurrency-limited queue. All the load-bearing decisions
  * live in the unit-tested matrix.ts; this component is a thin async driver.
- *
- * UI: the design system — `@civitai/blocks-react/ui` components + `@civitai/theme`
- * `--civitai-*` tokens (light/dark driven by the `[data-theme]` the host sets on
- * the block root; zero hardcoded colors, no JS light/dark boolean).
  */
+/**
+ * Make a dialog a real modal: move focus into it on open, trap Tab/Shift+Tab
+ * inside it, close on Escape, and restore focus to whatever was focused before
+ * (the trigger) on close. Markup/behavior only — no money/queue logic.
+ *
+ * @param ref      the dialog container
+ * @param active   whether the dialog is mounted/open
+ * @param onClose  called on Escape (cancel)
+ */
+function useModalA11y(
+  ref: React.RefObject<HTMLElement | null>,
+  active: boolean,
+  onClose: () => void,
+) {
+  // Keep the latest onClose without re-binding listeners every render.
+  const onCloseRef = useRef(onClose);
+  onCloseRef.current = onClose;
+
+  useEffect(() => {
+    if (!active) return;
+    const node = ref.current;
+    if (!node) return;
+    const previouslyFocused = document.activeElement as HTMLElement | null;
+
+    const focusables = () =>
+      Array.from(
+        node.querySelectorAll<HTMLElement>(
+          'a[href], button:not([disabled]), textarea:not([disabled]), input:not([disabled]), select:not([disabled]), [tabindex]:not([tabindex="-1"])',
+        ),
+      ).filter((el) => el.offsetParent !== null || el === document.activeElement);
+
+    // Focus the primary action (or the dialog itself) on open.
+    const initial =
+      node.querySelector<HTMLElement>('[data-autofocus]') ?? focusables()[0] ?? node;
+    initial.focus();
+
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        onCloseRef.current();
+        return;
+      }
+      if (e.key !== 'Tab') return;
+      const items = focusables();
+      if (items.length === 0) {
+        e.preventDefault();
+        return;
+      }
+      const first = items[0];
+      const last = items[items.length - 1];
+      const activeEl = document.activeElement as HTMLElement | null;
+      if (e.shiftKey) {
+        if (activeEl === first || !node.contains(activeEl)) {
+          e.preventDefault();
+          last.focus();
+        }
+      } else if (activeEl === last || !node.contains(activeEl)) {
+        e.preventDefault();
+        first.focus();
+      }
+    };
+
+    node.addEventListener('keydown', onKeyDown);
+    return () => {
+      node.removeEventListener('keydown', onKeyDown);
+      // Restore focus to the trigger on close (if it's still in the DOM).
+      if (previouslyFocused && document.contains(previouslyFocused)) {
+        previouslyFocused.focus();
+      }
+    };
+  }, [active, ref]);
+}
+
 export function App() {
   const { ready, viewer, theme } = useBlockContext();
-  const token$ = useBlockToken();
+  const token = useBlockToken();
   // The block's domain maturity ceiling (fail-closed SFW). Threaded into the
   // anon catalog read so a red-domain block's anon browse can show mature while
   // green/blue stay SFW. The token (signed-in) path ignores it — server clamps.
-  const { isSfw: domainIsSfw } = useDomainMaturity();
+  // ALSO drives the G1 result-image maturity gate (below).
+  const domainMaturity = useDomainMaturity();
+  const { isSfw: domainIsSfw } = domainMaturity;
   const { estimate, submit, poll, cancel } = useBuzzWorkflow();
   const { requestConsent } = useRequestConsent();
   const { requestSignIn } = useRequestSignIn();
   const { openPurchaseModal } = useBuzzPurchase();
   const { open: openResourcePicker } = useResourcePicker();
+  // M1 — the persistent read-model. `useAppStorage` (per-viewer KV that survives
+  // reload) holds the run manifest; `useAppWorkflows` is the host's authoritative,
+  // per-app-tag-scoped list we reconcile against for status/image/nsfwLevel/cost.
+  const storage = useAppStorage();
+  const { workflows: appWorkflows, refetch: refetchWorkflows } = useAppWorkflows();
+  const toast = useToast();
 
-  // The app-chrome palette — every value is a `--civitai-*` var reference, so
-  // light/dark is resolved by CSS off the `[data-theme]` root, not a JS boolean.
-  const c = palette();
+  // G1 — the domain ceiling the result-image gate consults (stable identity for
+  // deps). `isLevelAllowed`/`isSfw` are re-read live from useDomainMaturity.
+  const maturityGate = useMemo<MaturityGate>(
+    () => ({ isLevelAllowed: domainMaturity.isLevelAllowed, isSfw: domainMaturity.isSfw }),
+    [domainMaturity.isLevelAllowed, domainMaturity.isSfw],
+  );
+
+  const isDark = theme === 'dark';
+  const c = palette(isDark);
   const anon = ready && !viewer;
-  const granted = hasBudgetedScope(token$.scopes);
+  const granted = hasBudgetedScope(token.scopes);
 
   const rootRef = useRef<HTMLDivElement>(null);
   useBlockResize(rootRef);
@@ -140,7 +221,13 @@ export function App() {
   const [selectedCkpts, setSelectedCkpts] = useState<Set<number>>(
     () => new Set([CHECKPOINTS[0]?.versionId].filter((v): v is number => v != null)),
   );
-  const [selectedMods, setSelectedMods] = useState<Set<string>>(() => new Set(['baseline']));
+  // Default-select TWO styles so the out-of-box matrix demonstrates a real
+  // comparison (a 1-cell "matrix" doesn't). Baseline (no-style reference) +
+  // Cinematic — both prompt-style (non-LoRA), so the default run never hinges on
+  // a server compatibility check.
+  const [selectedMods, setSelectedMods] = useState<Set<string>>(
+    () => new Set(['baseline', 'cinematic']),
+  );
 
   // Picker-added axis members. The host's native resource picker
   // (useResourcePicker) returns one resource at a time; each becomes a LoRA
@@ -169,18 +256,51 @@ export function App() {
   );
   const allModifiers = useMemo<ModifierOption[]>(() => [...MODIFIERS, ...pickedMods], [pickedMods]);
 
+  // Per-LoRA strength overrides (design-system Slider). Keyed by modifier key so
+  // a picked/curated LoRA column's strength is user-tunable before spend. Applied
+  // when composing the chosen modifiers; server-clamped to [-1, 2] regardless.
+  const [strengthOverrides, setStrengthOverrides] = useState<Map<string, number>>(
+    () => new Map(),
+  );
+
   // ---- Run state (the matrix reducer) ----
   const [state, dispatch] = useReducer(matrixReducer, initialMatrixState);
+
+  // Per-cell enlarge lightbox (shows the UNCROPPED paid output + copy-URL). Null
+  // = closed. Reached only from a revealed/safe thumbnail (see MaturityImage).
+  const [lightbox, setLightbox] = useState<{
+    src: string;
+    alt: string;
+    nsfwLevel: number | null | undefined;
+  } | null>(null);
+  // "New matrix" confirm gate — deleting a paid run must be intentional.
+  const [confirmReset, setConfirmReset] = useState(false);
 
   // Auto-resume intent across the consent round-trip.
   const consentPendingRef = useRef(false);
   // Per-cell poll cancellation tokens, torn down on unmount / reset.
   const pollTokensRef = useRef<Map<string, { cancelled: boolean }>>(new Map());
+  // M4 — submit idempotency guard. Cell ids that have entered `runCell` this run,
+  // so a StrictMode double-invoke / re-entrant queue tick can't fire a SECOND
+  // submit (a second real spend) for the same cell. Belt-and-suspenders: the
+  // platform's per-app Redis idempotency cap is the authoritative backstop, but
+  // this stops a duplicate leaving the client at all. Cleared on BUILD / RESET.
+  const submittedRef = useRef<Set<string>>(new Set());
+  // M1 — guards so the mount-time restore fires once and reconcile re-runs only
+  // when the read-model actually changes.
+  const restoredRef = useRef(false);
+  const reconciledSigRef = useRef<string>('');
 
   // Keep the latest hook fns in refs so the queue driver (an effect) always
   // calls the current instances without re-subscribing.
   const fns = useRef({ estimate, submit, poll, cancel });
   fns.current = { estimate, submit, poll, cancel };
+  // Toast API in a ref so the stable runCell/poll callbacks reach the current one.
+  const toastRef = useRef(toast);
+  toastRef.current = toast;
+  // refetch in a ref so the done-count effect doesn't churn on hook identity.
+  const refetchRef = useRef(refetchWorkflows);
+  refetchRef.current = refetchWorkflows;
 
   useEffect(() => {
     const tokens = pollTokensRef.current;
@@ -194,9 +314,46 @@ export function App() {
     [allCheckpoints, selectedCkpts],
   );
   const chosenModifiers = useMemo(
-    () => allModifiers.filter((m) => selectedMods.has(m.key)),
-    [allModifiers, selectedMods],
+    () =>
+      allModifiers
+        .filter((m) => selectedMods.has(m.key))
+        .map((m) =>
+          // Apply a user LoRA-strength override (Slider) to the selected column.
+          m.loraVersionId != null && strengthOverrides.has(m.key)
+            ? { ...m, loraStrength: clampLoraStrength(strengthOverrides.get(m.key)) }
+            : m,
+        ),
+    [allModifiers, selectedMods, strengthOverrides],
   );
+
+  // The selected LoRA columns whose strength the Slider can tune (build phase).
+  const selectedLoraModifiers = useMemo(
+    () => chosenModifiers.filter((m) => m.loraVersionId != null),
+    [chosenModifiers],
+  );
+  const setLoraStrength = useCallback((key: string, value: number) => {
+    setStrengthOverrides((prev) => {
+      const next = new Map(prev);
+      next.set(key, clampLoraStrength(value));
+      return next;
+    });
+  }, []);
+
+  // The result-grid axes are derived FROM the run's cells (their row/col), not
+  // the live selection — so a RESTORED run (M1) renders its own grid even though
+  // the build-panel selection has reset to the default. row/col are contiguous
+  // from buildMatrix, so the sorted maps reproduce the original axes.
+  const { gridCheckpoints, gridModifiers } = useMemo(() => {
+    const ckMap = new Map<number, CheckpointOption>();
+    const modMap = new Map<number, ModifierOption>();
+    for (const cell of state.cells) {
+      if (!ckMap.has(cell.row)) ckMap.set(cell.row, cell.checkpoint);
+      if (!modMap.has(cell.col)) modMap.set(cell.col, cell.modifier);
+    }
+    const byIndex = <T,>(m: Map<number, T>): T[] =>
+      [...m.entries()].sort((a, b) => a[0] - b[0]).map(([, v]) => v);
+    return { gridCheckpoints: byIndex(ckMap), gridModifiers: byIndex(modMap) };
+  }, [state.cells]);
 
   // Preview cells (for the count / cost gate) — independent of the run state.
   const previewCells = useMemo(
@@ -206,50 +363,84 @@ export function App() {
   const billable = billableCellCount(previewCells);
   const over = exceedsCap(previewCells);
 
-  // ---- Build-phase representative estimate (best-effort, debounced) ----
-  // Fire ONE estimate() against a REPRESENTATIVE cell while the user is still
-  // building, so the summary + confirm gate can show "≈ N Buzz" instead of the
-  // ~25× over the cap-based "up to M". Best-effort: a slow/failed estimate never
-  // blocks the UI or the Generate button and never changes the cap/spend logic.
-  const [buildEstimate, setBuildEstimate] = useState<number | null>(null);
-  // The signature of the selection bits that materially change the estimate;
-  // re-estimate (debounced) only when it changes.
-  const estSig = estimateSignature(prompt, chosenCheckpoints, chosenModifiers);
-  const buildEstimateBody = useMemo(
-    () => representativeEstimateBody(prompt, chosenCheckpoints, chosenModifiers),
-    [prompt, chosenCheckpoints, chosenModifiers],
-  );
+  // ---- Build-phase PER-KIND estimate (best-effort, debounced) ----
+  // Fire one estimate() per DISTINCT billing kind (baseline/prompt-style = the
+  // 'base' kind; each distinct LoRA = its own kind) while the user is still
+  // building, so the summary + confirm gate can HEADLINE a real "≈ N Buzz" total
+  // — and, crucially, that "≈" SURVIVES the multi-LoRA compare case (a single
+  // representative estimate would undercount when ≥2 distinct LoRAs differ). At
+  // most a few estimates fire (kinds ≤ selected columns ≤ the cell cap).
+  // Best-effort: a slow/failed estimate never blocks the UI or Generate and never
+  // changes the cap/spend logic — a kind with no estimate falls to the ceiling.
+  const [buildKindEstimates, setBuildKindEstimates] = useState<Record<string, number>>({});
+  const firstCheckpoint = chosenCheckpoints[0];
+  // One representative modifier per distinct kind (first wins), stable-keyed.
+  const kindReps = useMemo(() => {
+    const map = new Map<string, ModifierOption>();
+    for (const m of chosenModifiers) {
+      const k = cellKindKey(m);
+      if (!map.has(k)) map.set(k, m);
+    }
+    return map;
+  }, [chosenModifiers]);
+  // The material signature — re-estimate (debounced) only when the prompt, the
+  // representative checkpoint, or the set of distinct kinds changes.
+  const kindSig = [
+    prompt.trim(),
+    firstCheckpoint?.versionId ?? 'none',
+    [...kindReps.keys()].sort().join(','),
+  ].join('|');
   useEffect(() => {
-    // Nothing meaningful to estimate yet (empty prompt / no checkpoint) → keep
-    // the cap-based fallback. Don't clear a prior estimate to null on every
-    // keystroke gap; just skip until there's something to price.
-    if (!buildEstimateBody) return;
+    if (prompt.trim().length === 0 || !firstCheckpoint || kindReps.size === 0) return;
     let cancelled = false;
     const handle = setTimeout(() => {
-      fns.current
-        .estimate(buildEstimateBody)
-        .then((e) => {
-          if (cancelled) return;
-          const total = e.cost?.total;
-          if (total != null && Number.isFinite(total) && total > 0) setBuildEstimate(total);
-        })
-        .catch(() => {
-          /* best-effort — leave the cap-based fallback in place */
-        });
+      const reps = [...kindReps.entries()];
+      Promise.all(
+        reps.map(async ([kind, modifier]) => {
+          const body = buildCellBody(firstCheckpoint, composeCellPrompt(prompt, modifier), modifier);
+          try {
+            const e = await fns.current.estimate(body);
+            const total = e.cost?.total;
+            if (total != null && Number.isFinite(total) && total > 0) {
+              return [kind, total] as const;
+            }
+          } catch {
+            /* best-effort — this kind falls to the ceiling in the total */
+          }
+          return null;
+        }),
+      ).then((results) => {
+        if (cancelled) return;
+        // Replace wholesale for this signature so a stale kind's estimate can't
+        // linger after the prompt/checkpoint (which changes ALL costs) changes.
+        const next: Record<string, number> = {};
+        for (const r of results) if (r) next[r[0]] = r[1];
+        setBuildKindEstimates(next);
+      });
     }, 500);
     return () => {
       cancelled = true;
       clearTimeout(handle);
     };
-    // estSig captures the material selection bits; buildEstimateBody is derived
-    // from the same inputs. Keying the effect on estSig debounces per-material-change.
+    // kindSig captures the material selection bits; the effect body reads the
+    // current prompt/checkpoint/kindReps. Keying on kindSig debounces per-change.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [estSig]);
+  }, [kindSig]);
 
-  // The preview total uses the real build-phase estimate once it has landed
-  // (→ "≈ N"); until then it's the cap-based MAXIMUM ("up to M"). matrixTotalLabel
-  // tags it so the UI never presents the ceiling as what you'll spend.
-  const previewLabel = matrixTotalLabel(previewCells, buildEstimate);
+  // A single representative per-cell number (the priciest known kind, so it
+  // over-covers) to seed the run + the Top-Up suggestion. The DISPLAY total uses
+  // the full per-kind map (below); this is only the run/topup scalar.
+  const repCellEstimate = useMemo(() => {
+    const vals = Object.values(buildKindEstimates).filter(
+      (v) => Number.isFinite(v) && v > 0,
+    );
+    return vals.length ? Math.max(...vals) : null;
+  }, [buildKindEstimates]);
+
+  // The preview total HEADLINES the real per-kind "≈ N" once estimates land
+  // (surviving multi-LoRA); until then it's the cap-based MAXIMUM ("up to M"),
+  // with the ceiling always available as a demoted "safety max" hint.
+  const previewLabel = matrixTotalLabel(previewCells, buildKindEstimates);
 
   // ---- Selection toggles ----
   const toggleCkpt = useCallback((versionId: number) => {
@@ -385,8 +576,14 @@ export function App() {
   // transitions go through the reducer; the queue effect below decides WHICH
   // cells run (concurrency limit), this just executes one.
   const runCell = useCallback(async (cell: MatrixCell) => {
+    // M4 — idempotency guard: never enter the estimate→submit path twice for the
+    // same cell in a run (StrictMode double-invoke / re-entrant queue tick). The
+    // first entry claims the id; a second is a no-op, so it can never re-spend.
+    if (submittedRef.current.has(cell.id)) return;
+    submittedRef.current.add(cell.id);
+
     const { estimate: est, submit: sub } = fns.current;
-    const body: WorkflowBodyTextToImage = buildCellBody(cell.checkpoint, cell.prompt, cell.modifier);
+    const body = buildCellBody(cell.checkpoint, cell.prompt, cell.modifier);
 
     // 1) Estimate (best-effort; failed estimate doesn't block submit). The
     //    first estimate to land seeds the per-cell estimate for the confirm
@@ -425,13 +622,19 @@ export function App() {
       snap = await sub(body);
     } catch (err) {
       const msg = err instanceof Error ? err.message : 'submit failed';
-      dispatch({
-        type: 'CELL_ERROR',
-        id: cell.id,
-        error: msg,
-        insufficient: isInsufficientBuzz(msg),
-        incompatible: isIncompatibleResourceError(msg),
-      });
+      const insufficient = isInsufficientBuzz(msg);
+      const incompatible = isIncompatibleResourceError(msg);
+      dispatch({ type: 'CELL_ERROR', id: cell.id, error: msg, insufficient, incompatible });
+      // A genuine failure (not the expected pre-spend `blocked`, not the
+      // Top-Up-handled `insufficient`) gets a non-blocking Toast so it's noticed
+      // even if the cell scrolled out of view. Design-system Toast (STEP 2).
+      if (!insufficient && !incompatible) {
+        toastRef.current?.show({
+          title: 'A cell failed to generate',
+          message: `${cell.checkpoint.label} · ${cell.modifier.label} — you can Retry failed.`,
+          color: 'error',
+        });
+      }
       return;
     }
 
@@ -508,6 +711,107 @@ export function App() {
     }
   }, [state.phase, state.cells, runCell]);
 
+  // Re-attach a poll loop to any `polling` cell that has a workflowId but no live
+  // poll token (a restored / reconciled in-flight cell). runPollLoop cancels any
+  // stale token first, so this is idempotent. M2's recovery path.
+  const resumePolling = useCallback(
+    (cells: readonly MatrixCell[]) => {
+      for (const cell of cells) {
+        if (cell.status !== 'polling' || cell.workflowId == null) continue;
+        const tok = pollTokensRef.current.get(cell.id);
+        if (tok && !tok.cancelled) continue; // already polling
+        runPollLoop(cell.id, cell.workflowId);
+      }
+    },
+    [runPollLoop],
+  );
+
+  // ---- M1 — restore a prior run on mount (once, for a signed-in viewer) ----
+  // Reload / device-switch rebuilds the in-flight + done matrix from the
+  // persisted manifest so paid outputs are never "lost". No auto-spend: an
+  // un-submitted cell restores as `canceled` (see restoreStateFromManifest).
+  useEffect(() => {
+    if (restoredRef.current || !ready || !viewer) return;
+    restoredRef.current = true;
+    let cancelled = false;
+    storage
+      .get<unknown>(RUN_STORAGE_KEY)
+      .then((raw) => {
+        if (cancelled) return;
+        const restored = restoreStateFromManifest(raw);
+        if (!restored) return;
+        // Mark every already-submitted cell so the M4 guard won't re-submit it.
+        for (const cell of restored.cells) {
+          if (cell.workflowId != null) submittedRef.current.add(cell.id);
+        }
+        dispatch({ type: 'RESTORE', state: restored });
+        resumePolling(restored.cells);
+        refetchWorkflows();
+      })
+      .catch(() => {
+        /* best-effort — a missing/malformed manifest just starts fresh */
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [ready, viewer, storage, resumePolling, refetchWorkflows]);
+
+  // ---- M1/M2 — reconcile against the authoritative read-model ----
+  // Whenever useAppWorkflows changes, merge status/image/nsfwLevel/cost onto the
+  // matrix cells (by workflowId) and resume polling anything still running
+  // server-side. Only acts on cells that carry a workflowId, and never during a
+  // fresh (unstarted) build — reconcile can't re-charge.
+  useEffect(() => {
+    if (appWorkflows.length === 0) return;
+    if (!state.cells.some((c) => c.workflowId != null)) return;
+    // Re-run only when the read-model actually changed (avoid a reconcile loop).
+    const sig = appWorkflows.map((w) => `${w.workflowId}:${w.status}`).join('|');
+    if (reconciledSigRef.current === sig) return;
+    reconciledSigRef.current = sig;
+    const { cells, resumableIds } = reconcileCells(
+      state.cells,
+      appWorkflows as unknown as AppWorkflowLike[],
+    );
+    dispatch({ type: 'RECONCILE', cells });
+    if (resumableIds.length > 0) resumePolling(cells);
+    // state.cells intentionally omitted: keyed on the read-model signature so a
+    // reconcile-driven cell change doesn't immediately re-fire this effect.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [appWorkflows, resumePolling]);
+
+  // ---- M1 — persist the run as it progresses (signed-in only) ----
+  // Written on every material state change so a reload mid-run recovers. anon /
+  // over-quota writes reject silently (best-effort).
+  useEffect(() => {
+    if (!viewer) return;
+    if (!isPersistableRun(state)) return;
+    let cancelled = false;
+    const handle = setTimeout(() => {
+      if (cancelled) return;
+      storage.set(RUN_STORAGE_KEY, buildRunManifest(state)).catch(() => undefined);
+    }, 250);
+    return () => {
+      cancelled = true;
+      clearTimeout(handle);
+    };
+  }, [state, viewer, storage]);
+
+  // ---- G1 — pull maturity for freshly-completed cells ----
+  // The LIVE poll snapshot carries NO nsfwLevel, so a just-finished result is
+  // fail-closed BLURRED on a SFW domain until the read-model confirms its
+  // maturity. Refetch useAppWorkflows shortly after each new `done` cell so the
+  // reconcile effect fills nsfwLevel and a safe image auto-reveals (a mature one
+  // stays blurred). Keyed on the done-count so it only fires as results land.
+  const doneCount = useMemo(
+    () => state.cells.filter((cell) => cell.status === 'done').length,
+    [state.cells],
+  );
+  useEffect(() => {
+    if (doneCount === 0 || !viewer) return;
+    const handle = setTimeout(() => refetchRef.current(), 400);
+    return () => clearTimeout(handle);
+  }, [doneCount, viewer]);
+
   // ---- Actions ----
   const handleGenerateClick = useCallback(() => {
     if (!viewer) {
@@ -515,17 +819,21 @@ export function App() {
       return;
     }
     if (over || billable === 0) return; // gated by the cap / empty selection
+    // A brand-new run: reset the M4 submit guard + reconcile signature so this
+    // build's cells can submit cleanly (and don't inherit a prior run's ids).
+    submittedRef.current.clear();
+    reconciledSigRef.current = '';
     // Build the matrix and move to the confirm gate (show total + confirm).
     dispatch({ type: 'BUILD', cells: buildMatrix(prompt, chosenCheckpoints, chosenModifiers) });
     // Seed the confirm gate with the build-phase representative estimate (if it
     // landed) so it shows "≈ N" immediately instead of the cap-based "up to M".
     // BUILD resets perCellEstimate to null, so re-apply it here; the first cell's
     // own estimate will refine it during the run. Best-effort: null is fine.
-    if (buildEstimate != null) {
-      dispatch({ type: 'SET_PER_CELL_ESTIMATE', estimate: buildEstimate });
+    if (repCellEstimate != null) {
+      dispatch({ type: 'SET_PER_CELL_ESTIMATE', estimate: repCellEstimate });
     }
     dispatch({ type: 'REQUEST_CONFIRM' });
-  }, [viewer, over, billable, prompt, chosenCheckpoints, chosenModifiers, buildEstimate, requestSignIn]);
+  }, [viewer, over, billable, prompt, chosenCheckpoints, chosenModifiers, repCellEstimate, requestSignIn]);
 
   const startRun = useCallback(() => {
     if (!granted) {
@@ -554,8 +862,12 @@ export function App() {
   const handleReset = useCallback(() => {
     pollTokensRef.current.forEach((t) => (t.cancelled = true));
     pollTokensRef.current.clear();
+    submittedRef.current.clear();
+    reconciledSigRef.current = '';
+    // Drop the persisted run — a fresh "New matrix" shouldn't rebuild the old one.
+    storage.delete(RUN_STORAGE_KEY).catch(() => undefined);
     dispatch({ type: 'RESET' });
-  }, []);
+  }, [storage]);
 
   // Stop the run: mark not-yet-started cells `canceled` (no spend) and fire the
   // orchestrator cancel() for every in-flight cell that has a workflowId. The
@@ -593,8 +905,25 @@ export function App() {
   // their costs/images are preserved and NOT re-charged (RETRY_FAILED re-queues
   // just the retryable subset to idle and resumes the run).
   const handleRetryFailed = useCallback(() => {
+    // Release the M4 guard for the cells about to be re-queued so they CAN run
+    // again — without this, the idempotency guard would block their retry. Only
+    // failed/insufficient cells re-run (done cells are never touched → never
+    // re-charged; RETRY_FAILED enforces that in the reducer).
+    for (const cell of state.cells) {
+      if (cell.status === 'failed' || cell.status === 'insufficient') {
+        submittedRef.current.delete(cell.id);
+      }
+    }
     dispatch({ type: 'RETRY_FAILED' });
-  }, []);
+  }, [state.cells]);
+
+  // M2 — re-check a `timedout` cell by re-polling its existing workflow (never a
+  // re-submit → never a re-charge). Flip it back to polling + re-attach the loop.
+  const handleRecheckTimedout = useCallback((cell: MatrixCell) => {
+    if (cell.status !== 'timedout' || cell.workflowId == null) return;
+    dispatch({ type: 'RECHECK_TIMEDOUT', id: cell.id });
+    runPollLoop(cell.id, cell.workflowId);
+  }, [runPollLoop]);
 
   const handleTopUp = useCallback(() => {
     // Suggest an amount proportionate to the run's actual cost (landed per-cell
@@ -607,7 +936,7 @@ export function App() {
   // ---- Render ----
   if (!ready) {
     return (
-      <div ref={rootRef} data-theme={theme || 'light'} style={pageStyle(c)}>
+      <div ref={rootRef} data-theme={isDark ? 'dark' : 'light'} style={pageStyle(c)}>
         <LoadingSkeleton c={c} />
       </div>
     );
@@ -616,10 +945,10 @@ export function App() {
   const inBuild = state.phase === 'building';
   const showConfirm = state.phase === 'confirming' || state.phase === 'needs-consent';
   const showGrid = state.phase === 'running' || state.phase === 'done';
-  // The confirm gate uses the REAL per-cell estimate once it has landed
-  // (perCellEstimate, seeded by the first cell's estimate call); until then it
-  // is a cap-based maximum, surfaced as "up to N" rather than expected spend.
-  const confirmLabel = matrixTotalLabel(state.cells, state.perCellEstimate);
+  // The confirm gate HEADLINES the real per-kind "≈ N" once estimates have landed
+  // (surviving the multi-LoRA compare case); until then it is a cap-based maximum,
+  // surfaced as "up to N" with the ceiling demoted to a "safety max" hint.
+  const confirmLabel = matrixTotalLabel(state.cells, buildKindEstimates);
   const anyInsufficient = state.cells.some((cell) => cell.status === 'insufficient');
   // Retry is offered once the run is done and at least one cell is retryable.
   const canRetry =
@@ -627,9 +956,16 @@ export function App() {
     state.cells.some((cell) => cell.status === 'failed' || cell.status === 'insufficient');
 
   return (
-    <div ref={rootRef} data-theme={theme || 'light'} style={pageStyle(c)}>
-      <div style={contentStyle}>
-        <AppHeader inBuild={inBuild} />
+    <div ref={rootRef} data-theme={isDark ? 'dark' : 'light'} style={pageStyle(c)}>
+      <div style={contentStyle()}>
+        <header style={{ display: 'grid', gap: 8 }}>
+          <h1 style={{ fontSize: 24, margin: 0 }}>Gen Matrix</h1>
+          <p style={{ fontSize: 15, opacity: 0.85, margin: 0, lineHeight: 1.45, fontWeight: 600 }}>
+            Same prompt, every model × style — side by side.
+          </p>
+          {inBuild && <p style={{ ...noteStyle(c), margin: 0 }}>{perCellBudgetCopy()}</p>}
+          {inBuild && <FirstRunExample c={c} />}
+        </header>
 
         {inBuild && (
           <BuildPanel
@@ -647,6 +983,8 @@ export function App() {
             previewLabel={previewLabel}
             anon={anon}
             picking={picking}
+            loraModifiers={selectedLoraModifiers}
+            setLoraStrength={setLoraStrength}
             onPickLora={handlePickLora}
             onPickCheckpoint={handlePickCheckpoint}
             onBrowseLora={() => openBrowse('LORA')}
@@ -660,7 +998,7 @@ export function App() {
             c={c}
             type={browse}
             cache={cacheRef.current}
-            blockToken={token$.raw}
+            blockToken={token.raw}
             domainIsSfw={domainIsSfw}
             onClose={closeBrowse}
             checkpointBaseModels={browse === 'LORA' ? selectedCkptBaseModels : EMPTY_BASE_MODELS}
@@ -677,6 +1015,7 @@ export function App() {
 
         {showConfirm && (
           <ConfirmPanel
+            c={c}
             cells={state.cells}
             label={confirmLabel}
             phase={state.phase}
@@ -689,25 +1028,60 @@ export function App() {
           <ResultGrid
             c={c}
             cells={state.cells}
-            checkpoints={chosenCheckpoints}
-            modifiers={chosenModifiers}
+            checkpoints={gridCheckpoints}
+            modifiers={gridModifiers}
             phase={state.phase}
             canRetry={canRetry}
-            onReset={handleReset}
+            maturityGate={maturityGate}
+            onReset={() => setConfirmReset(true)}
             onStop={handleStop}
             onRetry={handleRetryFailed}
+            onRecheck={handleRecheckTimedout}
+            onEnlarge={(cell) =>
+              cell.imageUrl &&
+              setLightbox({
+                src: cell.imageUrl,
+                alt: `${cell.checkpoint.label} · ${cell.modifier.label}`,
+                nsfwLevel: cell.nsfwLevel,
+              })
+            }
+          />
+        )}
+
+        {confirmReset && (
+          <ResetConfirmDialog
+            c={c}
+            onConfirm={() => {
+              setConfirmReset(false);
+              handleReset();
+            }}
+            onCancel={() => setConfirmReset(false)}
+          />
+        )}
+
+        {lightbox && (
+          <Lightbox
+            c={c}
+            src={lightbox.src}
+            alt={lightbox.alt}
+            nsfwLevel={lightbox.nsfwLevel}
+            gate={maturityGate}
+            onClose={() => setLightbox(null)}
+            onCopied={() =>
+              toastRef.current?.show({ message: 'Image URL copied', color: 'success' })
+            }
           />
         )}
 
         {anyInsufficient && (
-          <Alert color="warning" title="Some cells ran out of Buzz">
-            <Stack gap={10} align="flex-start">
-              <span style={mutedText}>Top up and run again to fill them.</span>
-              <Button color="warning" onClick={handleTopUp} data-testid="gm-topup">
-                Top up Buzz
-              </Button>
-            </Stack>
-          </Alert>
+          <div style={{ display: 'grid', gap: 6 }}>
+            <p style={noteStyle(c)}>
+              Some cells ran out of Buzz. Top up and run again to fill them.
+            </p>
+            <button type="button" onClick={handleTopUp} style={primaryBtn(c)} data-testid="gm-topup">
+              Top up Buzz
+            </button>
+          </div>
         )}
       </div>
     </div>
@@ -715,74 +1089,10 @@ export function App() {
 }
 
 // ---------------------------------------------------------------------------
-// Header — brand mark + title + hairline divider
-// ---------------------------------------------------------------------------
-
-/**
- * A tinted `radius.md` brand tile with the manifest `bolt` glyph (primary on
- * primary-light), the title, and a hairline `borderBottom` divider — the visual
- * identity anchor the design-system polish calls for.
- */
-function AppHeader({ inBuild }: { inBuild: boolean }) {
-  return (
-    <header
-      style={{
-        display: 'grid',
-        gap: 10,
-        paddingBottom: 14,
-        borderBottom: `1px solid ${token.border}`,
-      }}
-    >
-      <Group gap={12} wrap={false} align="center">
-        <span
-          aria-hidden
-          style={{
-            flex: 'none',
-            display: 'grid',
-            placeItems: 'center',
-            width: 40,
-            height: 40,
-            borderRadius: radius.md,
-            background: token.primaryLight,
-            color: token.primary,
-          }}
-        >
-          <BoltGlyph />
-        </span>
-        <div style={{ display: 'grid', gap: 2, minWidth: 0 }}>
-          <h1 style={{ fontSize: 19, margin: 0, letterSpacing: '-0.01em', lineHeight: 1.15 }}>
-            Gen Matrix
-          </h1>
-          <p style={metaText}>Same prompt, every model × style — side by side.</p>
-        </div>
-      </Group>
-      {inBuild && (
-        <Group gap={10} align="center">
-          <Badge variant="light" size="sm">
-            budgeted
-          </Badge>
-          <span style={metaText}>{perCellBudgetCopy()}</span>
-        </Group>
-      )}
-      {inBuild && <FirstRunExample />}
-    </header>
-  );
-}
-
-/** The manifest `bolt` icon as an inline glyph (inherits `currentColor`). */
-function BoltGlyph() {
-  return (
-    <svg width={22} height={22} viewBox="0 0 24 24" aria-hidden focusable="false">
-      <path d="M13 2 4 14h6l-1 8 9-12h-6l1-8Z" fill="currentColor" />
-    </svg>
-  );
-}
-
-// ---------------------------------------------------------------------------
 // Build panel — selection + cost preview + cap gate
 // ---------------------------------------------------------------------------
 
-function BuildPanel(props: {
+export function BuildPanel(props: {
   c: Palette;
   prompt: string;
   setPrompt: (v: string) => void;
@@ -797,6 +1107,9 @@ function BuildPanel(props: {
   previewLabel: CostLabel;
   anon: boolean;
   picking: boolean;
+  /** Selected LoRA columns whose strength the Slider can tune (STEP 2). */
+  loraModifiers: ModifierOption[];
+  setLoraStrength: (key: string, value: number) => void;
   onPickLora: () => void;
   onPickCheckpoint: () => void;
   onBrowseLora: () => void;
@@ -818,6 +1131,8 @@ function BuildPanel(props: {
     previewLabel,
     anon,
     picking,
+    loraModifiers,
+    setLoraStrength,
     onPickLora,
     onPickCheckpoint,
     onBrowseLora,
@@ -841,85 +1156,121 @@ function BuildPanel(props: {
           : `Over the ${MAX_CELLS}-cell limit — deselect some to continue.`;
 
   return (
-    <Stack gap={18}>
-      <Textarea
-        id="gm-prompt"
-        label="Shared prompt"
-        value={prompt}
-        maxLength={PROMPT_MAX}
-        placeholder="a serene mountain lake at golden hour, highly detailed"
-        onChange={(e) => setPrompt(e.target.value)}
-        aria-label="Shared generation prompt"
-        minRows={3}
-      />
+    <>
+      <div style={{ display: 'grid', gap: 6 }}>
+        <label htmlFor="gm-prompt" style={{ fontSize: 13, fontWeight: 600 }}>
+          Shared prompt
+        </label>
+        <textarea
+          id="gm-prompt"
+          value={prompt}
+          maxLength={PROMPT_MAX}
+          placeholder="a serene mountain lake at golden hour, highly detailed"
+          onChange={(e) => setPrompt(e.target.value)}
+          aria-label="Shared generation prompt"
+          rows={3}
+          style={textareaStyle(c)}
+        />
+      </div>
 
-      <AxisFieldset legend="Checkpoints (rows)">
-        {checkpoints.map((ckpt: CheckpointOption) => (
-          <Chip
-            key={ckpt.versionId}
-            label={ckpt.label}
-            selected={selectedCkpts.has(ckpt.versionId)}
-            onToggle={() => toggleCkpt(ckpt.versionId)}
-          />
-        ))}
-        <Button
-          variant="light"
-          size="sm"
-          onClick={onBrowseCheckpoint}
-          data-testid="gm-browse-checkpoint"
-        >
-          Browse checkpoints
-        </Button>
-        <Button
-          variant="subtle"
-          size="sm"
-          onClick={onPickCheckpoint}
-          loading={picking}
-          leftSection={<span aria-hidden>+</span>}
-          data-testid="gm-pick-checkpoint"
-        >
-          All resources
-        </Button>
-      </AxisFieldset>
+      <fieldset style={fieldsetStyle(c)}>
+        <legend style={legendStyle}>Models (checkpoints)</legend>
+        <div style={chipRow}>
+          {checkpoints.map((ckpt: CheckpointOption) => (
+            <Chip
+              key={ckpt.versionId}
+              c={c}
+              label={ckpt.label}
+              selected={selectedCkpts.has(ckpt.versionId)}
+              onToggle={() => toggleCkpt(ckpt.versionId)}
+            />
+          ))}
+          <button
+            type="button"
+            onClick={onBrowseCheckpoint}
+            style={browseBtn(c)}
+            className="gm-chip"
+            data-testid="gm-browse-checkpoint"
+          >
+            Browse checkpoints
+          </button>
+          <button
+            type="button"
+            onClick={onPickCheckpoint}
+            disabled={picking}
+            style={pickBtn(c, picking)}
+            className="gm-chip"
+            data-testid="gm-pick-checkpoint"
+          >
+            + All resources
+          </button>
+        </div>
+      </fieldset>
 
-      <AxisFieldset legend="Styles (columns)">
-        {modifiers.map((m: ModifierOption) => (
-          <Chip
-            key={m.key}
-            label={m.label}
-            selected={selectedMods.has(m.key)}
-            isLora={m.loraVersionId != null}
-            onToggle={() => toggleMod(m.key)}
-          />
-        ))}
-        <Button variant="light" size="sm" onClick={onBrowseLora} data-testid="gm-browse-lora">
-          Browse LoRAs
-        </Button>
-        <Button
-          variant="subtle"
-          size="sm"
-          onClick={onPickLora}
-          loading={picking}
-          leftSection={<span aria-hidden>+</span>}
-          data-testid="gm-pick-lora"
-        >
-          All resources
-        </Button>
-      </AxisFieldset>
+      <fieldset style={fieldsetStyle(c)}>
+        <legend style={legendStyle}>Styles (columns)</legend>
+        <div style={chipRow}>
+          {modifiers.map((m: ModifierOption) => (
+            <Chip
+              key={m.key}
+              c={c}
+              label={m.label}
+              selected={selectedMods.has(m.key)}
+              isLora={m.loraVersionId != null}
+              onToggle={() => toggleMod(m.key)}
+            />
+          ))}
+          <button
+            type="button"
+            onClick={onBrowseLora}
+            style={browseBtn(c)}
+            className="gm-chip"
+            data-testid="gm-browse-lora"
+          >
+            Browse LoRAs
+          </button>
+          <button
+            type="button"
+            onClick={onPickLora}
+            disabled={picking}
+            style={pickBtn(c, picking)}
+            className="gm-chip"
+            data-testid="gm-pick-lora"
+          >
+            + All resources
+          </button>
+        </div>
+        <p style={{ ...noteStyle(c), marginTop: 8 }}>
+          <LoraGlyph c={c} /> = a LoRA column (generates as an extra resource on the checkpoint,
+          and may cost a little more). Civitai checks each LoRA × checkpoint pairing — an
+          incompatible one shows as <em>incompatible</em> and costs nothing.
+        </p>
+        {loraModifiers.length > 0 && (
+          <div style={{ display: 'grid', gap: 10, marginTop: 12 }} data-testid="gm-lora-strengths">
+            {loraModifiers.map((m) => {
+              const strength = m.loraStrength ?? DEFAULT_LORA_STRENGTH;
+              return (
+                <Slider
+                  key={m.key}
+                  data-testid={`gm-lora-strength-${m.key}`}
+                  label={`${m.label} strength`}
+                  min={LORA_STRENGTH_MIN}
+                  max={LORA_STRENGTH_MAX}
+                  step={0.1}
+                  value={strength}
+                  valueLabel={strength.toFixed(1)}
+                  onChange={(e) => setLoraStrength(m.key, Number(e.currentTarget.value))}
+                />
+              );
+            })}
+          </div>
+        )}
+      </fieldset>
 
-      <p style={mutedText}>
-        <LoraGlyph /> = a LoRA column (generates as an extra resource on the checkpoint, and may
-        cost a little more). Civitai checks each LoRA × checkpoint pairing — an incompatible one
-        shows as <em>incompatible</em> and costs nothing.
-      </p>
-
-      <Card
-        withBorder
-        padding="sm"
+      <div
         role="status"
         style={{
-          fontSize: 14,
-          fontVariantNumeric: 'tabular-nums',
+          ...summaryBox(c),
           borderColor: over ? c.danger : c.border,
           color: over ? c.danger : c.fg,
         }}
@@ -928,100 +1279,340 @@ function BuildPanel(props: {
           {billable} of {MAX_CELLS}
         </strong>{' '}
         cell{billable === 1 ? '' : 's'} · <strong>{previewLabel.amount}</strong> Buzz
-        {previewLabel.isCeiling && <span style={metaText}> max — real cost is usually far less</span>}
-        {over && <> — over the {MAX_CELLS}-cell limit. Deselect some to continue.</>}
-      </Card>
+        {previewLabel.isCeiling ? (
+          <span style={{ opacity: 0.7 }}> max — real cost is usually far less</span>
+        ) : (
+          // The "≈" real estimate is the headline; the cap-based ceiling is
+          // demoted to a small "safety max" hint (never the anchor). I3.
+          <Tooltip
+            label={`Safety max ${previewLabel.ceilingAmount} Buzz — the per-cell safety cap × cells. Real cost is usually far less.`}
+          >
+            <span
+              tabIndex={0}
+              data-testid="gm-safety-max"
+              style={{ opacity: 0.7, marginLeft: 6, cursor: 'help', fontSize: 12 }}
+            >
+              safety max {previewLabel.ceilingAmount}
+            </span>
+          </Tooltip>
+        )}
+        {over && (
+          <>
+            {' '}
+            — over the {MAX_CELLS}-cell limit. Deselect some to continue.
+          </>
+        )}
+      </div>
 
-      <Stack gap={6}>
-        <Button
-          fullWidth
-          size="lg"
+      <div style={{ display: 'grid', gap: 6 }}>
+        <button
+          type="button"
           onClick={onGenerate}
           disabled={disabled}
+          style={primaryBtn(c, disabled)}
+          className="gm-chip"
           aria-describedby={disabledReason ? 'gm-generate-reason' : undefined}
           data-testid={anon ? 'gm-signin' : 'gm-generate'}
         >
           {anon
             ? 'Sign in to generate'
             : `Generate Matrix · ${billable} cell${billable === 1 ? '' : 's'}`}
-        </Button>
+        </button>
         {disabledReason && (
           <p
             id="gm-generate-reason"
             role="status"
-            style={{ ...metaText, textAlign: 'center' }}
+            style={{ ...noteStyle(c), textAlign: 'center', margin: 0 }}
             data-testid="gm-generate-reason"
           >
             {disabledReason}
           </p>
         )}
-      </Stack>
-    </Stack>
-  );
-}
-
-/** A token-styled fieldset wrapping a wrapping chip row (semantic grouping). */
-function AxisFieldset({ legend, children }: { legend: string; children: React.ReactNode }) {
-  return (
-    <fieldset
-      style={{
-        border: `1px solid ${token.border}`,
-        borderRadius: radius.md,
-        padding: 12,
-        margin: 0,
-      }}
-    >
-      <legend style={{ fontSize: 13, fontWeight: 700, padding: '0 6px' }}>{legend}</legend>
-      <Group gap={8}>{children}</Group>
-    </fieldset>
+      </div>
+    </>
   );
 }
 
 // ---------------------------------------------------------------------------
-// Confirm panel — explicit spend gate (design-system Modal)
+// Confirm panel — explicit spend gate
 // ---------------------------------------------------------------------------
 
-function ConfirmPanel(props: {
+export function ConfirmPanel(props: {
+  c: Palette;
   cells: MatrixCell[];
   label: CostLabel;
   phase: string;
   onConfirm: () => void;
   onCancel: () => void;
 }) {
-  const { cells, label, phase, onConfirm, onCancel } = props;
+  const { c, cells, label, phase, onConfirm, onCancel } = props;
   const billable = billableCellCount(cells);
   const needsConsent = phase === 'needs-consent';
 
+  const dialogRef = useRef<HTMLDivElement>(null);
+  // Real modal: focus moves in on open, is trapped, Escape cancels, and focus
+  // returns to the trigger on close (useModalA11y).
+  useModalA11y(dialogRef, true, onCancel);
+
   return (
-    <Modal opened onClose={onCancel} title="Confirm generation" size="sm">
-      <Stack gap={12}>
-        <p style={{ margin: 0, fontSize: 15, color: token.text }}>
+    <div
+      className="gm-backdrop"
+      style={backdropStyle()}
+      // A backdrop click cancels (mousedown on the backdrop itself, not a child).
+      onMouseDown={(e) => {
+        if (e.target === e.currentTarget) onCancel();
+      }}
+      data-testid="gm-confirm-backdrop"
+    >
+      <div
+        ref={dialogRef}
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="gm-confirm-title"
+        aria-describedby="gm-confirm-desc"
+        className="gm-dialog-enter"
+        style={confirmBox(c)}
+      >
+        <p id="gm-confirm-title" style={{ margin: 0, fontSize: 15 }}>
           Generate <strong>{billable}</strong> cell{billable === 1 ? '' : 's'} for{' '}
           <strong>{label.amount}</strong> Buzz{label.isCeiling ? ' at most' : ''}?
         </p>
-        <p style={mutedText}>
+        <p id="gm-confirm-desc" style={noteStyle(c)}>
           This spends real Buzz — one charge per cell, only its real cost (usually a few Buzz).
           {label.isCeiling
             ? ` ${PAGE_BUZZ_BUDGET_PER_CELL.toLocaleString()} Buzz per cell is the safety cap, not what you'll spend.`
-            : ''}{' '}
+            : ` Safety max ${label.ceilingAmount} Buzz total.`}{' '}
           Nothing is spent until you confirm.
         </p>
         {needsConsent && (
-          <Alert color="info" role="status">
+          <p role="status" style={noteStyle(c)}>
             Grant access to generate — confirm in the Civitai dialog. If you dismissed it, press
             Confirm again.
-          </Alert>
+          </p>
         )}
-        <Group gap={8} justify="flex-end">
-          <Button variant="subtle" onClick={onCancel} data-testid="gm-cancel">
-            Cancel
-          </Button>
-          <Button onClick={onConfirm} data-testid="gm-confirm">
+        <div style={{ display: 'flex', gap: 8 }}>
+          <button
+            type="button"
+            onClick={onConfirm}
+            style={primaryBtn(c)}
+            className="gm-chip"
+            data-autofocus
+            data-testid="gm-confirm"
+          >
             {needsConsent ? 'Grant & generate' : 'Confirm & generate'}
-          </Button>
-        </Group>
-      </Stack>
-    </Modal>
+          </button>
+          <button
+            type="button"
+            onClick={onCancel}
+            style={secondaryBtn(c)}
+            className="gm-chip"
+            data-testid="gm-cancel"
+          >
+            Cancel
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Enlarge lightbox + copy-image-URL (the only sandbox-legal "keep" path)
+// ---------------------------------------------------------------------------
+
+/**
+ * Copy a URL to the clipboard from inside the opaque-origin sandboxed iframe.
+ * Prefers the async Clipboard API; falls back to a hidden-textarea +
+ * `document.execCommand('copy')` because the async API can be unavailable in an
+ * `allow-scripts`-only iframe. A real file download is a host-bridge capability
+ * (out of scope) — copying the URL is the sandbox-legal "keep" action. Returns
+ * whether the copy succeeded.
+ */
+export async function copyImageUrl(url: string): Promise<boolean> {
+  try {
+    if (typeof navigator !== 'undefined' && navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(url);
+      return true;
+    }
+  } catch {
+    /* fall through to the execCommand fallback */
+  }
+  try {
+    const ta = document.createElement('textarea');
+    ta.value = url;
+    ta.setAttribute('readonly', '');
+    ta.style.position = 'fixed';
+    ta.style.top = '0';
+    ta.style.left = '0';
+    ta.style.opacity = '0';
+    document.body.appendChild(ta);
+    ta.focus();
+    ta.select();
+    const ok = document.execCommand('copy');
+    document.body.removeChild(ta);
+    return ok;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Per-cell enlarge lightbox (I1): shows the FULL paid output UNCROPPED (the grid
+ * thumbnail force-crops to a square) + a copy-image-URL action. A real modal
+ * (focus trap / Escape / restore via useModalA11y). The image renders through
+ * the SAME `MaturityImage` gate (fail-closed blur preserved) with `crop={false}`.
+ */
+export function Lightbox({
+  c,
+  src,
+  alt,
+  nsfwLevel,
+  gate,
+  onClose,
+  onCopied,
+}: {
+  c: Palette;
+  src: string;
+  alt: string;
+  nsfwLevel: number | null | undefined;
+  gate: MaturityGate;
+  onClose: () => void;
+  onCopied: () => void;
+}) {
+  const dialogRef = useRef<HTMLDivElement>(null);
+  useModalA11y(dialogRef, true, onClose);
+  const [copied, setCopied] = useState(false);
+  const copiedTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useEffect(
+    () => () => {
+      if (copiedTimer.current) clearTimeout(copiedTimer.current);
+    },
+    [],
+  );
+  const handleCopy = useCallback(async () => {
+    const ok = await copyImageUrl(src);
+    if (!ok) return;
+    setCopied(true);
+    onCopied();
+    if (copiedTimer.current) clearTimeout(copiedTimer.current);
+    copiedTimer.current = setTimeout(() => setCopied(false), 1600);
+  }, [src, onCopied]);
+
+  return (
+    <div
+      className="gm-backdrop"
+      style={backdropStyle()}
+      onMouseDown={(e) => {
+        if (e.target === e.currentTarget) onClose();
+      }}
+      data-testid="gm-lightbox-backdrop"
+    >
+      <div
+        ref={dialogRef}
+        role="dialog"
+        aria-modal="true"
+        aria-label={`Enlarged image: ${alt}`}
+        className="gm-dialog-enter"
+        style={lightboxBox(c)}
+        data-testid="gm-lightbox"
+      >
+        <MaturityImage src={src} alt={alt} nsfwLevel={nsfwLevel} gate={gate} crop={false} />
+        <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end', flexWrap: 'wrap' }}>
+          <button
+            type="button"
+            onClick={handleCopy}
+            style={primaryBtn(c)}
+            className="gm-chip"
+            data-autofocus
+            data-testid="gm-copy-url"
+          >
+            {copied ? 'Copied!' : 'Copy image URL'}
+          </button>
+          <button
+            type="button"
+            onClick={onClose}
+            style={secondaryBtn(c)}
+            className="gm-chip"
+            data-testid="gm-lightbox-close"
+          >
+            Close
+          </button>
+        </div>
+        {/* The raw URL is shown so it can be selected/copied by hand if the
+            clipboard write is blocked by the sandbox. */}
+        <p
+          style={{ ...noteStyle(c), margin: 0, wordBreak: 'break-all' }}
+          data-testid="gm-lightbox-url"
+        >
+          {src}
+        </p>
+      </div>
+    </div>
+  );
+}
+
+/**
+ * "New matrix" confirm gate (I2): `handleReset` deletes the paid run, so require
+ * an explicit confirm first. A real modal (useModalA11y).
+ */
+export function ResetConfirmDialog({
+  c,
+  onConfirm,
+  onCancel,
+}: {
+  c: Palette;
+  onConfirm: () => void;
+  onCancel: () => void;
+}) {
+  const dialogRef = useRef<HTMLDivElement>(null);
+  useModalA11y(dialogRef, true, onCancel);
+  return (
+    <div
+      className="gm-backdrop"
+      style={backdropStyle()}
+      onMouseDown={(e) => {
+        if (e.target === e.currentTarget) onCancel();
+      }}
+      data-testid="gm-reset-backdrop"
+    >
+      <div
+        ref={dialogRef}
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="gm-reset-title"
+        aria-describedby="gm-reset-desc"
+        className="gm-dialog-enter"
+        style={confirmBox(c)}
+      >
+        <p id="gm-reset-title" style={{ margin: 0, fontSize: 15 }}>
+          Start a new matrix?
+        </p>
+        <p id="gm-reset-desc" style={noteStyle(c)}>
+          Your current results will be cleared.
+        </p>
+        <div style={{ display: 'flex', gap: 8 }}>
+          <button
+            type="button"
+            onClick={onConfirm}
+            style={primaryBtn(c)}
+            className="gm-chip"
+            data-autofocus
+            data-testid="gm-reset-confirm"
+          >
+            Start new matrix
+          </button>
+          <button
+            type="button"
+            onClick={onCancel}
+            style={secondaryBtn(c)}
+            className="gm-chip"
+            data-testid="gm-reset-cancel"
+          >
+            Cancel
+          </button>
+        </div>
+      </div>
+    </div>
   );
 }
 
@@ -1029,18 +1620,22 @@ function ConfirmPanel(props: {
 // Result grid — rows=checkpoints, cols=modifiers
 // ---------------------------------------------------------------------------
 
-function ResultGrid(props: {
+export function ResultGrid(props: {
   c: Palette;
   cells: MatrixCell[];
   checkpoints: CheckpointOption[];
   modifiers: ModifierOption[];
   phase: string;
   canRetry: boolean;
+  maturityGate: MaturityGate;
   onReset: () => void;
   onStop: () => void;
   onRetry: () => void;
+  onRecheck: (cell: MatrixCell) => void;
+  onEnlarge: (cell: MatrixCell) => void;
 }) {
-  const { c, cells, checkpoints, modifiers, phase, canRetry, onReset, onStop, onRetry } = props;
+  const { c, cells, checkpoints, modifiers, phase, canRetry, maturityGate, onReset, onStop, onRetry, onRecheck, onEnlarge } =
+    props;
   const byId = new Map(cells.map((cell) => [`${cell.row}:${cell.col}`, cell]));
   const spent = totalSpent(cells);
   const running = phase === 'running';
@@ -1057,43 +1652,68 @@ function ResultGrid(props: {
   const totalCells = checkpoints.length * modifiers.length;
 
   return (
-    <Stack gap={12}>
-      <Group justify="space-between" gap={8}>
-        <span style={{ fontSize: 14, fontWeight: 600, fontVariantNumeric: 'tabular-nums' }} role="status">
+    <div style={{ display: 'grid', gap: 12 }}>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 8 }}>
+        <span style={{ fontSize: 14, fontWeight: 600 }} role="status">
           {running ? runProgressLabel(cells) : 'Done'} · spent {formatCost(spent)} Buzz
         </span>
-        <Group gap={8}>
+        <div style={{ display: 'flex', gap: 8 }}>
           {running && (
-            <Button variant="subtle" color="error" size="sm" onClick={onStop} data-testid="gm-stop">
+            <button
+              type="button"
+              onClick={onStop}
+              style={secondaryBtn(c)}
+              className="gm-chip"
+              data-testid="gm-stop"
+            >
               Stop
-            </Button>
+            </button>
           )}
           {phase === 'done' && canRetry && (
-            <Button size="sm" onClick={onRetry} data-testid="gm-retry">
+            <button
+              type="button"
+              onClick={onRetry}
+              style={primaryBtn(c)}
+              className="gm-chip"
+              data-testid="gm-retry"
+            >
               Retry failed
-            </Button>
+            </button>
           )}
           {phase === 'done' && (
-            <Button variant="outline" size="sm" onClick={onReset} data-testid="gm-newrun">
+            <button
+              type="button"
+              onClick={onReset}
+              style={secondaryBtn(c)}
+              className="gm-chip"
+              data-testid="gm-newrun"
+            >
               New matrix
-            </Button>
+            </button>
           )}
-        </Group>
-      </Group>
+        </div>
+      </div>
 
       {running && uncancelable > 0 && (
-        <p role="status" style={mutedText} data-testid="gm-stop-warning">
+        <p role="status" style={{ ...noteStyle(c), margin: 0 }} data-testid="gm-stop-warning">
           {stopInProgressWarning()}
         </p>
       )}
 
       {canOverflow && (
-        <p className="gm-swipe-cue" style={{ ...metaText, alignItems: 'center', gap: 6 }} aria-hidden>
+        <p
+          className="gm-swipe-cue"
+          style={{ ...noteStyle(c), alignItems: 'center', gap: 6, margin: 0 }}
+          aria-hidden
+        >
           <span>← swipe to see every style →</span>
         </p>
       )}
 
-      <div className="gm-grid-scroll" style={{ ['--gm-fade-color' as string]: c.fadeColor }}>
+      <div
+        className="gm-grid-scroll"
+        style={{ ['--gm-fade-color' as string]: c.fadeColor }}
+      >
         <table style={{ borderCollapse: 'collapse', width: '100%' }}>
           <thead>
             <tr>
@@ -1122,9 +1742,11 @@ function ResultGrid(props: {
                     <td key={m.key} style={cellTd(c)}>
                       <div
                         className="gm-cell"
-                        style={{ ['--gm-stagger' as string]: `${Math.min(idx, totalCells) * 40}ms` }}
+                        style={{
+                          ['--gm-stagger' as string]: `${Math.min(idx, totalCells) * 40}ms`,
+                        }}
                       >
-                        <CellView c={c} cell={cell} />
+                        <CellView c={c} cell={cell} maturityGate={maturityGate} onRecheck={onRecheck} onEnlarge={onEnlarge} />
                       </div>
                     </td>
                   );
@@ -1135,15 +1757,37 @@ function ResultGrid(props: {
         </table>
         {canOverflow && <span className="gm-edge-fade" aria-hidden />}
       </div>
-    </Stack>
+    </div>
   );
 }
 
-function CellView({ c, cell }: { c: Palette; cell: MatrixCell | undefined }) {
+export function CellView({
+  c,
+  cell,
+  maturityGate,
+  onRecheck,
+  onEnlarge,
+}: {
+  c: Palette;
+  cell: MatrixCell | undefined;
+  maturityGate: MaturityGate;
+  onRecheck: (cell: MatrixCell) => void;
+  onEnlarge: (cell: MatrixCell) => void;
+}) {
   if (!cell) return <span style={{ color: c.muted }}>—</span>;
   switch (cell.status) {
-    case 'blocked':
-      return <CellBox c={c} label="Incompatible" sub="no charge" tone="muted" />;
+    case 'blocked': {
+      // Give the muted "Incompatible" chip a reason (I5) — WHY it's blocked and
+      // what to change — in a design-system Tooltip so the cell isn't a dead end.
+      const reason = incompatibleCellReason(cell);
+      return (
+        <Tooltip label={reason}>
+          <span tabIndex={0} data-testid="gm-incompatible-detail" style={{ display: 'block' }}>
+            <CellBox c={c} label="Incompatible" sub="no charge" tone="muted" />
+          </span>
+        </Tooltip>
+      );
+    }
     case 'canceled':
       return <CellBox c={c} label="Canceled" sub="no charge" tone="muted" />;
     case 'idle':
@@ -1173,35 +1817,64 @@ function CellView({ c, cell }: { c: Palette; cell: MatrixCell | undefined }) {
       return <CellBox c={c} label="Out of Buzz" sub="top up & retry" tone="danger" />;
     case 'timedout':
       // Polling gave up; the gen may still finish + bill — so it's a muted
-      // "still working" state, never a failure and never "no charge".
-      return <CellBox c={c} label={timedOutCellLabel()} sub="may still finish" tone="muted" />;
-    case 'failed':
-      // Friendly label; keep the raw server detail in the tooltip so it's never lost.
+      // "still working" state, never a failure and never "no charge". M2: a
+      // Re-check re-polls the SAME workflow (no re-submit → no re-charge).
       return (
-        <CellBox
-          c={c}
-          label={failedCellLabel()}
-          tone="danger"
-          title={failedCellDetail(cell.error)}
-        />
+        <CellBox c={c} label={timedOutCellLabel()} sub="may still finish" tone="muted">
+          <button
+            type="button"
+            onClick={() => onRecheck(cell)}
+            className="gm-chip"
+            data-testid="gm-recheck"
+            style={{
+              marginTop: 4,
+              padding: '3px 10px',
+              borderRadius: 999,
+              border: `1px solid ${c.accent}`,
+              background: 'transparent',
+              color: c.accent,
+              fontSize: 11,
+              fontWeight: 700,
+              cursor: 'pointer',
+            }}
+          >
+            Re-check
+          </button>
+        </CellBox>
       );
+    case 'failed': {
+      // Friendly label; keep the raw server detail in a design-system Tooltip so
+      // it's never lost — just demoted from the primary label (STEP 2).
+      const detail = failedCellDetail(cell.error);
+      const box = <CellBox c={c} label={failedCellLabel()} tone="danger" />;
+      return detail ? (
+        <Tooltip label={detail}>
+          <span tabIndex={0} data-testid="gm-failed-detail" style={{ display: 'block' }}>
+            {box}
+          </span>
+        </Tooltip>
+      ) : (
+        box
+      );
+    }
     case 'done':
       return (
         <figure style={{ margin: 0, display: 'grid', gap: 4 }}>
           {cell.imageUrl ? (
-            <CellImage
-              c={c}
+            <MaturityImage
               src={cell.imageUrl}
               alt={`${cell.checkpoint.label} · ${cell.modifier.label}`}
+              nsfwLevel={cell.nsfwLevel}
+              gate={maturityGate}
+              onEnlarge={() => onEnlarge(cell)}
+              fallback={<span style={{ fontSize: 12, color: c.muted }}>Image unavailable</span>}
             />
           ) : (
             // A `done` cell with no imageUrl: the gen succeeded + was charged but
             // the snapshot carried no image — show an explicit, non-blank state.
             <CellBox c={c} label="Image unavailable" sub="generated · charged" tone="muted" />
           )}
-          <figcaption
-            style={{ fontSize: 11, color: c.muted, textAlign: 'center', fontVariantNumeric: 'tabular-nums' }}
-          >
+          <figcaption style={{ fontSize: 11, color: c.muted, textAlign: 'center' }}>
             {formatCost(cell.cost)} Buzz
           </figcaption>
         </figure>
@@ -1209,91 +1882,12 @@ function CellView({ c, cell }: { c: Palette; cell: MatrixCell | undefined }) {
   }
 }
 
-/**
- * A cell image that fades + scales in once the bytes have DECODED (D4.1) — the
- * gm-img-loaded class (gated behind prefers-reduced-motion) is added on onLoad
- * so the animation runs on the painted image, not the empty element. A cached
- * image that's already complete on mount gets the class immediately.
- *
- * MONEY HONESTY (HIGH-1): a `done` cell is one the user was CHARGED for. The
- * `<img>` uses `opacity:0` until decoded, so without an error path a load
- * failure (expired/missing/NSFW-gated CDN edge, transient network) would leave
- * the paid cell PERMANENTLY blank — and "Retry failed" never picks it up (it's
- * `done`, not failed). `onError` therefore swaps the image for an explicit
- * "Image unavailable" box with an "Open image" link, so the cell is never blank
- * and the parent figure's "N Buzz" caption still tells the user they were
- * charged and the gen exists.
- */
-function CellImage({ c, src, alt }: { c: Palette; src: string; alt: string }) {
-  const [loaded, setLoaded] = useState(false);
-  const [errored, setErrored] = useState(false);
-  const imgRef = useRef<HTMLImageElement>(null);
-  useEffect(() => {
-    // Re-arm on a new src (e.g. cell reuse) and fast-path a cached/instantly-
-    // complete image (onLoad may not fire for an already-decoded image).
-    setErrored(false);
-    if (imgRef.current?.complete && imgRef.current.naturalWidth > 0) setLoaded(true);
-  }, [src]);
+// The result image now renders through `MaturityImage` (G1), which wraps the
+// design-system `<Image>` primitive — it owns the decode fade, the load-error
+// fallback (a paid `done` cell is never left blank), AND the maturity gate. The
+// old hand-rolled `CellImage` was replaced by it (STEP 2 primitive adoption).
 
-  if (errored) {
-    // Visibly non-blank, conveys "you were charged; image didn't load", and
-    // offers a way to re-open the underlying image directly.
-    return (
-      <div
-        role="img"
-        aria-label={`${alt} — image unavailable`}
-        style={{
-          aspectRatio: '1 / 1',
-          display: 'grid',
-          placeContent: 'center',
-          gap: 4,
-          textAlign: 'center',
-          background: c.inputBg,
-          borderRadius: radius.md,
-          padding: 6,
-        }}
-      >
-        <span style={{ fontSize: 12, fontWeight: 600, color: c.fg }}>Image unavailable</span>
-        <a
-          href={src}
-          target="_blank"
-          rel="noopener noreferrer"
-          style={{ fontSize: 10, color: c.accent }}
-          data-testid="gm-cell-open-image"
-        >
-          Open image
-        </a>
-      </div>
-    );
-  }
-
-  return (
-    <img
-      ref={imgRef}
-      src={src}
-      alt={alt}
-      onLoad={() => setLoaded(true)}
-      // A failed load must NOT leave the cell at opacity:0 forever — surface the
-      // explicit unavailable affordance instead (the user was already charged).
-      onError={() => setErrored(true)}
-      className={loaded ? 'gm-img-loaded' : undefined}
-      style={{
-        width: '100%',
-        borderRadius: radius.md,
-        display: 'block',
-        aspectRatio: '1 / 1',
-        objectFit: 'cover',
-        // Structural reveal (NOT color-muting): hide until decoded so we never
-        // flash a half-painted image, then the class fades it in. (Under
-        // reduced-motion the class sets opacity:1.)
-        opacity: loaded ? 1 : 0,
-      }}
-    />
-  );
-}
-
-/** An animated shimmer skeleton with a status label on top (D4.2). Exported for
- * the a11y test (asserts the `role="status"` + accessible-name in-flight region). */
+/** An animated shimmer skeleton with a status label on top (D4.2). */
 export function SkeletonCell({ c, label }: { c: Palette; label: string }) {
   return (
     <div
@@ -1303,7 +1897,7 @@ export function SkeletonCell({ c, label }: { c: Palette; label: string }) {
       style={{
         position: 'relative',
         aspectRatio: '1 / 1',
-        borderRadius: radius.md,
+        borderRadius: 6,
         display: 'grid',
         placeContent: 'center',
         background: c.inputBg,
@@ -1323,13 +1917,16 @@ function CellBox({
   sub,
   tone,
   title,
+  children,
 }: {
   c: Palette;
   label: string;
   sub?: string;
   tone: 'muted' | 'busy' | 'danger';
-  /** Optional tooltip — used to preserve the raw failure detail on a failed cell. */
+  /** Optional native tooltip — legacy detail hint on a cell. */
   title?: string;
+  /** Optional extra content (e.g. the timedout Re-check button). */
+  children?: React.ReactNode;
 }) {
   const color = tone === 'danger' ? c.danger : tone === 'busy' ? c.accent : c.muted;
   return (
@@ -1342,55 +1939,65 @@ function CellBox({
         gap: 2,
         textAlign: 'center',
         background: c.inputBg,
-        borderRadius: radius.md,
+        borderRadius: 6,
         padding: 6,
       }}
     >
       <span style={{ fontSize: 12, fontWeight: 600, color }}>{label}</span>
       {sub && <span style={{ fontSize: 10, color: c.muted, lineHeight: 1.3 }}>{sub}</span>}
+      {children}
     </div>
   );
 }
 
-/**
- * A selectable axis chip — the pack `<Button>` (so hover/focus/active/disabled
- * come from the design system for free) carrying `aria-pressed`. Selected →
- * `filled`; a LoRA column when unselected → `light` (the faint primary tint marks
- * it); a plain unselected chip → `outline`.
- */
 export function Chip({
+  c,
   label,
   selected,
   isLora = false,
   onToggle,
 }: {
+  c: Palette;
   label: string;
   selected: boolean;
   /** LoRA columns read differently (cost, can be server-blocked) — mark them. */
   isLora?: boolean;
   onToggle: () => void;
 }) {
-  const variant = selected ? 'filled' : isLora ? 'light' : 'outline';
   return (
-    <Button
-      size="sm"
-      variant={variant}
+    <button
+      type="button"
       onClick={onToggle}
       aria-pressed={selected}
-      leftSection={isLora ? <LoraGlyph /> : undefined}
-      data-testid="gm-chip"
+      className="gm-chip"
+      style={{
+        display: 'inline-flex',
+        alignItems: 'center',
+        gap: 6,
+        padding: isLora ? '6px 12px 6px 9px' : '6px 12px',
+        borderRadius: 999,
+        border: `1px solid ${selected ? c.accent : c.border}`,
+        // A faint accent left-tint marks LoRA chips when unselected; selected
+        // chips already read as accent so the marker rides on the glyph.
+        background: selected ? c.accent : isLora ? c.accentTint : 'transparent',
+        color: selected ? c.accentFg : c.fg,
+        fontSize: 13,
+        fontWeight: 600,
+        cursor: 'pointer',
+      }}
     >
+      {isLora && <LoraGlyph c={c} on={selected} />}
       {label}
-    </Button>
+    </button>
   );
 }
 
 /**
- * The small "this is a LoRA" marker — a layered-square resource glyph. Uses
- * `currentColor` so it inherits whatever text color its context sets (the chip
- * button's label color, or the muted note color), reading in both themes.
+ * The small "this is a LoRA" marker — a layered-square resource glyph. Inherits
+ * the accent (or accentFg on a selected chip) so it reads in both themes
+ * without a paragraph of explanation (S2.2).
  */
-function LoraGlyph() {
+function LoraGlyph({ c, on = false }: { c: Palette; on?: boolean }) {
   return (
     <svg
       width={11}
@@ -1400,8 +2007,26 @@ function LoraGlyph() {
       focusable="false"
       style={{ flex: 'none', verticalAlign: '-1px' }}
     >
-      <rect x={1} y={3} width={7} height={7} rx={1.5} fill="none" stroke="currentColor" strokeWidth={1.4} />
-      <rect x={4} y={1} width={7} height={7} rx={1.5} fill="none" stroke="currentColor" strokeWidth={1.4} />
+      <rect
+        x={1}
+        y={3}
+        width={7}
+        height={7}
+        rx={1.5}
+        fill="none"
+        stroke={on ? c.accentFg : c.accent}
+        strokeWidth={1.4}
+      />
+      <rect
+        x={4}
+        y={1}
+        width={7}
+        height={7}
+        rx={1.5}
+        fill="none"
+        stroke={on ? c.accentFg : c.accent}
+        strokeWidth={1.4}
+      />
     </svg>
   );
 }
@@ -1415,41 +2040,48 @@ function LoraGlyph() {
  * dots labeled by the two axes, so the concept reads instantly without a
  * docs-like paragraph. Decorative — labeled for AT, dots aria-hidden.
  */
-function FirstRunExample() {
+function FirstRunExample({ c }: { c: Palette }) {
   return (
-    <Card
-      withBorder
-      padding="sm"
+    <div
+      style={{
+        display: 'flex',
+        alignItems: 'center',
+        gap: 12,
+        border: `1px solid ${c.border}`,
+        borderRadius: 10,
+        background: c.cardBg,
+        padding: '10px 12px',
+      }}
       aria-label="Example: a 2 by 2 grid of two models across two styles"
     >
-      <Group gap={12} wrap={false} align="center">
-        <div
-          aria-hidden
-          style={{
-            display: 'grid',
-            gridTemplateColumns: 'repeat(2, 18px)',
-            gridAutoRows: '18px',
-            gap: 4,
-            flex: 'none',
-          }}
-        >
-          {[0, 1, 2, 3].map((i) => (
-            <span
-              key={i}
-              style={{
-                borderRadius: radius.sm,
-                background: i % 3 === 0 ? token.primary : token.primaryLight,
-                border: `1px solid ${token.primary}`,
-              }}
-            />
-          ))}
-        </div>
-        <div style={{ display: 'grid', gap: 2, minWidth: 0 }}>
-          <span style={{ fontSize: 13, fontWeight: 600 }}>2 models × 2 styles = 4 cells</span>
-          <span style={metaText}>Each cell is one real generation — compare them side by side.</span>
-        </div>
-      </Group>
-    </Card>
+      <div
+        aria-hidden
+        style={{
+          display: 'grid',
+          gridTemplateColumns: 'repeat(2, 18px)',
+          gridAutoRows: '18px',
+          gap: 4,
+          flex: 'none',
+        }}
+      >
+        {[0, 1, 2, 3].map((i) => (
+          <span
+            key={i}
+            style={{
+              borderRadius: 4,
+              background: i % 3 === 0 ? c.accent : c.accentTint,
+              border: `1px solid ${c.accent}`,
+            }}
+          />
+        ))}
+      </div>
+      <div style={{ display: 'grid', gap: 2 }}>
+        <span style={{ fontSize: 13, fontWeight: 600 }}>2 models × 2 styles = 4 cells</span>
+        <span style={{ ...noteStyle(c), margin: 0 }}>
+          Each cell is one real generation — compare them side by side.
+        </span>
+      </div>
+    </div>
   );
 }
 
@@ -1464,7 +2096,7 @@ function LoadingSkeleton({ c }: { c: Palette }) {
       className="gm-skeleton"
       style={{
         background: c.inputBg,
-        borderRadius: radius.md,
+        borderRadius: 8,
         ['--gm-skel-base' as string]: c.skelBase,
         ['--gm-skel-shine' as string]: c.skelShine,
         ...style,
@@ -1472,43 +2104,203 @@ function LoadingSkeleton({ c }: { c: Palette }) {
     />
   );
   return (
-    <div style={contentStyle} role="status" aria-label="Loading Gen Matrix" data-testid="gm-loading">
-      <Group gap={12} wrap={false} align="center">
-        {shimmer({ height: 40, width: 40, borderRadius: radius.md })}
-        {shimmer({ height: 24, width: 180 })}
-      </Group>
+    <div style={contentStyle()} role="status" aria-label="Loading Gen Matrix" data-testid="gm-loading">
+      {shimmer({ height: 28, width: 180 })}
+      {shimmer({ height: 16, width: '60%' })}
       {shimmer({ height: 72 })}
       <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
-        {shimmer({ height: 32, width: 96 })}
-        {shimmer({ height: 32, width: 96 })}
-        {shimmer({ height: 32, width: 120 })}
+        {shimmer({ height: 32, width: 96, borderRadius: 999 })}
+        {shimmer({ height: 32, width: 96, borderRadius: 999 })}
+        {shimmer({ height: 32, width: 120, borderRadius: 999 })}
       </div>
       <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
-        {shimmer({ height: 32, width: 84 })}
-        {shimmer({ height: 32, width: 84 })}
-        {shimmer({ height: 32, width: 84 })}
-        {shimmer({ height: 32, width: 110 })}
+        {shimmer({ height: 32, width: 84, borderRadius: 999 })}
+        {shimmer({ height: 32, width: 84, borderRadius: 999 })}
+        {shimmer({ height: 32, width: 84, borderRadius: 999 })}
+        {shimmer({ height: 32, width: 110, borderRadius: 999 })}
       </div>
-      {shimmer({ height: 44 })}
+      {shimmer({ height: 40 })}
       {shimmer({ height: 48 })}
     </div>
   );
 }
 
-// ---------------------------------------------------------------------------
-// Matrix-table chrome — the design system has no <table> primitive, so these
-// are token-styled off the same `--civitai-*` vars the pack reads (borders in
-// both themes; recessed header via elevate(), never surface-2/gray as a fill).
-// ---------------------------------------------------------------------------
+// The theme palette (design-system `--civitai-*` tokens) now lives in theme.ts,
+// imported at the top of the file. `palette()` is token-driven + theme-invariant
+// (light/dark resolve from the root `data-theme` the tokens switch on).
+
+function pageStyle(c: Palette): React.CSSProperties {
+  return {
+    fontFamily: 'system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif',
+    background: c.bg,
+    color: c.fg,
+    width: '100%',
+    minHeight: '100dvh',
+    display: 'flex',
+    boxSizing: 'border-box',
+  };
+}
+
+function contentStyle(): React.CSSProperties {
+  return {
+    margin: '0 auto',
+    width: '100%',
+    maxWidth: 820,
+    padding: 24,
+    display: 'grid',
+    gap: 16,
+    alignContent: 'start',
+    boxSizing: 'border-box',
+  };
+}
+
+function textareaStyle(c: Palette): React.CSSProperties {
+  return {
+    resize: 'vertical',
+    padding: 12,
+    borderRadius: 8,
+    border: `1px solid ${c.border}`,
+    background: c.inputBg,
+    color: c.fg,
+    fontSize: 15,
+    lineHeight: 1.5,
+    fontFamily: 'inherit',
+    boxSizing: 'border-box',
+    width: '100%',
+    minHeight: 72,
+  };
+}
+
+function fieldsetStyle(c: Palette): React.CSSProperties {
+  return { border: `1px solid ${c.border}`, borderRadius: 8, padding: 12, margin: 0 };
+}
+
+const legendStyle: React.CSSProperties = { fontSize: 13, fontWeight: 700, padding: '0 6px' };
+const chipRow: React.CSSProperties = { display: 'flex', flexWrap: 'wrap', gap: 8 };
+
+function summaryBox(c: Palette): React.CSSProperties {
+  return {
+    border: `1px solid ${c.border}`,
+    borderRadius: 8,
+    padding: '10px 12px',
+    fontSize: 14,
+    fontVariantNumeric: 'tabular-nums',
+  };
+}
+
+function confirmBox(c: Palette): React.CSSProperties {
+  return {
+    border: `1px solid ${c.accent}`,
+    borderRadius: 12,
+    padding: 16,
+    display: 'grid',
+    gap: 10,
+    background: c.cardBg,
+    width: '100%',
+    maxWidth: 460,
+    boxSizing: 'border-box',
+    boxShadow: '0 8px 32px rgba(0,0,0,0.28)',
+  };
+}
+
+function lightboxBox(c: Palette): React.CSSProperties {
+  return {
+    border: `1px solid ${c.border}`,
+    borderRadius: 12,
+    padding: 12,
+    display: 'grid',
+    gap: 10,
+    background: c.cardBg,
+    width: '100%',
+    maxWidth: 720,
+    boxSizing: 'border-box',
+    boxShadow: '0 8px 32px rgba(0,0,0,0.28)',
+  };
+}
+
+// The modal backdrop — dims the page and centers the dialog. A click on the
+// backdrop itself (handled in ConfirmPanel) cancels.
+function backdropStyle(): React.CSSProperties {
+  return {
+    position: 'fixed',
+    inset: 0,
+    background: 'rgba(0,0,0,0.45)',
+    display: 'grid',
+    placeItems: 'center',
+    padding: 16,
+    zIndex: 60,
+    boxSizing: 'border-box',
+  };
+}
+
+function primaryBtn(c: Palette, disabled = false): React.CSSProperties {
+  return {
+    padding: '12px 18px',
+    border: 'none',
+    borderRadius: 8,
+    background: disabled ? c.border : c.accent,
+    color: disabled ? c.muted : c.accentFg,
+    fontWeight: 700,
+    fontSize: 15,
+    cursor: disabled ? 'not-allowed' : 'pointer',
+  };
+}
+
+function secondaryBtn(c: Palette): React.CSSProperties {
+  return {
+    padding: '12px 18px',
+    border: `1px solid ${c.border}`,
+    borderRadius: 8,
+    background: 'transparent',
+    color: c.fg,
+    fontWeight: 600,
+    fontSize: 15,
+    cursor: 'pointer',
+  };
+}
+
+function noteStyle(c: Palette): React.CSSProperties {
+  return { fontSize: 13, color: c.muted, margin: 0, lineHeight: 1.5 };
+}
+
+// A dashed "add" chip for the resource-picker affordance — visually distinct
+// from a selectable Chip so it reads as an action, not a toggle.
+function pickBtn(c: Palette, busy: boolean): React.CSSProperties {
+  return {
+    padding: '6px 12px',
+    borderRadius: 999,
+    border: `1px dashed ${c.accent}`,
+    background: 'transparent',
+    color: busy ? c.muted : c.accent,
+    fontSize: 13,
+    fontWeight: 600,
+    cursor: busy ? 'wait' : 'pointer',
+  };
+}
+
+// The PRIMARY browse affordance — a filled accent chip (the fast curated path),
+// visually stronger than the dashed "All resources" fallback next to it.
+function browseBtn(c: Palette): React.CSSProperties {
+  return {
+    padding: '6px 12px',
+    borderRadius: 999,
+    border: `1px solid ${c.accent}`,
+    background: c.accent,
+    color: c.accentFg,
+    fontSize: 13,
+    fontWeight: 700,
+    cursor: 'pointer',
+  };
+}
 
 function cornerTh(c: Palette): React.CSSProperties {
-  return { border: `1px solid ${c.border}`, padding: 6, background: elevate(4), width: 90 };
+  return { border: `1px solid ${c.border}`, padding: 6, background: c.cardBg, width: 90 };
 }
 function headTh(c: Palette): React.CSSProperties {
   return {
     border: `1px solid ${c.border}`,
     padding: 8,
-    background: elevate(4),
+    background: c.cardBg,
     fontSize: 12,
     fontWeight: 700,
   };
@@ -1517,7 +2309,7 @@ function rowTh(c: Palette): React.CSSProperties {
   return {
     border: `1px solid ${c.border}`,
     padding: 8,
-    background: elevate(4),
+    background: c.cardBg,
     fontSize: 12,
     fontWeight: 700,
     textAlign: 'left',
