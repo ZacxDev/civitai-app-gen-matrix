@@ -1,11 +1,12 @@
 {
   "$schema": "https://civitai.com/schemas/app-block/v1.json",
   "blockId": "gen-matrix",
-  "version": "0.8.4",
+  "version": "0.8.5",
   "name": "Gen Matrix",
   "tagline": "Every model. Every style. Side by side.",
   "description": "Gen Matrix runs one prompt across a grid of models and styles, so you can see side by side what each one changes.\n\nWrite a shared prompt, then choose the two axes. Rows are checkpoints — a curated starting pair plus anything you add from the in-app browser or Civitai's full resource picker. Columns are styles: cinematic, anime and watercolor modifiers alongside a plain baseline, or any LoRA added as its own column with a strength slider. Every cell is a real generation of the same prompt, so the only thing that differs is the row and column that made it.\n\nEach cell spends Buzz, so the grid is capped at 12 cells and a live cell count and estimated total sit above the Generate button as you build. Confirming is its own step: a dialog names the exact cell count and the total before anything is spent, and every cell is charged only its real cost, usually a few Buzz. Cells run three at a time and fill in as they land. Run short mid-grid and you can top up and retry only the failures — a finished cell is never re-charged, and a LoRA the server rejects as incompatible costs nothing.\n\nYour run is saved as it goes, so a reload rebuilds the grid with its images and per-cell costs intact.",
   "category": "generation",
+  "repository": "https://github.com/ZacxDev/civitai-app-gen-matrix",
   "type": "block",
   "scopes": [
     "ai:write:budgeted"
