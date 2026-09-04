@@ -972,7 +972,15 @@ export function App() {
             Same prompt, every model × style — side by side.
           </p>
           {inBuild && <p style={{ ...noteStyle(c), margin: 0 }}>{perCellBudgetCopy()}</p>}
-          {inBuild && <MatrixConceptExample c={c} />}
+          {/* The concept example now covers ONLY the state where there is no
+              shape to draw. With a selection, BuildPanel renders the real grid
+              instead — so the explainer appears exactly when an explainer is
+              useful, and the screen never carries a fixed "4 cells" alongside a
+              live count that says something else. This is the live-state stand-in
+              for "first run": it needs no persisted flag, which matters because
+              the per-viewer KV that would hold one is gated to mods +
+              app-dev-testers. */}
+          {inBuild && billable === 0 && <MatrixConceptExample c={c} />}
         </header>
 
         {inBuild && (
@@ -991,6 +999,8 @@ export function App() {
             previewLabel={previewLabel}
             anon={anon}
             picking={picking}
+            chosenCheckpoints={chosenCheckpoints}
+            chosenModifiers={chosenModifiers}
             loraModifiers={selectedLoraModifiers}
             setLoraStrength={setLoraStrength}
             onPickLora={handlePickLora}
@@ -1115,6 +1125,15 @@ export function BuildPanel(props: {
   previewLabel: CostLabel;
   anon: boolean;
   picking: boolean;
+  /**
+   * The SELECTED axes, in the same order `buildMatrix` assigns row/col — passed
+   * down rather than re-derived here so the preview and the count cannot drift
+   * apart. REQUIRED on purpose: optional, a missed wiring would render no
+   * preview at all with every test still green, which is the "declared but
+   * nothing reads it" failure.
+   */
+  chosenCheckpoints: CheckpointOption[];
+  chosenModifiers: ModifierOption[];
   /** Selected LoRA columns whose strength the Slider can tune (STEP 2). */
   loraModifiers: ModifierOption[];
   setLoraStrength: (key: string, value: number) => void;
@@ -1139,6 +1158,8 @@ export function BuildPanel(props: {
     previewLabel,
     anon,
     picking,
+    chosenCheckpoints,
+    chosenModifiers,
     loraModifiers,
     setLoraStrength,
     onPickLora,
@@ -1274,6 +1295,13 @@ export function BuildPanel(props: {
           </div>
         )}
       </fieldset>
+
+      {/* The shape you are about to buy, immediately above the count and the
+          cost of buying it. Withheld at 0 cells: an empty table is not a
+          preview, and the header's concept example covers that state. */}
+      {billable > 0 && (
+        <MatrixShapePreview c={c} checkpoints={chosenCheckpoints} modifiers={chosenModifiers} />
+      )}
 
       <div
         role="status"
@@ -2075,6 +2103,99 @@ function LoraGlyph({ c, on = false }: { c: Palette; on?: boolean }) {
  * (`assertViewerIsAppDeveloper` on the apps.router storage procedures), so for an
  * ordinary viewer the flag could never be read back.
  */
+/**
+ * The grid you are ABOUT to generate, drawn before you spend — same table shape
+ * as `ResultGrid`, same axis headers, empty cells.
+ *
+ * 🔴 WHY THIS EXISTS: THE APP IS NAMED FOR A MATRIX AND NEVER SHOWED ONE. The
+ * two axes render as two stacked chip rows, which do not read as a grid, and the
+ * only grid on the configure screen was the 2x2 dot glyph inside
+ * {@link MatrixConceptExample} — an explainer standing in for the layout, which
+ * is the classic tell that the layout failed. Drawing the real shape is what
+ * lets that explainer retire to the empty state where it belongs.
+ *
+ * 🔴 IT COMPUTES NOTHING. `App` already builds `previewCells` on every render
+ * (it is what feeds the "N of 12 cells" counter, the cap gate and the estimate);
+ * this only draws the axes it is handed. So the preview and the counter cannot
+ * disagree — they are the same selection — which is the property the hardcoded
+ * concept band did NOT have.
+ *
+ * 🔴 IT DELIBERATELY DOES NOT PREDICT INCOMPATIBILITY. A LoRA x checkpoint
+ * pairing is rejected by the SERVER, pre-spend, and `CellStatus` only becomes
+ * `'blocked'` after that round trip — at preview time every cell is `'idle'`.
+ * So these boxes promise a SHAPE, never that every cell will produce an image.
+ * Claiming otherwise here would be the more dangerous kind of wrong, because it
+ * is a claim about money.
+ */
+export function MatrixShapePreview({
+  c,
+  checkpoints,
+  modifiers,
+}: {
+  c: Palette;
+  checkpoints: CheckpointOption[];
+  modifiers: ModifierOption[];
+}) {
+  // Mirrors ResultGrid: a 3rd column can overflow at ~390px, so the swipe cue
+  // and edge fade are surfaced only when overflow is actually possible.
+  const canOverflow = modifiers.length > 2;
+
+  return (
+    <div style={{ display: 'grid', gap: 6 }} data-testid="gm-shape-preview">
+      <span style={{ ...noteStyle(c), margin: 0 }}>
+        {checkpoints.length} model{checkpoints.length === 1 ? '' : 's'} ×{' '}
+        {modifiers.length} style{modifiers.length === 1 ? '' : 's'} — this is the grid you
+        will get.
+      </span>
+      <div className="gm-grid-scroll" style={{ ['--gm-fade-color' as string]: c.fadeColor }}>
+        <table style={{ borderCollapse: 'collapse', width: '100%' }}>
+          <thead>
+            <tr>
+              <th
+                style={{ ...cornerTh(c), position: 'sticky', left: 0, zIndex: 2 }}
+                className="gm-row-th"
+                aria-hidden
+              />
+              {modifiers.map((m) => (
+                <th key={m.key} scope="col" style={headTh(c)}>
+                  {m.label}
+                </th>
+              ))}
+            </tr>
+          </thead>
+          <tbody>
+            {checkpoints.map((ckpt) => (
+              <tr key={ckpt.versionId}>
+                <th scope="row" style={rowTh(c)} className="gm-row-th">
+                  {ckpt.label}
+                </th>
+                {modifiers.map((m) => (
+                  <td key={m.key} style={cellTd(c)}>
+                    {/* Empty on purpose — a placeholder box, not a promise that
+                        this pairing will render. aria-hidden because the axis
+                        headers already name every cell for AT; announcing N
+                        empty cells would be noise. */}
+                    <div
+                      aria-hidden
+                      style={{
+                        minHeight: 34,
+                        borderRadius: 6,
+                        border: `1px dashed ${c.border}`,
+                        background: c.inputBg,
+                      }}
+                    />
+                  </td>
+                ))}
+              </tr>
+            ))}
+          </tbody>
+        </table>
+        {canOverflow && <span className="gm-edge-fade" aria-hidden />}
+      </div>
+    </div>
+  );
+}
+
 export function MatrixConceptExample({ c }: { c: Palette }) {
   return (
     <div

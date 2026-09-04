@@ -39,6 +39,11 @@ function buildProps(over: Record<string, unknown> = {}) {
     modifiers: [baseline, cine, lora],
     selectedCkpts: new Set([1]),
     selectedMods: new Set(['baseline']),
+    // The selected axes, in buildMatrix's row/col order. REQUIRED on BuildPanel
+    // deliberately: optional, a missed wiring would render no shape preview at
+    // all and every one of these tests would still pass.
+    chosenCheckpoints: [ckpts[0]],
+    chosenModifiers: [baseline],
     toggleCkpt: vi.fn(),
     toggleMod: vi.fn(),
     billable: 1,

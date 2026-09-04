@@ -166,3 +166,38 @@ describe('App money-path integration (mock host)', () => {
     expect(screen.queryByTestId('gm-newrun')).toBeNull();
   });
 });
+
+/**
+ * 🔴 THE SEAM NEITHER UNIT TEST CROSSES. `MatrixShapePreview` is tested against
+ * BuildPanel's props and `MatrixConceptExample` is tested standalone, but which
+ * of the two the SCREEN shows is decided in `App` — `billable === 0` picks the
+ * explainer, `billable > 0` picks the real grid. Both components can be
+ * individually correct while App shows neither, or both at once, and no test
+ * scoped to one component can see that.
+ *
+ * The relationship is what matters here, so these assert it as a pair: exactly
+ * one is present, in both directions, driven through the real default state and
+ * a real click rather than by handing a component a prop.
+ */
+describe('the configure screen shows the grid OR the explainer, never both', () => {
+  it('shows the live shape (and no explainer) at the default selection', async () => {
+    renderApp({ viewer, consentGranted: true, buzzBudget: 200 });
+
+    // Default is 1 checkpoint x 2 styles = 2 cells, so there IS a shape.
+    expect(await screen.findByTestId('gm-shape-preview')).toBeInTheDocument();
+    expect(screen.queryByText(/Example: 2 models/)).toBeNull();
+  });
+
+  it('falls back to the explainer (and drops the shape) at zero cells', async () => {
+    renderApp({ viewer, consentGranted: true, buzzBudget: 200 });
+    await screen.findByTestId('gm-shape-preview');
+
+    // Deselect the only selected model -> 0 rows -> 0 cells. This is the state a
+    // real user reaches by toggling their last checkpoint off, which is why the
+    // explainer is not dead code even though the app boots with a selection.
+    await userEvent.click(screen.getByRole('button', { name: /SD XL/i }));
+
+    await waitFor(() => expect(screen.queryByTestId('gm-shape-preview')).toBeNull());
+    expect(screen.getByText(/Example: 2 models/)).toBeInTheDocument();
+  });
+});

@@ -45,6 +45,16 @@
       "what": "phases 4 (identity) and 5 (moderation) are n-a, and this was MEASURED rather than assumed",
       "chose": "record the reason, do not invent a surface to grade",
       "because": "gen-matrix declares exactly one scope, `ai:write:budgeted`, and uses NO shared storage -- `useSharedStorage` appears nowhere in src/. There is no cross-user content, so there is nobody to attribute and nothing to report. A shared-storage board was considered and deliberately deferred (see deferred[])."
+    },
+    {
+      "what": "the app named for a matrix now DRAWS one before you spend",
+      "chose": "render the live selection as the real grid shape (MatrixShapePreview), and demote the hardcoded concept example to the zero-cell state",
+      "because": "looked at the running app rather than reasoning about it: the two axes render as two stacked chip rows, which do not read as a grid, and the ONLY grid on the configure screen was the 2x2 dot glyph inside the explainer. An explainer standing in for the layout is the textbook tell that the layout failed. The preview computes nothing new -- App already builds `previewCells` every render to feed the counter, the cap gate and the estimate -- so the preview and the count are the same selection and CANNOT disagree, which is exactly the property the hardcoded band lacked. Verified by headless screenshot of the dev harness (no operator screen touched): at the default 1 model x 2 styles the caption, the table, `2 of 12 cells` and `Generate Matrix - 2 cells` all agree."
+    },
+    {
+      "what": "the preview promises a SHAPE, never that every cell will render",
+      "chose": "draw empty placeholder boxes and say nothing about compatibility",
+      "because": "a LoRA x checkpoint pairing is rejected by the SERVER pre-spend, and CellStatus only becomes 'blocked' after that round trip -- at preview time every cell is 'idle'. Predicting compatibility here would be a claim about MONEY made from data the client does not have, which is the more dangerous kind of wrong."
     }
   ],
   "deferred": [
@@ -67,9 +77,9 @@
       "noHardcodedThemeColour": "pass -- measured 0 hex literals in src/theme.ts. The four literals in index.html's boot <style> are the deliberate exception (a var is unusable before the stylesheet loads) and are asserted against the INSTALLED @civitai/theme by src/bootTokens.test.ts"
     },
     "informationArchitecture": {
-      "primaryObjectFirst": "partial -- the prompt field is below a title, a tagline, a money note and the concept band. The band was fixed rather than removed this pass (see decisions); whether the header earns four blocks before the first input is the open question for a later pass",
+      "primaryObjectFirst": "FIXED this pass -- the app's primary object (the grid) is now ON the configure screen, drawn from the live selection, immediately above the count and cost of generating it. The header was measured (headless screenshot) and is compact and proportionate; the earlier `partial` grading was about block COUNT, which looking at the render did not support",
       "creationSecondary": "n-a -- this app has no board to add to; its single action IS the primary",
-      "noRedundantExplainer": "FIXED this pass -- the concept band's fixed numbers no longer read as a live readout contradicting the counter beside them",
+      "noRedundantExplainer": "FIXED this pass -- the concept band's fixed numbers no longer sit beside a live count that says something else, and the band now renders ONLY at zero cells, where an explainer is the right thing to show. The live-state gate is the stand-in for `first run`, which needs no persisted flag -- important because the per-viewer KV that would hold one is gated to mods + app-dev-testers",
       "partialRankingDisclosed": "n-a -- no ranking, no list, no server-side sort in play"
     },
     "interaction": {
@@ -85,13 +95,13 @@
       "costHonesty": "pass, pre-existing -- incompatible LoRA x checkpoint pairings are disclosed as `incompatible` and `cost nothing`; the per-cell figure is named as `the safety cap, not what you'll spend`; Confirm is gated on a returned estimate"
     },
     "coverage": {
-      "unitComponentIntegration": "pass -- 368 tests / 16 files after this pass (was 364 / 15)",
+      "unitComponentIntegration": "pass -- 377 tests / 17 files after this pass (was 364 / 15 at phase 0). MEASURED from the run, not projected: an earlier draft of this line said `384 / 18`, which was a guess written before the final suite ran and was wrong in both figures.",
       "failureInjection": "pass, pre-existing -- queue-driver and catalog-api both inject failures",
-      "regressionWatchedRed": "pass -- BOTH new guards mutated separately and each killed exactly ONE test for its own reason: removing the visible `Example:` marker reddens only `says \"Example\" in the VISIBLE text` (1 failed / 3 passed); restoring the old aria-label reddens only `does not carry an accessible name that disagrees` (1 failed / 3 passed). An earlier draft of the idempotence test also died to the first mutation and was rewritten so it cannot",
+      "regressionWatchedRed": "pass -- EIGHT mutants, each killing exactly ONE test for its own reason (1 failed / N passed every time). Marker removed -> only the visible-Example test; old aria-label restored -> only the accessible-name test; rows iterated from the wrong axis, and cells from the wrong axis -> only the grid-shape test; render gate widened to >=0 -> only the zero-cell test; preview moved below the count -> only the ordering test (and the mutant was verified to have actually MOVED the element before its red was trusted); pluralisation forced -> only the singular test; aria-hidden dropped -> only the a11y test. The App-level SEAM was mutated in BOTH directions: always-explainer and never-explainer each redden exactly one of the paired integration tests",
       "recipeUpdated": "n-a this PR -- no testid was renamed, added or removed, and the ready anchor (gm-generate) is unmoved. The capture recipe needs no edit"
     },
     "evidence": {
-      "beforeAfterDiff": "PARTIAL -- the phase-0 baseline is captured (/tmp/taste-before-gm, 0 a11y violations, 0 console, 0 failed of 3 observed, 65 elements, 6 testids). The after-run cannot be taken until 0.8.7 is live, and this app's capture exits 6 REFUSE[too_few_states] by design -- it has exactly one state that does not spend Buzz, so it is an --evidence target, never a --render one"
+      "beforeAfterDiff": "PARTIAL, and better than at phase 0 -- the before capture is /tmp/taste-before-gm (0 a11y violations, 0 console, 0 failed of 3, 65 elements, 6 testids) and the AFTER state was verified by a headless chromium screenshot of the dev harness, which is not the same thing as the live app but did settle that the grid renders and every number agrees. The live re-shoot still cannot run until 0.8.7 is approved, and this app's capture exits 6 REFUSE[too_few_states] by design"
     }
   }
 }
