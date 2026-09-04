@@ -54,6 +54,8 @@ import {
   matrixReducer,
   nextCellsToStart,
   POLL_MAX_ATTEMPTS,
+  runElapsedLabel,
+  sharedPromptFromCells,
   timedOutCellLabel,
   runProgressLabel,
   isUncancelableInFlight,
@@ -72,14 +74,23 @@ import { palette, type Palette } from './theme.js';
 import { paintTheme } from './bootTheme.js';
 import { MaturityImage } from './MaturityImage.js';
 import {
-  RUN_STORAGE_KEY,
   buildRunManifest,
   isPersistableRun,
   reconcileCells,
   restoreStateFromManifest,
+  runTimingFromManifest,
   type AppWorkflowLike,
   type MaturityGate,
 } from './persistence.js';
+import {
+  ACTIVE_RUN_POINTER_KEY,
+  HISTORY_LIST_CAP,
+  historyAgeLabel,
+  historyKeyFor,
+  loadHistory,
+  migrateLegacyRun,
+  type HistoryLoad,
+} from './history.js';
 
 /**
  * Stable empty-array identity for ResourceBrowser's `checkpointBaseModels` prop
@@ -280,9 +291,36 @@ export function App() {
     src: string;
     alt: string;
     nsfwLevel: number | null | undefined;
+    /** The cell's EFFECTIVE prompt (shared + this style's suffix). */
+    prompt: string;
   } | null>(null);
   // "New matrix" confirm gate — deleting a paid run must be intentional.
   const [confirmReset, setConfirmReset] = useState(false);
+
+  // ---- Release A — run history + elapsed time ----
+  // The history index. `null` means "not read yet" and renders NOTHING: before
+  // the read resolves we know neither that the viewer has matrices nor that they
+  // have none, and a component that guesses at that moment will flash the wrong
+  // one of those two claims on every mount.
+  const [history, setHistory] = useState<HistoryLoad | null>(null);
+  // Bumped to force a re-read (after a run completes / is cleared).
+  const [historyNonce, setHistoryNonce] = useState(0);
+  // True while showing a matrix reopened FROM history: it is already paid for
+  // and already finished, so the run controls that could spend Buzz are withheld.
+  const [viewingHistory, setViewingHistory] = useState(false);
+  // The storage key the live/open run is written to — one key per run, which is
+  // what turns the old single slot into a list. Null before a run has started.
+  const currentRunKeyRef = useRef<string | null>(null);
+  // Wall-clock stamps for change 5. Kept OUT of `matrixReducer` deliberately:
+  // that reducer is pure and takes no clock, and threading a timestamp through
+  // every action to stamp two of them would make every other transition harder
+  // to reason about for no gain.
+  const [runStartedAt, setRunStartedAt] = useState<number | null>(null);
+  const [runFinishedAt, setRunFinishedAt] = useState<number | null>(null);
+  // Only a run STARTED in this session may stamp its own finish — see the effect.
+  const startedThisSessionRef = useRef(false);
+  // Ticks once a second while running so the elapsed label advances.
+  const [nowTick, setNowTick] = useState(() => Date.now());
 
   // Auto-resume intent across the consent round-trip.
   const consentPendingRef = useRef(false);
@@ -742,27 +780,95 @@ export function App() {
     if (restoredRef.current || !ready || !viewer) return;
     restoredRef.current = true;
     let cancelled = false;
-    storage
-      .get<unknown>(RUN_STORAGE_KEY)
-      .then((raw) => {
-        if (cancelled) return;
-        const restored = restoreStateFromManifest(raw);
-        if (!restored) return;
-        // Mark every already-submitted cell so the M4 guard won't re-submit it.
-        for (const cell of restored.cells) {
-          if (cell.workflowId != null) submittedRef.current.add(cell.id);
+    void (async () => {
+      // 1) Rescue the legacy single-slot run into the history keyspace. A viewer
+      //    mid-generation when this ships has their matrix in the OLD key; if we
+      //    only ever looked at the new one they would boot into an empty build
+      //    screen while a run they are paying for sat unreachable.
+      const migrated = await migrateLegacyRun(storage);
+      let activeKey: string | null = migrated.key;
+      let raw: unknown = migrated.manifest;
+
+      // 2) Otherwise follow the active-run pointer. The pointer is what makes
+      //    "New matrix" able to clear the screen WITHOUT deleting the paid run:
+      //    the row stays in history, only the pointer goes.
+      if (raw == null) {
+        try {
+          const pointer = await storage.get<{ key?: unknown }>(ACTIVE_RUN_POINTER_KEY);
+          const key = typeof pointer?.key === 'string' ? pointer.key : null;
+          if (key) {
+            activeKey = key;
+            raw = await storage.get<unknown>(key);
+          }
+        } catch {
+          /* best-effort — an unreadable pointer just starts on the build screen */
         }
-        dispatch({ type: 'RESTORE', state: restored });
-        resumePolling(restored.cells);
-        refetchWorkflows();
-      })
-      .catch(() => {
-        /* best-effort — a missing/malformed manifest just starts fresh */
-      });
+      }
+      if (cancelled || raw == null) return;
+
+      const restored = restoreStateFromManifest(raw);
+      if (!restored) return;
+      currentRunKeyRef.current = activeKey;
+      // The stamps come from the MANIFEST, never from the restore itself — see
+      // `runElapsedLabel`. An older manifest carries neither, and that run's
+      // elapsed time is then correctly shown as nothing.
+      const timing = runTimingFromManifest(raw);
+      setRunStartedAt(timing.startedAt ?? null);
+      setRunFinishedAt(timing.finishedAt ?? null);
+      // Mark every already-submitted cell so the M4 guard won't re-submit it.
+      for (const cell of restored.cells) {
+        if (cell.workflowId != null) submittedRef.current.add(cell.id);
+      }
+      dispatch({ type: 'RESTORE', state: restored });
+      resumePolling(restored.cells);
+      refetchWorkflows();
+    })().catch(() => {
+      /* best-effort — a missing/malformed manifest just starts fresh */
+    });
     return () => {
       cancelled = true;
     };
   }, [ready, viewer, storage, resumePolling, refetchWorkflows]);
+
+  // ---- Release A — read the history index ----
+  // Runs for anon too: `list` resolves EMPTY for an anonymous viewer rather than
+  // rejecting, so they get the ordinary empty state instead of an error.
+  useEffect(() => {
+    if (!ready) return;
+    let cancelled = false;
+    setHistory(null);
+    loadHistory(storage)
+      .then((h) => {
+        if (!cancelled) setHistory(h);
+      })
+      .catch(() => {
+        // `loadHistory` already maps a rejection to `{kind:'error'}`; this is the
+        // belt for anything thrown before it. Never a silent empty list.
+        if (!cancelled) setHistory({ kind: 'error' });
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [ready, storage, historyNonce]);
+
+  // ---- Release A — stamp the run's finish, once, in the session that ran it ----
+  // 🔴 GATED ON `startedThisSessionRef`. Stamping any run that merely LOOKS done
+  // would give a matrix restored from storage a finish time of "now", so a run
+  // from last week would report a week-long duration. Only the session that
+  // watched the run end knows when it ended.
+  useEffect(() => {
+    if (state.phase !== 'done') return;
+    if (!startedThisSessionRef.current) return;
+    setRunFinishedAt((prev) => prev ?? Date.now());
+  }, [state.phase]);
+
+  // Advance the elapsed clock while a run is in progress.
+  useEffect(() => {
+    if (state.phase !== 'running') return;
+    setNowTick(Date.now());
+    const handle = setInterval(() => setNowTick(Date.now()), 1000);
+    return () => clearInterval(handle);
+  }, [state.phase]);
 
   // ---- M1/M2 — reconcile against the authoritative read-model ----
   // Whenever useAppWorkflows changes, merge status/image/nsfwLevel/cost onto the
@@ -793,16 +899,26 @@ export function App() {
   useEffect(() => {
     if (!viewer) return;
     if (!isPersistableRun(state)) return;
+    const key = currentRunKeyRef.current;
+    if (key == null) return;
     let cancelled = false;
     const handle = setTimeout(() => {
       if (cancelled) return;
-      storage.set(RUN_STORAGE_KEY, buildRunManifest(state)).catch(() => undefined);
+      const manifest = buildRunManifest(state, Date.now, {
+        startedAt: runStartedAt,
+        finishedAt: runFinishedAt,
+      });
+      // 🔴 STILL BEST-EFFORT, DELIBERATELY. A failed save must never interrupt a
+      // run the viewer is paying for. What changed is only that a failed READ is
+      // no longer allowed to masquerade as an empty history — see `HistoryLoad`.
+      storage.set(key, manifest).catch(() => undefined);
+      storage.set(ACTIVE_RUN_POINTER_KEY, { key }).catch(() => undefined);
     }, 250);
     return () => {
       cancelled = true;
       clearTimeout(handle);
     };
-  }, [state, viewer, storage]);
+  }, [state, viewer, storage, runStartedAt, runFinishedAt]);
 
   // ---- G1 — pull maturity for freshly-completed cells ----
   // The LIVE poll snapshot carries NO nsfwLevel, so a just-finished result is
@@ -843,6 +959,20 @@ export function App() {
     dispatch({ type: 'REQUEST_CONFIRM' });
   }, [viewer, over, billable, prompt, chosenCheckpoints, chosenModifiers, repCellEstimate, requestSignIn]);
 
+  // Begin a run: mint the storage key it will live under and stamp its start.
+  // Both happen HERE rather than at BUILD because a build that is never
+  // confirmed spends nothing and is not a matrix anyone should find in history.
+  const beginRun = useCallback(() => {
+    const at = Date.now();
+    currentRunKeyRef.current = historyKeyFor(at);
+    setRunStartedAt(at);
+    setRunFinishedAt(null);
+    setNowTick(at);
+    startedThisSessionRef.current = true;
+    setViewingHistory(false);
+    dispatch({ type: 'START_RUN' });
+  }, []);
+
   const startRun = useCallback(() => {
     if (!granted) {
       consentPendingRef.current = true;
@@ -850,16 +980,16 @@ export function App() {
       requestConsent({ scopes: ['ai:write:budgeted'] });
       return;
     }
-    dispatch({ type: 'START_RUN' });
-  }, [granted, requestConsent]);
+    beginRun();
+  }, [granted, requestConsent, beginRun]);
 
   // Auto-resume the run once consent lands.
   useEffect(() => {
     if (granted && consentPendingRef.current) {
       consentPendingRef.current = false;
-      dispatch({ type: 'START_RUN' });
+      beginRun();
     }
-  }, [granted]);
+  }, [granted, beginRun]);
 
   const handleConfirm = useCallback(() => startRun(), [startRun]);
 
@@ -872,10 +1002,46 @@ export function App() {
     pollTokensRef.current.clear();
     submittedRef.current.clear();
     reconciledSigRef.current = '';
-    // Drop the persisted run — a fresh "New matrix" shouldn't rebuild the old one.
-    storage.delete(RUN_STORAGE_KEY).catch(() => undefined);
+    // 🔴 CLEAR THE POINTER, NEVER THE RUN. This used to `delete` the run itself,
+    // which is why there was no history: "New matrix" destroyed the matrix you
+    // had just paid for. Dropping only the pointer means the next mount starts
+    // on the build screen, and the run stays listed and reopenable.
+    storage.delete(ACTIVE_RUN_POINTER_KEY).catch(() => undefined);
+    currentRunKeyRef.current = null;
+    startedThisSessionRef.current = false;
+    setRunStartedAt(null);
+    setRunFinishedAt(null);
+    setViewingHistory(false);
+    // The run being cleared away should appear in the list it is being cleared to.
+    setHistoryNonce((n) => n + 1);
     dispatch({ type: 'RESET' });
   }, [storage]);
+
+  // Reopen a matrix from history, read-only. Never re-submits and never
+  // re-charges: it only rebuilds a state that was already paid for.
+  const handleOpenHistory = useCallback(
+    async (key: string) => {
+      try {
+        const raw = await storage.get<unknown>(key);
+        const restored = restoreStateFromManifest(raw);
+        if (!restored) return;
+        const timing = runTimingFromManifest(raw);
+        currentRunKeyRef.current = key;
+        startedThisSessionRef.current = false;
+        setRunStartedAt(timing.startedAt ?? null);
+        setRunFinishedAt(timing.finishedAt ?? null);
+        setViewingHistory(true);
+        for (const cell of restored.cells) {
+          if (cell.workflowId != null) submittedRef.current.add(cell.id);
+        }
+        dispatch({ type: 'RESTORE', state: restored });
+        storage.set(ACTIVE_RUN_POINTER_KEY, { key }).catch(() => undefined);
+      } catch {
+        /* best-effort — a failed reopen leaves the build screen as it was */
+      }
+    },
+    [storage],
+  );
 
   // Stop the run: mark not-yet-started cells `canceled` (no spend) and fire the
   // orchestrator cancel() for every in-flight cell that has a workflowId. The
@@ -958,6 +1124,17 @@ export function App() {
   // surfaced as "up to N" with the ceiling demoted to a "safety max" hint.
   const confirmLabel = matrixTotalLabel(state.cells, buildKindEstimates);
   const anyInsufficient = state.cells.some((cell) => cell.status === 'insufficient');
+  // Change 3 — the SHARED prompt, recovered from the run's OWN cells.
+  // 🔴 Never `prompt` (the live textarea). A restored run's form has reset to
+  // empty, so reading current form state would caption someone's paid matrix
+  // with a prompt they did not run — usually a blank one.
+  const runSharedPrompt = sharedPromptFromCells(state.cells);
+  // Change 5 — elapsed, from the run's own stamps.
+  const runElapsed = runElapsedLabel(
+    { startedAt: runStartedAt, finishedAt: runFinishedAt },
+    state.phase === 'running',
+    nowTick,
+  );
   // Retry is offered once the run is done and at least one cell is retryable.
   const canRetry =
     state.phase === 'done' &&
@@ -1011,6 +1188,10 @@ export function App() {
           />
         )}
 
+        {inBuild && (
+          <HistoryPanel c={c} load={history} now={nowTick} onOpen={handleOpenHistory} />
+        )}
+
         {inBuild && browse && cacheRef.current && (
           <ResourceBrowser
             c={c}
@@ -1051,6 +1232,9 @@ export function App() {
             phase={state.phase}
             canRetry={canRetry}
             maturityGate={maturityGate}
+            sharedPrompt={runSharedPrompt}
+            elapsed={runElapsed}
+            readOnly={viewingHistory}
             onReset={() => setConfirmReset(true)}
             onStop={handleStop}
             onRetry={handleRetryFailed}
@@ -1061,6 +1245,10 @@ export function App() {
                 src: cell.imageUrl,
                 alt: `${cell.checkpoint.label} · ${cell.modifier.label}`,
                 nsfwLevel: cell.nsfwLevel,
+                // The EFFECTIVE prompt — shared + this column's style suffix.
+                // Taken off the cell, so it is the string that actually produced
+                // this image rather than a recomposition from current state.
+                prompt: cell.prompt,
               })
             }
           />
@@ -1083,6 +1271,7 @@ export function App() {
             src={lightbox.src}
             alt={lightbox.alt}
             nsfwLevel={lightbox.nsfwLevel}
+            prompt={lightbox.prompt}
             gate={maturityGate}
             onClose={() => setLightbox(null)}
             onCopied={() =>
@@ -1503,6 +1692,7 @@ export function Lightbox({
   src,
   alt,
   nsfwLevel,
+  prompt,
   gate,
   onClose,
   onCopied,
@@ -1511,6 +1701,17 @@ export function Lightbox({
   src: string;
   alt: string;
   nsfwLevel: number | null | undefined;
+  /**
+   * The EFFECTIVE prompt for this one cell — the shared prompt plus the column's
+   * style suffix, i.e. the exact string that produced the image on screen.
+   *
+   * 🔴 THIS IS PER-CELL AND THE HEADER'S IS NOT. Showing the shared prompt here
+   * would be wrong in the way that matters most: the enlarged view is where
+   * someone decides which model/style combination they want, so it has to say
+   * what THIS cell actually asked for, suffix included. Optional so the existing
+   * call sites and tests that predate it still compile.
+   */
+  prompt?: string;
   gate: MaturityGate;
   onClose: () => void;
   onCopied: () => void;
@@ -1553,6 +1754,15 @@ export function Lightbox({
         data-testid="gm-lightbox"
       >
         <MaturityImage src={src} alt={alt} nsfwLevel={nsfwLevel} gate={gate} crop={false} />
+        {prompt != null && prompt.trim().length > 0 && (
+          <p
+            style={{ ...noteStyle(c), margin: 0, display: 'block' }}
+            data-testid="gm-lightbox-prompt"
+          >
+            <span style={{ fontWeight: 700, color: c.fg }}>Prompt: </span>
+            {prompt}
+          </p>
+        )}
         <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end', flexWrap: 'wrap' }}>
           <button
             type="button"
@@ -1653,6 +1863,90 @@ export function ResetConfirmDialog({
 }
 
 // ---------------------------------------------------------------------------
+// History — the list of matrices this viewer has already generated
+// ---------------------------------------------------------------------------
+
+/**
+ * The viewer's past matrices, on the configure screen.
+ *
+ * 🔴 FOUR STATES, AND THREE OF THEM MUST NOT LOOK ALIKE:
+ *
+ *  - `null` (not read yet) renders NOTHING. Before the read resolves we know
+ *    neither that they have matrices nor that they have none, so any output
+ *    here is a guess that flashes and then contradicts itself.
+ *  - `error` says the READ failed. It is not "you have no matrices" — that is a
+ *    claim about their data, and making it when we simply could not look tells
+ *    someone their paid work is gone while it sits safe in storage.
+ *  - `ok` + zero entries is the honest empty state, and it is also what an
+ *    ANONYMOUS viewer gets: `list` resolves empty for them rather than
+ *    rejecting, so signed-out is an ordinary empty list, never an error.
+ *  - `ok` + entries is the list.
+ */
+export function HistoryPanel({
+  c,
+  load,
+  now,
+  onOpen,
+}: {
+  c: Palette;
+  load: HistoryLoad | null;
+  now: number;
+  onOpen: (key: string) => void;
+}) {
+  if (load == null) return null;
+
+  if (load.kind === 'error') {
+    return (
+      <p style={{ ...noteStyle(c), margin: 0 }} role="status" data-testid="gm-history-error">
+        We couldn&rsquo;t load your past matrices just now. They&rsquo;re still saved — reload to
+        try again.
+      </p>
+    );
+  }
+
+  if (load.entries.length === 0) {
+    return (
+      <p style={{ ...noteStyle(c), margin: 0 }} data-testid="gm-history-empty">
+        No past matrices yet. Generate one and it will show up here.
+      </p>
+    );
+  }
+
+  return (
+    <section style={{ display: 'grid', gap: 6 }} data-testid="gm-history">
+      <h2 style={{ fontSize: 14, margin: 0, fontWeight: 700 }}>Your past matrices</h2>
+      <ul
+        style={{ listStyle: 'none', margin: 0, padding: 0, display: 'grid', gap: 4 }}
+        data-testid="gm-history-list"
+      >
+        {load.entries.map((entry) => (
+          <li key={entry.key} data-testid="gm-history-item">
+            <button
+              type="button"
+              onClick={() => onOpen(entry.key)}
+              style={secondaryBtn(c)}
+              className="gm-chip"
+              data-testid="gm-history-open"
+            >
+              Open matrix from {historyAgeLabel(entry.updatedAt, now)}
+            </button>
+          </li>
+        ))}
+      </ul>
+      {/* 🔴 RENDERED ONLY WHEN THE CAP ACTUALLY BINDS. `loadHistory` fetches one
+          row beyond the cap purely so this can be true or false honestly; a
+          notice that shows unconditionally would tell a viewer with three
+          matrices that some are being withheld. */}
+      {load.truncated && (
+        <p style={{ ...noteStyle(c), margin: 0 }} data-testid="gm-history-truncated">
+          Showing your {HISTORY_LIST_CAP} most recent matrices.
+        </p>
+      )}
+    </section>
+  );
+}
+
+// ---------------------------------------------------------------------------
 // Result grid — rows=checkpoints, cols=modifiers
 // ---------------------------------------------------------------------------
 
@@ -1664,13 +1958,23 @@ export function ResultGrid(props: {
   phase: string;
   canRetry: boolean;
   maturityGate: MaturityGate;
+  /**
+   * The run's SHARED prompt (change 3), or null when it cannot be recovered.
+   * Null renders no prompt line at all — never an empty one, which would read as
+   * "you ran a blank prompt".
+   */
+  sharedPrompt?: string | null;
+  /** Elapsed time (change 5), or null when unknown. Null renders nothing. */
+  elapsed?: string | null;
+  /** True for a matrix reopened from history: already paid, already finished. */
+  readOnly?: boolean;
   onReset: () => void;
   onStop: () => void;
   onRetry: () => void;
   onRecheck: (cell: MatrixCell) => void;
   onEnlarge: (cell: MatrixCell) => void;
 }) {
-  const { c, cells, checkpoints, modifiers, phase, canRetry, maturityGate, onReset, onStop, onRetry, onRecheck, onEnlarge } =
+  const { c, cells, checkpoints, modifiers, phase, canRetry, maturityGate, sharedPrompt, elapsed, readOnly, onReset, onStop, onRetry, onRecheck, onEnlarge } =
     props;
   const byId = new Map(cells.map((cell) => [`${cell.row}:${cell.col}`, cell]));
   const spent = totalSpent(cells);
@@ -1690,9 +1994,20 @@ export function ResultGrid(props: {
   return (
     <div style={{ display: 'grid', gap: 12 }}>
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 8 }}>
-        <span style={{ fontSize: 14, fontWeight: 600 }} role="status">
-          {running ? runProgressLabel(cells) : 'Done'} · spent {formatCost(spent)} Buzz
-        </span>
+        <div style={{ display: 'flex', alignItems: 'baseline', gap: 6, flexWrap: 'wrap' }}>
+          <span style={{ fontSize: 14, fontWeight: 600 }} role="status">
+            {running ? runProgressLabel(cells) : 'Done'} · spent {formatCost(spent)} Buzz
+          </span>
+          {/* 🔴 OUTSIDE the role="status" region on purpose. The elapsed label
+              re-renders every second while a run is in progress; inside a live
+              region that is a screen reader announcing the clock once a second,
+              drowning out the progress it is meant to accompany. */}
+          {elapsed != null && (
+            <span style={{ fontSize: 13, color: c.muted }} data-testid="gm-elapsed">
+              · {elapsed}
+            </span>
+          )}
+        </div>
         <div style={{ display: 'flex', gap: 8 }}>
           {running && (
             <button
@@ -1705,7 +2020,7 @@ export function ResultGrid(props: {
               Stop
             </button>
           )}
-          {phase === 'done' && canRetry && (
+          {phase === 'done' && canRetry && !readOnly && (
             <button
               type="button"
               onClick={onRetry}
@@ -1729,6 +2044,16 @@ export function ResultGrid(props: {
           )}
         </div>
       </div>
+
+      {/* Change 3 — the shared prompt this whole grid was generated from. Comes
+          from the run's own cells, so a matrix reopened after a reload shows the
+          prompt that produced it rather than whatever is in the form now. */}
+      {sharedPrompt != null && sharedPrompt.trim().length > 0 && (
+        <p style={{ ...noteStyle(c), margin: 0 }} data-testid="gm-run-prompt">
+          <span style={{ fontWeight: 700, color: c.fg }}>Prompt: </span>
+          {sharedPrompt}
+        </p>
+      )}
 
       {running && uncancelable > 0 && (
         <p role="status" style={{ ...noteStyle(c), margin: 0 }} data-testid="gm-stop-warning">
@@ -1797,6 +2122,71 @@ export function ResultGrid(props: {
   );
 }
 
+/**
+ * The height reserved for a cell's caption row, in px, in EVERY status.
+ *
+ * Exported so a test can assert the reservation rather than re-typing the
+ * number — a duplicated literal would let the shell and its guard drift apart.
+ */
+export const CELL_CAPTION_HEIGHT = 16;
+
+/**
+ * The one shell every cell renders through, whatever its status.
+ *
+ * 🔴 THIS IS THE LAYOUT-SHIFT FIX. Before it, an in-flight cell was a bare
+ * square (`SkeletonCell`, `aspectRatio: 1/1`) and a finished one was that square
+ * PLUS a `<figcaption>` carrying the Buzz cost. The caption's height was
+ * reserved nowhere, so every cell that completed grew taller than its
+ * neighbours and shoved its whole row down — during a run, which is exactly when
+ * the viewer is watching the grid and trying to compare cells. With nine cells
+ * landing at different times that is nine separate jumps.
+ *
+ * The fix is to reserve the caption's row in every status rather than to delete
+ * the caption: the per-cell cost is the app's core money disclosure and removing
+ * it would trade a layout bug for a transparency one. A fixed second row means
+ * the shell's height is a function of the cell's WIDTH alone (the media row is a
+ * square), so it is identical across statuses by construction.
+ */
+function CellShell({
+  c,
+  caption,
+  children,
+}: {
+  c: Palette;
+  /** The caption's content, or null/undefined for a status that has none. */
+  caption?: React.ReactNode;
+  children: React.ReactNode;
+}) {
+  return (
+    <figure
+      data-testid="gm-cell-shell"
+      style={{
+        margin: 0,
+        display: 'grid',
+        gridTemplateRows: `1fr ${CELL_CAPTION_HEIGHT}px`,
+        gap: 4,
+      }}
+    >
+      <div style={{ minWidth: 0 }}>{children}</div>
+      {/* Present and EMPTY until the cell is done — the slot is the reservation.
+          Rendering it conditionally would put the shift straight back. */}
+      <figcaption
+        data-testid="gm-cell-caption"
+        style={{
+          height: CELL_CAPTION_HEIGHT,
+          lineHeight: `${CELL_CAPTION_HEIGHT}px`,
+          fontSize: 11,
+          color: c.muted,
+          textAlign: 'center',
+          overflow: 'hidden',
+        }}
+      >
+        {caption}
+      </figcaption>
+    </figure>
+  );
+}
+
 export function CellView({
   c,
   cell,
@@ -1810,111 +2200,145 @@ export function CellView({
   onRecheck: (cell: MatrixCell) => void;
   onEnlarge: (cell: MatrixCell) => void;
 }) {
-  if (!cell) return <span style={{ color: c.muted }}>—</span>;
+  const { body, caption } = cellContent({ c, cell, maturityGate, onRecheck, onEnlarge });
+  return (
+    <CellShell c={c} caption={caption}>
+      {body}
+    </CellShell>
+  );
+}
+
+/**
+ * The per-status content of a cell: what goes in the media row, and what (if
+ * anything) goes in the caption row. Split out from `CellView` so that the
+ * shell wrapping it is applied in exactly ONE place — a `switch` that returned
+ * a fully-formed element per branch is how the missing caption reservation got
+ * in, and it would let the next status skip the shell just as quietly.
+ */
+function cellContent({
+  c,
+  cell,
+  maturityGate,
+  onRecheck,
+  onEnlarge,
+}: {
+  c: Palette;
+  cell: MatrixCell | undefined;
+  maturityGate: MaturityGate;
+  onRecheck: (cell: MatrixCell) => void;
+  onEnlarge: (cell: MatrixCell) => void;
+}): { body: React.ReactNode; caption?: React.ReactNode } {
+  if (!cell) return { body: <CellBox c={c} label="—" tone="muted" /> };
   switch (cell.status) {
     case 'blocked': {
       // Give the muted "Incompatible" chip a reason (I5) — WHY it's blocked and
       // what to change — in a design-system Tooltip so the cell isn't a dead end.
       const reason = incompatibleCellReason(cell);
-      return (
-        <Tooltip label={reason}>
-          <span tabIndex={0} data-testid="gm-incompatible-detail" style={{ display: 'block' }}>
-            <CellBox c={c} label="Incompatible" sub="no charge" tone="muted" />
-          </span>
-        </Tooltip>
-      );
+      return {
+        body: (
+          <Tooltip label={reason}>
+            <span tabIndex={0} data-testid="gm-incompatible-detail" style={{ display: 'block' }}>
+              <CellBox c={c} label="Incompatible" sub="no charge" tone="muted" />
+            </span>
+          </Tooltip>
+        ),
+      };
     }
     case 'canceled':
-      return <CellBox c={c} label="Canceled" sub="no charge" tone="muted" />;
+      return { body: <CellBox c={c} label="Canceled" sub="no charge" tone="muted" /> };
     case 'idle':
-      return <CellBox c={c} label="Queued" tone="muted" />;
+      return { body: <CellBox c={c} label="Queued" tone="muted" /> };
     // The in-flight states render an animated shimmer skeleton with the small
     // status label on top (D4.2), instead of a static text box.
     // estimating / submitting with no workflowId yet can't be cleanly canceled
     // by Stop (it may still complete + charge) — label it honestly so the user
     // can distinguish it from a cleanly-canceled cell.
     case 'estimating':
-      return (
-        <SkeletonCell
-          c={c}
-          label={isUncancelableInFlight(cell) ? 'Submitting (may charge)…' : 'Estimating…'}
-        />
-      );
+      return {
+        body: (
+          <SkeletonCell
+            c={c}
+            label={isUncancelableInFlight(cell) ? 'Submitting (may charge)…' : 'Estimating…'}
+          />
+        ),
+      };
     case 'submitting':
-      return (
-        <SkeletonCell
-          c={c}
-          label={isUncancelableInFlight(cell) ? 'Submitting (may charge)…' : 'Submitting…'}
-        />
-      );
+      return {
+        body: (
+          <SkeletonCell
+            c={c}
+            label={isUncancelableInFlight(cell) ? 'Submitting (may charge)…' : 'Submitting…'}
+          />
+        ),
+      };
     case 'polling':
-      return <SkeletonCell c={c} label="Generating…" />;
+      return { body: <SkeletonCell c={c} label="Generating…" /> };
     case 'insufficient':
-      return <CellBox c={c} label="Out of Buzz" sub="top up & retry" tone="danger" />;
+      return { body: <CellBox c={c} label="Out of Buzz" sub="top up & retry" tone="danger" /> };
     case 'timedout':
       // Polling gave up; the gen may still finish + bill — so it's a muted
       // "still working" state, never a failure and never "no charge". M2: a
       // Re-check re-polls the SAME workflow (no re-submit → no re-charge).
-      return (
-        <CellBox c={c} label={timedOutCellLabel()} sub="may still finish" tone="muted">
-          <button
-            type="button"
-            onClick={() => onRecheck(cell)}
-            className="gm-chip"
-            data-testid="gm-recheck"
-            style={{
-              marginTop: 4,
-              padding: '3px 10px',
-              borderRadius: 999,
-              border: `1px solid ${c.accent}`,
-              background: 'transparent',
-              color: c.accent,
-              fontSize: 11,
-              fontWeight: 700,
-              cursor: 'pointer',
-            }}
-          >
-            Re-check
-          </button>
-        </CellBox>
-      );
+      return {
+        body: (
+          <CellBox c={c} label={timedOutCellLabel()} sub="may still finish" tone="muted">
+            <button
+              type="button"
+              onClick={() => onRecheck(cell)}
+              className="gm-chip"
+              data-testid="gm-recheck"
+              style={{
+                marginTop: 4,
+                padding: '3px 10px',
+                borderRadius: 999,
+                border: `1px solid ${c.accent}`,
+                background: 'transparent',
+                color: c.accent,
+                fontSize: 11,
+                fontWeight: 700,
+                cursor: 'pointer',
+              }}
+            >
+              Re-check
+            </button>
+          </CellBox>
+        ),
+      };
     case 'failed': {
       // Friendly label; keep the raw server detail in a design-system Tooltip so
       // it's never lost — just demoted from the primary label (STEP 2).
       const detail = failedCellDetail(cell.error);
       const box = <CellBox c={c} label={failedCellLabel()} tone="danger" />;
-      return detail ? (
-        <Tooltip label={detail}>
-          <span tabIndex={0} data-testid="gm-failed-detail" style={{ display: 'block' }}>
-            {box}
-          </span>
-        </Tooltip>
-      ) : (
-        box
-      );
+      return {
+        body: detail ? (
+          <Tooltip label={detail}>
+            <span tabIndex={0} data-testid="gm-failed-detail" style={{ display: 'block' }}>
+              {box}
+            </span>
+          </Tooltip>
+        ) : (
+          box
+        ),
+      };
     }
     case 'done':
-      return (
-        <figure style={{ margin: 0, display: 'grid', gap: 4 }}>
-          {cell.imageUrl ? (
-            <MaturityImage
-              src={cell.imageUrl}
-              alt={`${cell.checkpoint.label} · ${cell.modifier.label}`}
-              nsfwLevel={cell.nsfwLevel}
-              gate={maturityGate}
-              onEnlarge={() => onEnlarge(cell)}
-              fallback={<span style={{ fontSize: 12, color: c.muted }}>Image unavailable</span>}
-            />
-          ) : (
-            // A `done` cell with no imageUrl: the gen succeeded + was charged but
-            // the snapshot carried no image — show an explicit, non-blank state.
-            <CellBox c={c} label="Image unavailable" sub="generated · charged" tone="muted" />
-          )}
-          <figcaption style={{ fontSize: 11, color: c.muted, textAlign: 'center' }}>
-            {formatCost(cell.cost)} Buzz
-          </figcaption>
-        </figure>
-      );
+      return {
+        body: cell.imageUrl ? (
+          <MaturityImage
+            src={cell.imageUrl}
+            alt={`${cell.checkpoint.label} · ${cell.modifier.label}`}
+            nsfwLevel={cell.nsfwLevel}
+            gate={maturityGate}
+            onEnlarge={() => onEnlarge(cell)}
+            fallback={<span style={{ fontSize: 12, color: c.muted }}>Image unavailable</span>}
+          />
+        ) : (
+          // A `done` cell with no imageUrl: the gen succeeded + was charged but
+          // the snapshot carried no image — show an explicit, non-blank state.
+          <CellBox c={c} label="Image unavailable" sub="generated · charged" tone="muted" />
+        ),
+        caption: `${formatCost(cell.cost)} Buzz`,
+      };
   }
 }
 
@@ -2148,7 +2572,17 @@ export function MatrixShapePreview({
         will get.
       </span>
       <div className="gm-grid-scroll" style={{ ['--gm-fade-color' as string]: c.fadeColor }}>
-        <table style={{ borderCollapse: 'collapse', width: '100%' }}>
+        {/* 🔴 THE WHOLE TABLE IS aria-hidden, AND THE CAPTION ABOVE IS ITS
+            ACCESSIBLE EQUIVALENT. Every cell here is an empty dashed box: the
+            grid is a picture of a SHAPE, not data. To a screen-reader user it
+            was a table to be traversed cell by cell — six, twelve, up to twenty
+            announcements of nothing — while the one sentence that actually
+            carries the information ("2 models × 3 styles — this is the grid you
+            will get") sits right above it, and the axis names are already
+            announced by the chip rows further up. Hiding a redundant decorative
+            table behind an equivalent text alternative is the standard remedy;
+            nothing here is available only inside the table. */}
+        <table style={{ borderCollapse: 'collapse', width: '100%' }} aria-hidden>
           <thead>
             <tr>
               <th

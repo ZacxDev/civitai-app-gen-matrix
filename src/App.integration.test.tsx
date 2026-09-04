@@ -168,6 +168,128 @@ describe('App money-path integration (mock host)', () => {
 });
 
 /**
+ * 🔴 THE SEAM THE COMPONENT TESTS CANNOT REACH. `sharedPromptFromCells` is
+ * verified as a pure function and `ResultGrid` is verified against a
+ * `sharedPrompt` prop, but WHICH string App hands it is decided in App — and the
+ * dangerous wrong answer, the live `prompt` state, is available there and
+ * nowhere else. Both halves can be individually correct while the screen shows
+ * the wrong prompt entirely, and only a test that drives the real restore can
+ * see it.
+ */
+describe('a restored matrix shows the prompt that produced IT', () => {
+  const restoredPrompt = 'a lighthouse in fog';
+
+  function seedDoneRun(key: string) {
+    const cells = buildMatrix(restoredPrompt, [CHECKPOINTS[0]], [MODIFIERS[0], MODIFIERS[1]]).map(
+      (cell, i): MatrixCell => ({
+        ...cell,
+        status: 'done',
+        workflowId: `wf_${i}`,
+        imageUrl: `https://img.example/${i}.jpeg`,
+        cost: 8,
+        nsfwLevel: 1,
+      }),
+    );
+    return { [key]: buildRunManifest({ phase: 'done', cells, perCellEstimate: 8 }) };
+  }
+
+  it('shows the run’s own prompt, not the empty form state', async () => {
+    // 🔴 THE FORM HAS RESET. On a restore the textarea is empty, so a header
+    // that recomputed the prompt from current state would caption a paid matrix
+    // with a blank — or, worse, with whatever the viewer typed next. Reading it
+    // back off the run's own cells is what makes the caption true.
+    renderApp({
+      viewer,
+      consentGranted: true,
+      storage: { seed: seedDoneRun(RUN_STORAGE_KEY) },
+    });
+
+    await waitFor(() => expect(screen.getByTestId('gm-run-prompt')).toBeInTheDocument(), {
+      timeout: 4000,
+    });
+    expect(screen.getByTestId('gm-run-prompt').textContent).toContain(restoredPrompt);
+  });
+
+  it('migrates the legacy single-slot run instead of stranding it', async () => {
+    // The viewer who was mid-run when this shipped: their matrix lives in the
+    // OLD `gen-matrix:run:v1` key. If the app only ever looked at the new
+    // keyspace they would land on an empty build screen while a run they paid
+    // for sat unreachable in storage.
+    renderApp({
+      viewer,
+      consentGranted: true,
+      storage: { seed: seedDoneRun(RUN_STORAGE_KEY) },
+    });
+
+    // Restored: the paid images are on screen and the build panel is gone.
+    await waitFor(() => expect(screen.getAllByTestId('gm-maturity-image')).toHaveLength(2), {
+      timeout: 4000,
+    });
+    expect(screen.queryByLabelText('Shared generation prompt')).toBeNull();
+  });
+
+  it('replays the elapsed time the run RECORDED, not one measured from the reload', async () => {
+    // 🔴 The stamps must come off the manifest. Measuring from the restore would
+    // give a matrix generated last week a four-second runtime — a fabricated
+    // number, which is strictly worse than the blank a stamp-less run gets.
+    // (That a stamp-less run shows nothing is `runElapsedLabel`'s own guard.)
+    const cells = buildMatrix(restoredPrompt, [CHECKPOINTS[0]], [MODIFIERS[0], MODIFIERS[1]]).map(
+      (cell, i): MatrixCell => ({
+        ...cell,
+        status: 'done',
+        workflowId: `wf_${i}`,
+        imageUrl: `https://img.example/${i}.jpeg`,
+        cost: 8,
+        nsfwLevel: 1,
+      }),
+    );
+    const startedAt = Date.UTC(2026, 0, 1, 0, 0, 0);
+    const manifest = buildRunManifest({ phase: 'done', cells, perCellEstimate: 8 }, Date.now, {
+      startedAt,
+      // 95s later → "1m 35s". Distinct from every other number in this file, and
+      // not a round minute, so an off-by-one in either direction is visible.
+      finishedAt: startedAt + 95_000,
+    });
+
+    renderApp({
+      viewer,
+      consentGranted: true,
+      storage: { seed: { [RUN_STORAGE_KEY]: manifest } },
+    });
+
+    await waitFor(() => expect(screen.getByTestId('gm-elapsed')).toBeInTheDocument(), {
+      timeout: 4000,
+    });
+    expect(screen.getByTestId('gm-elapsed').textContent).toContain('1m 35s');
+  });
+
+  it('names the EFFECTIVE prompt of the cell that was enlarged', async () => {
+    // The App→Lightbox half of change 3: the header shows the shared prompt,
+    // but the enlarged view must show what THIS cell asked for, suffix and all.
+    // Which string reaches the lightbox is decided in App, so no component test
+    // can see it.
+    renderApp({
+      viewer,
+      consentGranted: true,
+      storage: { seed: seedDoneRun(RUN_STORAGE_KEY) },
+    });
+
+    await waitFor(() => expect(screen.getAllByTestId('gm-enlarge').length).toBeGreaterThan(1), {
+      timeout: 4000,
+    });
+    // MODIFIERS[1] is the second column — a styled one, so its effective prompt
+    // is strictly longer than the shared prompt the header shows.
+    await userEvent.click(screen.getAllByTestId('gm-enlarge')[1]);
+
+    const shown = (await screen.findByTestId('gm-lightbox-prompt')).textContent ?? '';
+    expect(shown).toContain(restoredPrompt);
+    expect(shown).toContain(MODIFIERS[1].promptSuffix);
+    // And it is genuinely the per-cell string, not the shared one echoed twice.
+    expect(shown.length).toBeGreaterThan(restoredPrompt.length);
+  });
+});
+
+/**
  * 🔴 THE SEAM NEITHER UNIT TEST CROSSES. `MatrixShapePreview` is tested against
  * BuildPanel's props and `MatrixConceptExample` is tested standalone, but which
  * of the two the SCREEN shows is decided in `App` — `billable === 0` picks the
