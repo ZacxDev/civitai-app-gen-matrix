@@ -1,0 +1,97 @@
+{
+  "slug": "gen-matrix",
+  "pass": "2026-09-04",
+  "versionAtPass": "0.8.6",
+  "baseAtPass": "8460b0b4d5baa2fe011802d6eb5b92c8de066912",
+  "brandDepth": "accent",
+  "hue": "#DB6EC9",
+  "heroPrompt": null,
+  "heroSeed": null,
+  "sdkVersionAtPass": {
+    "@civitai/app-sdk": "0.37.0",
+    "@civitai/blocks-react": "0.46.0",
+    "@civitai/components": "0.4.1",
+    "@civitai/components-react": "0.4.1",
+    "@civitai/theme": "0.3.1",
+    "_measured": "resolved via readlink -f on node_modules/@civitai/*, cross-checked against each resolved package's own version field. NOT a pnpm store version count -- the store retains pre-upgrade entries, so it reports both versions after a clean bump and one each before it."
+  },
+  "decisions": [
+    {
+      "what": "brandDepth stays `accent`, not `skin`",
+      "chose": "leave every surface on the host's --civitai-* tokens",
+      "because": "src/theme.ts contains ZERO hardcoded colour literals (measured: 0 hex matches), so light/dark correctness is already entirely the platform's. Moving to `skin` would transfer that debt to this app for no gain the store assets do not already provide -- the #DB6EC9 orchid plate is the brand's expression in the STORE (brand/icon.svg, brand/cover.svg, both attached and approved on the listing), not inside a block whose job is to render other people's images side by side."
+    },
+    {
+      "what": "no in-app hero image, despite hero generation being pre-authorised",
+      "chose": "spend nothing",
+      "because": "the app's primary object is a configuration form that becomes a comparison grid, inside an iframe with minHeight 600. A hero band would push the prompt field -- the first thing anyone needs to touch -- further down on every visit. Same reasoning that kept sensei and model-benchmarking heroless. The store listing already carries generated cover art."
+    },
+    {
+      "what": "the concept band's hardcoded numbers now say `Example:` in the VISIBLE text",
+      "chose": "mark them where a sighted reader can see it, and delete the aria-label that used to carry the marker",
+      "because": "measured live on 0.8.6 at the default selection, the configure screen showed THREE different cell counts at once: this band's fixed `2 models x 2 styles = 4 cells`, the live counter's `2 of 12 cells`, and the button's `Generate Matrix - 2 cells`. The band reuses the same `2` a small selection has, so it read as a fourth opinion about the current state. The marker DID exist -- in `aria-label=\"Example: ...\"` on a role-less <div>, which is not reliably announced by AT at all AND made the accessible name disagree with the visible text. That is also why the a11y sweep reads 0 violations here: every axe check passes on a non-interactive div that has a name. Removing the label and putting the word on screen makes the a11y tree and the screen say the same thing."
+    },
+    {
+      "what": "`FirstRunExample` renamed to `MatrixConceptExample`",
+      "chose": "rename to what it does rather than make it first-run",
+      "because": "its call site is `{inBuild && ...}` and the build phase is re-entered via `New run`, so it rendered on EVERY visit to the configure screen, not once -- the name was a false claim. It cannot be MADE first-run either: remembering a dismissal needs `useAppStorage`, and that surface is gated by `assertViewerIsAppDeveloper` (mods + app-dev-testers), so for an ordinary viewer the flag could never be read back. model-benchmarking's `one-time dismissible panel with a persisted per-viewer flag` is therefore not portable to this app."
+    },
+    {
+      "what": "the per-cell Buzz copy in the header was left in place, though it is arguably redundant with the live counter",
+      "chose": "do not delete standing money disclosure to save a line",
+      "because": "phase 2 says to delete copy that explains what the UI already shows, and `Each cell spends only its real cost...` does overlap the counter's `max -- real cost is usually far less`. But the header copy is the only STANDING statement of the 200-Buzz per-gen cap; the counter's equivalent lives in a Tooltip. Demoting a money disclosure from standing copy to a hover is a downgrade in honesty, which is the opposite of what this arc is for. Decluttering is not worth it here."
+    },
+    {
+      "what": "phases 4 (identity) and 5 (moderation) are n-a, and this was MEASURED rather than assumed",
+      "chose": "record the reason, do not invent a surface to grade",
+      "because": "gen-matrix declares exactly one scope, `ai:write:budgeted`, and uses NO shared storage -- `useSharedStorage` appears nowhere in src/. There is no cross-user content, so there is nobody to attribute and nothing to report. A shared-storage board was considered and deliberately deferred (see deferred[])."
+    }
+  ],
+  "deferred": [
+    {
+      "what": "a shared-storage board of published comparison grids, so the expensive answer this app produces becomes readable by people who did not pay for it",
+      "blockedBy": "the platform's publish path is author-cohort-only. `blocks.publishGenerationOutputs` calls `assertViewerIsAppDeveloper`, which is `mod OR the app-dev-testers cohort` and fail-closed, so an ordinary viewer cannot publish images at all. The READ side is deliberately open (`blocks.getImagesByIds` is commented `NOT the author gate: a viewer of the app can read images the app published`), so only half the loop exists. Per-user KV (`useAppStorage`) carries the same author gate; shared storage itself is genuinely public.",
+      "closingCondition": "The author gate comes off the publish path: `assertViewerIsAppDeveloper` no longer guards `publishGenerationOutputs` in civitai/civitai `src/server/routers/blocks.router.ts`. That is a one-command mechanical check at the ref (`git -C <civitai> show origin/main:src/server/routers/blocks.router.ts | grep -A30 'publishGenerationOutputs: publicProcedure'`), and whoever runs the next phase 0 on this app is who checks it. Until then a board would be an operator-curated reading room, not a community board -- which the operator considered and declined on 2026-09-04."
+    },
+    {
+      "what": "an inline boot-theme reader in index.html, so the pre-`ready` paint uses the HOST's theme instead of the machine's OS preference",
+      "blockedBy": "nothing, as of the SDK bump to app-sdk 0.37.0 -- this is now a CHOICE, not a blocker. `blocks/initFragment`'s `parseBlockInitFragment(hash)` returns `{ theme?, renderMode?, blockInstanceId? }` read synchronously at document parse time. src/bootTheme.ts's `bootThemeGuess()` already reads `data-civitai-boot-theme` FIRST and is deliberately forward-compatible, so only the inline reader is missing. It was not taken here because it changes the boot path and does not belong in a taste pass whose other changes are cosmetic and copy-level.",
+      "closingCondition": "index.html gains the inline reader AND the tripwire in src/bootTokens.test.ts (`expect(BOOT_CSS).not.toContain('data-civitai-boot-theme')`) is replaced with assertions over the new override blocks, in the SAME commit -- a boot path whose CSS and reader disagree is a colour flash. The test failing is the mechanical signal; whoever writes the reader is who checks it."
+    }
+  ],
+  "rubric": {
+    "brand": {
+      "hueFromSystem": "pass -- #DB6EC9 read from brand/README.md, not invented here",
+      "heroReproducible": "n-a -- no hero, see decisions",
+      "dualTheme": "pass -- accent depth, host owns both themes; zero hardcoded colours in src/theme.ts",
+      "noHardcodedThemeColour": "pass -- measured 0 hex literals in src/theme.ts. The four literals in index.html's boot <style> are the deliberate exception (a var is unusable before the stylesheet loads) and are asserted against the INSTALLED @civitai/theme by src/bootTokens.test.ts"
+    },
+    "informationArchitecture": {
+      "primaryObjectFirst": "partial -- the prompt field is below a title, a tagline, a money note and the concept band. The band was fixed rather than removed this pass (see decisions); whether the header earns four blocks before the first input is the open question for a later pass",
+      "creationSecondary": "n-a -- this app has no board to add to; its single action IS the primary",
+      "noRedundantExplainer": "FIXED this pass -- the concept band's fixed numbers no longer read as a live readout contradicting the counter beside them",
+      "partialRankingDisclosed": "n-a -- no ranking, no list, no server-side sort in play"
+    },
+    "interaction": {
+      "transitions": "n-a -- no motion added this pass",
+      "reducedMotion": "n-a -- see above; becomes mandatory if motion is added",
+      "optimisticRollback": "n-a -- the money path is estimate -> confirm -> submit -> poll, with no optimistic write to roll back",
+      "menus": "n-a -- no overflow menus",
+      "heightNotifiesHost": "pass -- useBlockResize(rootRef) at App.tsx"
+    },
+    "honesty": {
+      "noRejectedAffordance": "pass, pre-existing -- `data-testid={anon ? 'gm-signin' : 'gm-generate'}` offers a signed-out viewer a sign-in rather than a mutation that would reject. This is constraints section 7 implemented correctly and it was NOT added by this pass",
+      "suppressionNamedAsSuppression": "n-a -- nothing is suppressed; there is no cross-user content",
+      "costHonesty": "pass, pre-existing -- incompatible LoRA x checkpoint pairings are disclosed as `incompatible` and `cost nothing`; the per-cell figure is named as `the safety cap, not what you'll spend`; Confirm is gated on a returned estimate"
+    },
+    "coverage": {
+      "unitComponentIntegration": "pass -- 368 tests / 16 files after this pass (was 364 / 15)",
+      "failureInjection": "pass, pre-existing -- queue-driver and catalog-api both inject failures",
+      "regressionWatchedRed": "pass -- BOTH new guards mutated separately and each killed exactly ONE test for its own reason: removing the visible `Example:` marker reddens only `says \"Example\" in the VISIBLE text` (1 failed / 3 passed); restoring the old aria-label reddens only `does not carry an accessible name that disagrees` (1 failed / 3 passed). An earlier draft of the idempotence test also died to the first mutation and was rewritten so it cannot",
+      "recipeUpdated": "n-a this PR -- no testid was renamed, added or removed, and the ready anchor (gm-generate) is unmoved. The capture recipe needs no edit"
+    },
+    "evidence": {
+      "beforeAfterDiff": "PARTIAL -- the phase-0 baseline is captured (/tmp/taste-before-gm, 0 a11y violations, 0 console, 0 failed of 3 observed, 65 elements, 6 testids). The after-run cannot be taken until 0.8.7 is live, and this app's capture exits 6 REFUSE[too_few_states] by design -- it has exactly one state that does not spend Buzz, so it is an --evidence target, never a --render one"
+    }
+  }
+}
