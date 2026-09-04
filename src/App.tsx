@@ -972,7 +972,7 @@ export function App() {
             Same prompt, every model × style — side by side.
           </p>
           {inBuild && <p style={{ ...noteStyle(c), margin: 0 }}>{perCellBudgetCopy()}</p>}
-          {inBuild && <FirstRunExample c={c} />}
+          {inBuild && <MatrixConceptExample c={c} />}
         </header>
 
         {inBuild && (
@@ -2046,9 +2046,36 @@ function LoraGlyph({ c, on = false }: { c: Palette; on?: boolean }) {
 /**
  * A one-glance "what is a matrix" affordance (I3.1): a tiny 2×2 grid of accent
  * dots labeled by the two axes, so the concept reads instantly without a
- * docs-like paragraph. Decorative — labeled for AT, dots aria-hidden.
+ * docs-like paragraph. Dots are aria-hidden; the text beside them is the label.
+ *
+ * 🔴 THE NUMBERS HERE ARE A FIXED EXAMPLE, NOT A READOUT — and saying so in the
+ * VISIBLE text is the whole point of this component's shape. It renders directly
+ * above BuildPanel's live counter, which says the real thing ("N of 12 cells"),
+ * and the example's own "2 models × 2 styles = 4 cells" is hardcoded. Measured
+ * live on 0.8.6 at the default selection, the screen showed THREE different cell
+ * counts at once — this band's 4, the counter's "2 of 12", and the button's
+ * "· 2 cells" — because the example reuses the same "2" the live selection had
+ * and nothing on screen marked it as illustrative.
+ *
+ * 🔴 IT USED TO BE MARKED, IN A PLACE NOBODY COULD READ IT. The marker lived in
+ * an `aria-label="Example: …"` on this bare `<div>` — which has no role, so the
+ * label is not reliably exposed by AT at all, AND it made the accessible name
+ * disagree with the visible text. That is why the a11y sweep reads 0 violations
+ * on this screen: every axe check (interactive-name, img-alt, control-label,
+ * heading-order) passes on a non-interactive div with a name. The label was
+ * removed rather than fixed: with "Example" in the visible text the element
+ * describes itself, and the a11y tree and the screen now say the SAME thing,
+ * which is the property worth having.
+ *
+ * 🔴 RENAMED FROM `FirstRunExample`, WHICH WAS FALSE. Its call site is
+ * `{inBuild && …}` — the build phase, which you re-enter via "New run" — so it
+ * renders on EVERY visit to the configure screen, not once. It cannot be made
+ * genuinely first-run either: remembering a dismissal needs `useAppStorage`, and
+ * that surface is reachable only by mods + app-dev-testers
+ * (`assertViewerIsAppDeveloper` on the apps.router storage procedures), so for an
+ * ordinary viewer the flag could never be read back.
  */
-function FirstRunExample({ c }: { c: Palette }) {
+export function MatrixConceptExample({ c }: { c: Palette }) {
   return (
     <div
       style={{
@@ -2060,7 +2087,6 @@ function FirstRunExample({ c }: { c: Palette }) {
         background: c.cardBg,
         padding: '10px 12px',
       }}
-      aria-label="Example: a 2 by 2 grid of two models across two styles"
     >
       <div
         aria-hidden
@@ -2084,7 +2110,9 @@ function FirstRunExample({ c }: { c: Palette }) {
         ))}
       </div>
       <div style={{ display: 'grid', gap: 2 }}>
-        <span style={{ fontSize: 13, fontWeight: 600 }}>2 models × 2 styles = 4 cells</span>
+        <span style={{ fontSize: 13, fontWeight: 600 }}>
+          Example: 2 models × 2 styles = 4 cells
+        </span>
         <span style={{ ...noteStyle(c), margin: 0 }}>
           Each cell is one real generation — compare them side by side.
         </span>
