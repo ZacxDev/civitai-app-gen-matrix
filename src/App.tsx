@@ -69,6 +69,7 @@ import { CatalogCache, defaultKvStore } from './catalog-cache.js';
 import { DEFAULT_LIMIT, fetchCatalog, type CatalogQuery } from './catalog-api.js';
 import { loraBaseModelFilter } from './ecosystem.js';
 import { palette, type Palette } from './theme.js';
+import { paintTheme } from './bootTheme.js';
 import { MaturityImage } from './MaturityImage.js';
 import {
   RUN_STORAGE_KEY,
@@ -208,7 +209,14 @@ export function App() {
     [domainMaturity.isLevelAllowed, domainMaturity.isSfw],
   );
 
-  const isDark = theme === 'dark';
+  // 🔴 NEVER the bare `theme` here, and in THIS app it drives more than an
+  // attribute: `palette(isDark)` is JS-derived, so the sentinel picked the whole
+  // light colour set for the `!ready` commit. Before `ready` the SDK's snapshot
+  // hardcodes the string 'light' (blocks-react dist/internal/transport.js,
+  // EMPTY_SNAPSHOT), so every pre-init viewer got a LIGHT skeleton — repainting
+  // index.html's dark boot skeleton white, then dark again at BLOCK_INIT. After
+  // `ready` the host's answer wins outright, exactly as before. See src/bootTheme.ts.
+  const isDark = paintTheme(ready, theme) === 'dark';
   const c = palette(isDark);
   const anon = ready && !viewer;
   const granted = hasBudgetedScope(token.scopes);
