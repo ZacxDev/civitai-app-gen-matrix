@@ -10,12 +10,26 @@
  * flash introduced at exactly the moment `bootSkeleton: true` stands the host's veil
  * down. Never branch on `theme` in a `!ready` path; use this instead.
  *
- * 🔴 THE ATTRIBUTE READ IS FORWARD-COMPATIBLE, NOT LOAD-BEARING HERE. This app's
- * pinned SDK cannot decode the init fragment, so index.html ships no inline reader
- * and nothing sets `data-civitai-boot-theme` today — the OS query below is what
- * actually answers, matching the stylesheet's `@media (prefers-color-scheme: light)`
- * exactly. The attribute branch is kept so that adding the reader later needs no
- * change here.
+ * 🔴 THE ATTRIBUTE READ IS FORWARD-COMPATIBLE, NOT LOAD-BEARING HERE. Nothing sets
+ * `data-civitai-boot-theme` today, because index.html ships no inline reader — so
+ * the OS query below is what actually answers, matching the stylesheet's
+ * `@media (prefers-color-scheme: light)` exactly. The attribute branch is kept so
+ * that adding the reader later needs no change here.
+ *
+ * 🔴 THE REASON FOR THAT GAP CHANGED, AND THE OLD REASON IS NO LONGER TRUE. This
+ * comment used to read "this app's pinned SDK cannot decode the init fragment".
+ * That was accurate at `@civitai/app-sdk@0.28.0` and is false as of the bump to
+ * `0.37.0`, which ships `blocks/initFragment` — `parseBlockInitFragment(hash)`
+ * returns `{ theme?, renderMode?, blockInstanceId? }` read SYNCHRONOUSLY at
+ * document parse time, which is exactly the signal an inline reader needs and
+ * strictly better than the OS guess (it is the HOST's theme, not the machine's).
+ * Measured 2026-09-04: `dist/blocks/initFragment.d.ts` is present at 0.37.0 and
+ * absent at 0.28.0. So the inline reader is now a CHOICE, not a blocker. It is
+ * deliberately not taken in the same commit as a dependency bump — adding it is a
+ * behaviour change to the boot path and belongs with the boot work, not here.
+ * Closing condition: index.html gains the inline reader and the tripwire in
+ * src/bootTokens.test.ts ("no `data-civitai-boot-theme` override blocks") is
+ * updated in that same commit; whoever writes the reader is who checks it.
  *
  * Unknown means DARK, here and in index.html and in `<meta name="color-scheme">`.
  */

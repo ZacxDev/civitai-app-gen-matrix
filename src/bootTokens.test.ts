@@ -109,10 +109,18 @@ describe('boot token parity with @civitai/theme', () => {
       lightBody,
     );
 
-    // 🔴 NO `data-civitai-boot-theme` OVERRIDE BLOCKS IN THIS APP, deliberately —
-    // its pinned SDK cannot decode the init fragment, so index.html ships no inline
-    // reader and nothing ever sets that attribute. Asserting override rules here
-    // would pin markup that does not exist. See the note at the top of index.html.
+    // 🔴 NO `data-civitai-boot-theme` OVERRIDE BLOCKS IN THIS APP: index.html ships
+    // no inline reader, so nothing ever sets that attribute, and asserting override
+    // rules here would pin markup that does not exist.
+    //
+    // 🔴 THIS IS NOW A TRIPWIRE, NOT A STATEMENT OF THE POSSIBLE. It used to say the
+    // pinned SDK "cannot decode the init fragment" — true at app-sdk@0.28.0, FALSE as
+    // of the bump to 0.37.0, which ships `blocks/initFragment`
+    // (`parseBlockInitFragment`, read synchronously at parse time). So an inline
+    // reader is now buildable, and the day someone builds it this assertion is what
+    // goes red. That is the intent: read src/bootTheme.ts's note, add the matching
+    // override blocks, and replace this line with assertions over them in the SAME
+    // commit — a boot path whose CSS and whose reader disagree is a colour flash.
     expect(BOOT_CSS).not.toContain('data-civitai-boot-theme');
   });
 

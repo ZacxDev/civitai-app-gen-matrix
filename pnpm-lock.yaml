@@ -9,20 +9,20 @@ importers:
   .:
     dependencies:
       '@civitai/app-sdk':
-        specifier: ^0.28.0
-        version: 0.28.0
-      '@civitai/blocks-react':
         specifier: ^0.37.0
-        version: 0.37.0(@civitai/app-sdk@0.28.0)(react@19.2.7)
+        version: 0.37.0
+      '@civitai/blocks-react':
+        specifier: ^0.46.0
+        version: 0.46.0(@civitai/app-sdk@0.37.0)(react@19.2.7)
       '@civitai/components':
-        specifier: ^0.3.0
-        version: 0.3.0
+        specifier: ^0.4.1
+        version: 0.4.1
       '@civitai/components-react':
-        specifier: ^0.3.0
-        version: 0.3.0(react-dom@19.2.7(react@19.2.7))(react@19.2.7)
+        specifier: ^0.4.1
+        version: 0.4.1(react-dom@19.2.7(react@19.2.7))(react@19.2.7)
       '@civitai/theme':
-        specifier: ^0.2.0
-        version: 0.2.0
+        specifier: ^0.3.1
+        version: 0.3.1
       react:
         specifier: ^19.0.0
         version: 19.2.7
@@ -104,30 +104,30 @@ packages:
     resolution: {integrity: sha512-6zABk/ECA/QYSCQ1NGiVwwbQerUCZ+TQbp64Q3AgmfNvurHH0j8TtXa1qbShXA6qqkpAj4V5W8pP6mLe1mcMqA==}
     engines: {node: '>=18'}
 
-  '@civitai/app-sdk@0.28.0':
-    resolution: {integrity: sha512-MeNJDM5mrNeU3jKWXSS27Zw6J7uFHCQL5qKresHJuroJ2ZKwe3a9R4k/jpkcPhQzW8Ey4ACate1+qTH+aVcaQQ==}
+  '@civitai/app-sdk@0.37.0':
+    resolution: {integrity: sha512-x0uulFdoI3amgny9TVoFZ/77okRj7pX2gBC7f/SA3VX+JzKV1IuBLlhfwyV2JH8Rh/0FRNSyRV+eVJmAHeQgyQ==}
     engines: {node: '>=20'}
 
-  '@civitai/blocks-react@0.37.0':
-    resolution: {integrity: sha512-eFJfLiuZIdZz5IOovT0n3Lvrsrm39yTsjahR6aYgz4tQPxdkO0STzgnFEUFtFE9oMqtjMCudWjtkEPeYA9bF0A==}
+  '@civitai/blocks-react@0.46.0':
+    resolution: {integrity: sha512-Z1yUGC0RfdukoQ1RVciff4vUog6gls8Csr7rHGAN63S/a8NI3XxWEkX1udFs6n7ROXEO+Y1XMrO47wm0/8k8Qw==}
     engines: {node: '>=20'}
     peerDependencies:
-      '@civitai/app-sdk': ^0.28.0
+      '@civitai/app-sdk': '>=0.29.0 <1.0.0'
       react: ^18.0.0 || ^19.0.0
 
-  '@civitai/components-react@0.3.0':
-    resolution: {integrity: sha512-Knv38Ou7tmI0BDmVmoiwMRLSEEttp5n6Em4fyBOjQASK5cM4uY9AktXpYfL1I/0X/TvQgxXYtMDVOFw7FwqrtQ==}
+  '@civitai/components-react@0.4.1':
+    resolution: {integrity: sha512-7CZ1rLXq9/8ee5AUTppgMLfe9VZm0n1YiYdc5kdmzMZvgGuOxnokspdQkc+zXuMffkhgnHppElEiLyyS5+Z/nw==}
     engines: {node: '>=20'}
     peerDependencies:
       react: ^18.0.0 || ^19.0.0
       react-dom: ^18.0.0 || ^19.0.0
 
-  '@civitai/components@0.3.0':
-    resolution: {integrity: sha512-nQzqTNVOR9oZiJuUcJX9OE1j0qNQSfse/3mL9PwI4gGSvYU/yskLGDRO9rOuvZJ9T/BR0hfhuY+ZHBFw4MEVtA==}
+  '@civitai/components@0.4.1':
+    resolution: {integrity: sha512-w8hcqhBlBGGQviGVweLkSEilARzOyDtKqr00O7u/s4i8CXrNu8s4+lAT5GFJb4lAYU75BXX1s99138dZFhyaqA==}
     engines: {node: '>=20'}
 
-  '@civitai/theme@0.2.0':
-    resolution: {integrity: sha512-eYtfCiMvrjH2aiBg0G0pMFXnE/fo6tRL4oBQVLNQ863WKPIrLxUsYfsSlRMYF9tIQAaJ1N28OdUkxs6iYNb7rQ==}
+  '@civitai/theme@0.3.1':
+    resolution: {integrity: sha512-S/ibSOGDkXyskNSqbDxXO2sh3bsa+zhm7qPwM8mr5br218osPwBVmca7WI1uSZDd0ij6CZviOaw8kJ92TYkeog==}
     engines: {node: '>=20'}
 
   '@csstools/color-helpers@5.1.0':
@@ -1035,27 +1035,27 @@ snapshots:
 
   '@bcoe/v8-coverage@1.0.2': {}
 
-  '@civitai/app-sdk@0.28.0': {}
+  '@civitai/app-sdk@0.37.0': {}
 
-  '@civitai/blocks-react@0.37.0(@civitai/app-sdk@0.28.0)(react@19.2.7)':
+  '@civitai/blocks-react@0.46.0(@civitai/app-sdk@0.37.0)(react@19.2.7)':
     dependencies:
-      '@civitai/app-sdk': 0.28.0
-      '@civitai/components': 0.3.0
-      '@civitai/theme': 0.2.0
+      '@civitai/app-sdk': 0.37.0
+      '@civitai/components': 0.4.1
+      '@civitai/theme': 0.3.1
       react: 19.2.7
 
-  '@civitai/components-react@0.3.0(react-dom@19.2.7(react@19.2.7))(react@19.2.7)':
+  '@civitai/components-react@0.4.1(react-dom@19.2.7(react@19.2.7))(react@19.2.7)':
     dependencies:
-      '@civitai/components': 0.3.0
-      '@civitai/theme': 0.2.0
+      '@civitai/components': 0.4.1
+      '@civitai/theme': 0.3.1
       react: 19.2.7
       react-dom: 19.2.7(react@19.2.7)
 
-  '@civitai/components@0.3.0':
+  '@civitai/components@0.4.1':
     dependencies:
-      '@civitai/theme': 0.2.0
+      '@civitai/theme': 0.3.1
 
-  '@civitai/theme@0.2.0': {}
+  '@civitai/theme@0.3.1': {}
 
   '@csstools/color-helpers@5.1.0': {}
 
