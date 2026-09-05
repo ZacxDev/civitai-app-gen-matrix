@@ -28,7 +28,7 @@ packages:
   - '.'
 minimumReleaseAgeExclude:
   - '@civitai/app-sdk@0.28.0'
-  - '@civitai/blocks-react@0.37.0 || 0.46.0'
+  - '@civitai/blocks-react@0.37.0 || 0.46.0 || 0.47.0'
   - '@civitai/theme@0.2.0 || 0.3.1'
   - '@civitai/components@0.3.0 || 0.4.1'
   - '@civitai/components-react@0.3.0 || 0.4.1'

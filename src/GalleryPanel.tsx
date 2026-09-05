@@ -205,10 +205,37 @@ function GalleryEntryCard({
       </p>
 
       {/* The resources this matrix compared.
-          🔴 TEMPORARY RENDERING — a shared `ResourceCard` is being added to
-          `@civitai/blocks-react/ui` in a parallel PR and is the intended
-          replacement for these chips. Deliberately NOT a local component: a
-          second `ResourceCard` in this repo would collide with it on arrival. */}
+          🔴 THESE CHIPS ARE NOT TEMPORARY, AND THE COMMENT THAT SAID THEY WERE
+          WAS WRONG. It read: "TEMPORARY RENDERING — a shared `ResourceCard` is
+          being added to `@civitai/blocks-react/ui` in a parallel PR and is the
+          intended replacement for these chips." That component now exists, is
+          published (`@civitai/blocks-react@0.47.0`) and IS adopted in this app —
+          the browse grid and both configure-screen axes render it. This site is
+          the one place it cannot go, for a reason that has nothing to do with
+          the component.
+
+          `ResourceCard` renders a resource: a model NAME, a version name, a type
+          and a base model. A gallery entry has NONE of those. `GalleryRowRef` is
+          `{row, versionId}` and `GalleryColRef` is `{col, key, loraVersionId}` —
+          ids only, deliberately, because `data` is an UNMODERATED client-written
+          blob and this app must never echo text out of it (see `gallery.ts`,
+          "Labels — derived from ids, NEVER echoed out of `data`"). What these
+          chips show is `rowLabel`/`columnLabel`: a lookup into this app's own
+          curated table, falling back to "Model version 12345" — derived from a
+          number this module validated.
+
+          So feeding a `ResourceCard` here would mean either storing names in the
+          moderated-text-free payload, or synthesising a resource whose `name` is
+          the string "Model version 12345" and whose type and base model are
+          blank — a card that looks like a resource and asserts nothing true
+          about one. A column is worse still: most are prompt STYLES, which are
+          not resources in any sense.
+
+          Closing condition, if anyone wants to revisit: it needs a way to
+          resolve a versionId to a display resource at render time WITHOUT
+          trusting the blob — i.e. a host/catalog read per gallery row — and a
+          decision that the extra fetches are worth it. That is a different
+          change from this one, and it is not blocked on the design system. */}
       <ul
         style={{ listStyle: 'none', display: 'flex', flexWrap: 'wrap', gap: 4, margin: 0, padding: 0 }}
         data-testid="gm-gallery-resources"

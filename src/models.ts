@@ -22,6 +22,15 @@ export interface CheckpointOption {
   label: string;
   /** Base-model family — display/label only; compatibility is a SERVER authority. */
   baseModel: string;
+  /**
+   * The model's own public name, WITHOUT the version folded in — the shared
+   * `ResourceCard` renders the two on separate lines. OPTIONAL because state
+   * persisted by a build before this field existed carries only `label`; see
+   * {@link checkpointResource} for the fallback.
+   */
+  modelName?: string;
+  /** The version's own public name ("v9"). Optional for the same reason. */
+  versionName?: string;
 }
 
 /**
@@ -91,6 +100,21 @@ export interface ModifierOption {
    * `loraVersionId` is set.
    */
   baseModelFamily?: string;
+  /**
+   * The LoRA's parent MODEL id. Carried for display only — the wire needs
+   * `loraVersionId` alone (`additionalResources[].modelVersionId`).
+   *
+   * 🔴 ITS PRESENCE IS THE GATE for rendering this column as a resource rather
+   * than a chip: see {@link loraResource}, which returns `null` without it. A
+   * prompt-style column has no resource at all, and a LoRA column persisted by a
+   * build before this field existed has an incomplete one — both must fall back
+   * to the pill, and one nullable projection covers both.
+   */
+  loraModelId?: number;
+  /** The LoRA model's own public name, without the version folded in. */
+  modelName?: string;
+  /** The LoRA version's own public name ("v2.0"). */
+  versionName?: string;
 }
 
 /**
@@ -114,9 +138,30 @@ export const BASELINE_MODIFIER: ModifierOption = {
  *    (257749/290640).
  * Verified Public + covered + SFW on prod 2026-06-18.
  */
+// 🔴 `label` STAYS SHORT AND `modelName`/`versionName` ARE THE REAL ONES. The
+// label is a grid ROW HEADER — it sits in a narrow `<th>` beside every cell, so
+// "Pony Diffusion V6 XL / V6 (start with this one)" cannot go there. The public
+// names are carried separately for the axis card, which has room for both.
+// Read from the live API 2026-09-05 (`/api/v1/model-versions/<id>`), not typed
+// from memory: `128078` is model "SD XL" version "v1.0 VAE fix", `290640` is
+// "Pony Diffusion V6 XL" version "V6 (start with this one)".
 export const CHECKPOINTS: readonly CheckpointOption[] = [
-  { versionId: 128078, modelId: 101055, label: 'SD XL 1.0', baseModel: 'SDXL 1.0' },
-  { versionId: 290640, modelId: 257749, label: 'Pony V6 XL', baseModel: 'Pony' },
+  {
+    versionId: 128078,
+    modelId: 101055,
+    label: 'SD XL 1.0',
+    baseModel: 'SDXL 1.0',
+    modelName: 'SD XL',
+    versionName: 'v1.0 VAE fix',
+  },
+  {
+    versionId: 290640,
+    modelId: 257749,
+    label: 'Pony V6 XL',
+    baseModel: 'Pony',
+    modelName: 'Pony Diffusion V6 XL',
+    versionName: 'V6 (start with this one)',
+  },
 ] as const;
 
 /**
@@ -147,25 +192,30 @@ export const MODIFIERS: readonly ModifierOption[] = [
     promptSuffix: 'watercolor painting, soft washes, paper texture',
     loraVersionId: null,
   },
-  // Sample LoRA: "Sinfully Stylish" (versionId 407532), a public + covered +
-  // SFW SDXL LoRA. `baseModelFamily` is display/label metadata only — it no
-  // longer drives blocking. Every checkpoint × this-LoRA cell is attempted; the
-  // server decides compatibility (and rejects an incompatible pairing pre-spend,
-  // which the block shows as `blocked`, costing 0). Strength 1 (server default,
-  // mid of the [-1, 2] range).
+  // 🔴 THE SEED LoRA COLUMN IS GONE, AND ITS ABSENCE IS THE FIX. This table
+  // used to ship a fifth column, "LoRA: Sinfully Stylish" (versionId 407532),
+  // described here as "a public + covered + SFW SDXL LoRA" verified on prod
+  // 2026-06-18. Re-measured 2026-09-05, that resource is NOT IN THE ANON
+  // CATALOG: `/api/v1/model-versions/407532` returns 404 "Model not found", and
+  // a LORA search for the name returns 0 items. The positive control passes —
+  // checkpoint `128078` returns 200 from the same endpoint with the same client
+  // — so this is the resource being absent, not the reader being broken.
   //
-  // This is now a DEFAULT SEED, not the only LoRA source: the user can add more
-  // LoRA columns via the host's native resource picker (useResourcePicker —
-  // see picked* helpers below + App.tsx). The seed keeps the grid useful out of
-  // the box.
-  {
-    key: 'lora-sinfully-stylish',
-    label: 'LoRA: Sinfully Stylish',
-    promptSuffix: '',
-    loraVersionId: 407532,
-    loraStrength: 1,
-    baseModelFamily: 'SDXL 1.0',
-  },
+  // 🔴 A DEAD SEED IS WORSE THAN NO SEED, which is why it is removed rather than
+  // left in place with a note. It shipped pre-selected-able out of the box, so a
+  // first-time viewer's likeliest second click added a column whose every cell
+  // the server rejects pre-spend. The block renders that as `blocked`, which
+  // reads as "this app cannot do LoRAs" rather than "this one model is gone".
+  //
+  // ⚠ NOT RULED OUT: both reads were ANONYMOUS, so a resource merely hidden from
+  // anon (rather than deleted) looks identical from here. That does not change
+  // the decision — a seed the anon catalog cannot see is a seed most viewers
+  // cannot use — which is why this says "not in the anon catalog", not "deleted".
+  //
+  // LoRA columns are now entirely user-supplied, via the in-block browser
+  // (`ResourceBrowser`) or the host's native picker (`useResourcePicker`) — see
+  // the picked* helpers below. Both carry the FULL resource, which is what lets
+  // the column axis render as `ResourceCard`s instead of bare name pills.
 ];
 
 // ---------------------------------------------------------------------------
@@ -251,6 +301,41 @@ export function loraModifierFromPick(picked: PickedResource): ModifierOption {
     loraVersionId: picked.versionId,
     loraStrength: PICKED_LORA_DEFAULT_STRENGTH,
     baseModelFamily: picked.baseModel,
+    // The split fields the composed `label` cannot be taken apart into.
+    loraModelId: picked.modelId,
+    modelName: picked.modelName,
+    versionName: picked.versionName,
+  };
+}
+
+/**
+ * The `ResourceCard` shape for a LoRA column, or `null` when this column is not
+ * a renderable resource.
+ *
+ * 🔴 NULLABLE ON PURPOSE, AND THE NULL ARM IS THE COMMON ONE. Three distinct
+ * cases reach here and only the first is a resource:
+ *   1. A user-added LoRA (browsed or picked) — full data, renders as a card.
+ *   2. A PROMPT-STYLE column (Cinematic, Watercolor, the baseline) — not a
+ *      resource in any sense. There is no `versionId` to show and no model to
+ *      name; forcing one into a `ResourceCard` would render "#undefined" at
+ *      people, which is the exact failure the component's own name fallback
+ *      exists to prevent.
+ *   3. A LoRA column persisted by a build BEFORE `loraModelId` existed. Its
+ *      `label` still works, so it keeps the pill it has always had rather than
+ *      degrading into a half-filled card.
+ *
+ * Returning `null` rather than throwing is what lets one axis hold both shapes
+ * without the caller re-deriving "is this a resource?" from three fields.
+ */
+export function loraResource(mod: ModifierOption): PickedResource | null {
+  if (mod.loraVersionId == null || mod.loraModelId == null) return null;
+  return {
+    versionId: mod.loraVersionId,
+    modelId: mod.loraModelId,
+    modelName: mod.modelName?.trim() || mod.label,
+    versionName: mod.versionName ?? '',
+    baseModel: mod.baseModelFamily ?? '',
+    modelType: 'LORA',
   };
 }
 
@@ -261,5 +346,40 @@ export function checkpointFromPick(picked: PickedResource): CheckpointOption {
     modelId: picked.modelId,
     label: pickedCheckpointLabel(picked.versionId, picked.baseModel, picked),
     baseModel: picked.baseModel,
+    // 🔴 The SPLIT names, kept ALONGSIDE the composed `label` rather than
+    // instead of it. `label` is one string ("Sinfully Stylish — v2.0") because
+    // it has to fit a grid row/column header; the shared `ResourceCard` wants
+    // the model and the version as separate fields so it can render the version
+    // in its own muted meta row. Deriving one from the other is not possible in
+    // either direction: an em-dash is legal inside a model name.
+    modelName: picked.modelName,
+    versionName: picked.versionName,
+  };
+}
+
+/**
+ * The shape `@civitai/blocks-react/ui`'s `ResourceCard` takes — this app's local
+ * mirror of the SDK's `BlockResourceInfo`, which is `PickedResource` above.
+ *
+ * 🔴 WHY A PROJECTION FUNCTION RATHER THAN STORING ONE. A `CheckpointOption` is
+ * PERSISTED (see `persistence.ts`, which round-trips these objects verbatim), so
+ * every field added here is a field that must survive a reload written by an
+ * older build. `modelType` and the label fallback are DERIVABLE — a
+ * `CheckpointOption` is a checkpoint by construction — so deriving them costs
+ * nothing at read time and adds nothing to the stored shape. Only the two names
+ * that genuinely cannot be recovered from a composed label are stored.
+ *
+ * `modelName` is optional because state persisted by a build before this change
+ * has only `label`; that case falls back to the label, which is what the app
+ * showed then and is never worse.
+ */
+export function checkpointResource(ckpt: CheckpointOption): PickedResource {
+  return {
+    versionId: ckpt.versionId,
+    modelId: ckpt.modelId,
+    modelName: ckpt.modelName?.trim() || ckpt.label,
+    versionName: ckpt.versionName ?? '',
+    baseModel: ckpt.baseModel,
+    modelType: 'Checkpoint',
   };
 }

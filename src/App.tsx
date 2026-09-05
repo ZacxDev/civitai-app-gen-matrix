@@ -16,6 +16,7 @@ import {
   useResourcePicker,
   useSharedStorage,
 } from '@civitai/blocks-react';
+import { ResourceCard } from '@civitai/blocks-react/ui';
 import { Slider, Tooltip, useToast } from '@civitai/components-react';
 import type { BlockWorkflowSnapshot } from '@civitai/app-sdk/blocks';
 
@@ -23,9 +24,12 @@ import {
   CHECKPOINTS,
   MODIFIERS,
   checkpointFromPick,
+  checkpointResource,
   loraModifierFromPick,
+  loraResource,
   type CheckpointOption,
   type ModifierOption,
+  type PickedResource,
 } from './models.js';
 import {
   DEFAULT_CONCURRENCY,
@@ -1912,6 +1916,29 @@ export function BuildPanel(props: {
   const emptyPrompt = prompt.trim().length === 0;
   const disabled = anon ? false : over || billable === 0 || emptyPrompt;
 
+  // 🔴 PARTITIONED ON `loraResource`, NOT ON `loraVersionId != null`, and the
+  // two are NOT the same predicate. A column persisted by a build before
+  // `loraModelId` existed has a `loraVersionId` and no renderable resource, so
+  // keying the split on the id would send it to the card group and render a
+  // half-filled card. `loraResource` returns `null` for exactly that case (and
+  // for prompt styles), so one call decides the group AND supplies the props —
+  // there is no second place for the two answers to disagree.
+  //
+  // 🔴 EVERY COLUMN LANDS IN EXACTLY ONE GROUP. `styleModifiers` is the
+  // complement, computed from the same call rather than from a mirrored
+  // condition, so a column can neither vanish from the axis nor appear twice.
+  const resourceColumns = useMemo(
+    () =>
+      modifiers
+        .map((mod) => ({ mod, resource: loraResource(mod) }))
+        .filter((x): x is { mod: ModifierOption; resource: PickedResource } => x.resource != null),
+    [modifiers],
+  );
+  const styleModifiers = useMemo(
+    () => modifiers.filter((m) => loraResource(m) == null),
+    [modifiers],
+  );
+
   // Inline reason for a disabled Generate (I3.2). Anon is never "disabled" (the
   // button becomes Sign-in), so only the signed-in gates surface a reason.
   // Order: empty prompt → no selection → over cap (over-cap also shows in the
@@ -1945,16 +1972,37 @@ export function BuildPanel(props: {
 
       <fieldset style={fieldsetStyle(c)}>
         <legend style={legendStyle}>Models (checkpoints)</legend>
-        <div style={chipRow}>
+        {/* 🔴 THE ROW AXIS IS A LIST OF RESOURCES, SO IT RENDERS AS RESOURCES.
+            These used to be bare name pills — "SD XL 1.0", and nothing else —
+            which is the same string in every app that happens to pick this
+            checkpoint, telling the viewer nothing about WHAT they picked. The
+            shared `ResourceCard` adds the model type and the base-model family,
+            and splits the version onto its own line, from data the app already
+            had and was throwing away at the `label` boundary.
+
+            `auto-fill` rather than a single column: a row card is a compact
+            line, and stacking two of them vertically would push the matrix
+            preview — the thing Release A added as this app's centrepiece —
+            below the fold on a narrow viewport. */}
+        <div style={resourceAxisGrid} data-testid="gm-checkpoint-axis">
           {checkpoints.map((ckpt: CheckpointOption) => (
-            <Chip
+            <ResourceCard
               key={ckpt.versionId}
-              c={c}
-              label={ckpt.label}
+              variant="row"
+              interactive
+              resource={checkpointResource(ckpt)}
               selected={selectedCkpts.has(ckpt.versionId)}
-              onToggle={() => toggleCkpt(ckpt.versionId)}
+              // 🔴 NOT `disabled` when selected. Unlike the browse grid (which is
+              // add-only), this IS the toggle: pressing a selected card takes the
+              // checkpoint back off the axis, which is exactly what `aria-pressed`
+              // promises. Disabling here would drop every chosen model out of the
+              // tab order and strand a keyboard user with no way to deselect.
+              onSelect={() => toggleCkpt(ckpt.versionId)}
+              data-testid={`gm-ckpt-${ckpt.versionId}`}
             />
           ))}
+        </div>
+        <div style={{ ...chipRow, marginTop: 8 }}>
           <button
             type="button"
             onClick={onBrowseCheckpoint}
@@ -1979,17 +2027,53 @@ export function BuildPanel(props: {
 
       <fieldset style={fieldsetStyle(c)}>
         <legend style={legendStyle}>Styles (columns)</legend>
-        <div style={chipRow}>
-          {modifiers.map((m: ModifierOption) => (
+        {/* 🔴 TWO KINDS OF COLUMN, TWO SHAPES — and the split is the point,
+            not a layout preference. This axis mixes PROMPT STYLES (a suffix
+            folded into the shared prompt) with LoRA RESOURCES (a real model
+            layered on every checkpoint, which costs more and which the server
+            can reject per pairing). They used to sit in ONE wrap row, told apart
+            only by an 11px glyph and a paragraph of prose explaining the glyph.
+            A style is a word; a LoRA is a thing with a name, a version and a
+            base model. Rendering them as one shape asked the viewer to hold that
+            distinction in their head; rendering them as two states it. */}
+        <div style={chipRow} data-testid="gm-style-axis">
+          {styleModifiers.map((m: ModifierOption) => (
             <Chip
               key={m.key}
               c={c}
               label={m.label}
               selected={selectedMods.has(m.key)}
-              isLora={m.loraVersionId != null}
               onToggle={() => toggleMod(m.key)}
             />
           ))}
+        </div>
+
+        {resourceColumns.length > 0 && (
+          <>
+            <p style={{ ...noteStyle(c), margin: '12px 0 6px', fontWeight: 600 }} id="gm-lora-columns-label">
+              LoRA columns
+            </p>
+            <div
+              style={resourceAxisGrid}
+              aria-labelledby="gm-lora-columns-label"
+              data-testid="gm-lora-axis"
+            >
+              {resourceColumns.map(({ mod, resource }) => (
+                <ResourceCard
+                  key={mod.key}
+                  variant="row"
+                  interactive
+                  resource={resource}
+                  selected={selectedMods.has(mod.key)}
+                  onSelect={() => toggleMod(mod.key)}
+                  data-testid={`gm-lora-col-${mod.key}`}
+                />
+              ))}
+            </div>
+          </>
+        )}
+
+        <div style={{ ...chipRow, marginTop: 12 }}>
           <button
             type="button"
             onClick={onBrowseLora}
@@ -2011,9 +2095,9 @@ export function BuildPanel(props: {
           </button>
         </div>
         <p style={{ ...noteStyle(c), marginTop: 8 }}>
-          <LoraGlyph c={c} /> = a LoRA column (generates as an extra resource on the checkpoint,
-          and may cost a little more). Civitai checks each LoRA × checkpoint pairing — an
-          incompatible one shows as <em>incompatible</em> and costs nothing.
+          A <strong>LoRA column</strong> generates as an extra resource on the checkpoint, and may
+          cost a little more. Civitai checks each LoRA × checkpoint pairing — an incompatible one
+          shows as <em>incompatible</em> and costs nothing.
         </p>
         {loraModifiers.length > 0 && (
           <div style={{ display: 'grid', gap: 10, marginTop: 12 }} data-testid="gm-lora-strengths">
@@ -3009,18 +3093,30 @@ function CellBox({
   );
 }
 
+/**
+ * A style-column toggle pill.
+ *
+ * 🔴 NO `isLora` PROP ANY MORE, AND ITS REMOVAL IS PART OF THE SAME CHANGE that
+ * split the column axis. The flag drew an 11px two-square glyph and a faint
+ * accent tint to mark which pills in a mixed row were LoRA RESOURCES rather than
+ * prompt styles — a marker so small the fieldset carried a sentence of prose
+ * explaining it. LoRA columns now render as `ResourceCard`s in their own
+ * labelled group, so the kinds are told apart by SHAPE and the glyph has nothing
+ * left to disambiguate.
+ *
+ * It is deleted rather than left optional on purpose: an unused optional prop is
+ * an inert config key, and the next person to pass `isLora` would get a marker
+ * that no longer distinguishes anything, in a row where every pill is a style.
+ */
 export function Chip({
   c,
   label,
   selected,
-  isLora = false,
   onToggle,
 }: {
   c: Palette;
   label: string;
   selected: boolean;
-  /** LoRA columns read differently (cost, can be server-blocked) — mark them. */
-  isLora?: boolean;
   onToggle: () => void;
 }) {
   return (
@@ -3033,60 +3129,18 @@ export function Chip({
         display: 'inline-flex',
         alignItems: 'center',
         gap: 6,
-        padding: isLora ? '6px 12px 6px 9px' : '6px 12px',
+        padding: '6px 12px',
         borderRadius: 999,
         border: `1px solid ${selected ? c.accent : c.border}`,
-        // A faint accent left-tint marks LoRA chips when unselected; selected
-        // chips already read as accent so the marker rides on the glyph.
-        background: selected ? c.accent : isLora ? c.accentTint : 'transparent',
+        background: selected ? c.accent : 'transparent',
         color: selected ? c.accentFg : c.fg,
         fontSize: 13,
         fontWeight: 600,
         cursor: 'pointer',
       }}
     >
-      {isLora && <LoraGlyph c={c} on={selected} />}
       {label}
     </button>
-  );
-}
-
-/**
- * The small "this is a LoRA" marker — a layered-square resource glyph. Inherits
- * the accent (or accentFg on a selected chip) so it reads in both themes
- * without a paragraph of explanation (S2.2).
- */
-function LoraGlyph({ c, on = false }: { c: Palette; on?: boolean }) {
-  return (
-    <svg
-      width={11}
-      height={11}
-      viewBox="0 0 12 12"
-      aria-hidden
-      focusable="false"
-      style={{ flex: 'none', verticalAlign: '-1px' }}
-    >
-      <rect
-        x={1}
-        y={3}
-        width={7}
-        height={7}
-        rx={1.5}
-        fill="none"
-        stroke={on ? c.accentFg : c.accent}
-        strokeWidth={1.4}
-      />
-      <rect
-        x={4}
-        y={1}
-        width={7}
-        height={7}
-        rx={1.5}
-        fill="none"
-        stroke={on ? c.accentFg : c.accent}
-        strokeWidth={1.4}
-      />
-    </svg>
   );
 }
 
@@ -3367,6 +3421,21 @@ function fieldsetStyle(c: Palette): React.CSSProperties {
 
 const legendStyle: React.CSSProperties = { fontSize: 13, fontWeight: 700, padding: '0 6px' };
 const chipRow: React.CSSProperties = { display: 'flex', flexWrap: 'wrap', gap: 8 };
+
+/**
+ * The layout for an axis rendered as `ResourceCard`s rather than pills.
+ *
+ * `auto-fill` with a `minmax` floor, NOT a flex wrap: a row card is a real box
+ * with a thumbnail slot, and letting flex size it to content makes two cards of
+ * different name lengths different heights on the same line. The 220px floor is
+ * the width at which "Pony Diffusion V6 XL" stops truncating on the smallest
+ * viewport this block is embedded at.
+ */
+const resourceAxisGrid: React.CSSProperties = {
+  display: 'grid',
+  gridTemplateColumns: 'repeat(auto-fill, minmax(220px, 1fr))',
+  gap: 8,
+};
 
 function summaryBox(c: Palette): React.CSSProperties {
   return {

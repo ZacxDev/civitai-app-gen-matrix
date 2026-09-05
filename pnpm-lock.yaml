@@ -12,8 +12,8 @@ importers:
         specifier: ^0.37.0
         version: 0.37.0
       '@civitai/blocks-react':
-        specifier: ^0.46.0
-        version: 0.46.0(@civitai/app-sdk@0.37.0)(react@19.2.7)
+        specifier: ^0.47.0
+        version: 0.47.0(@civitai/app-sdk@0.37.0)(react@19.2.7)
       '@civitai/components':
         specifier: ^0.4.1
         version: 0.4.1
@@ -108,8 +108,8 @@ packages:
     resolution: {integrity: sha512-x0uulFdoI3amgny9TVoFZ/77okRj7pX2gBC7f/SA3VX+JzKV1IuBLlhfwyV2JH8Rh/0FRNSyRV+eVJmAHeQgyQ==}
     engines: {node: '>=20'}
 
-  '@civitai/blocks-react@0.46.0':
-    resolution: {integrity: sha512-Z1yUGC0RfdukoQ1RVciff4vUog6gls8Csr7rHGAN63S/a8NI3XxWEkX1udFs6n7ROXEO+Y1XMrO47wm0/8k8Qw==}
+  '@civitai/blocks-react@0.47.0':
+    resolution: {integrity: sha512-aeCdSsuWMm6fUpvxxzSdsVYYPT+AyW7O/qK/F5hodRY31g30mYmTQnNJiNph21HoZ4hSCsQRUFumjbn02zx5aw==}
     engines: {node: '>=20'}
     peerDependencies:
       '@civitai/app-sdk': '>=0.29.0 <1.0.0'
@@ -1037,7 +1037,7 @@ snapshots:
 
   '@civitai/app-sdk@0.37.0': {}
 
-  '@civitai/blocks-react@0.46.0(@civitai/app-sdk@0.37.0)(react@19.2.7)':
+  '@civitai/blocks-react@0.47.0(@civitai/app-sdk@0.37.0)(react@19.2.7)':
     dependencies:
       '@civitai/app-sdk': 0.37.0
       '@civitai/components': 0.4.1
