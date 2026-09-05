@@ -4,10 +4,14 @@ import {
   ACTIVE_RUN_POINTER_KEY,
   HISTORY_LIST_CAP,
   HISTORY_PREFIX,
+  HISTORY_RETENTION_CAP,
+  evictBeyondRetention,
   historyAgeLabel,
   historyKeyFor,
+  historyKeyTimeMs,
   loadHistory,
   migrateLegacyRun,
+  mintHistoryKey,
   type HistoryStorage,
 } from './history.js';
 import { RUN_STORAGE_KEY } from './persistence.js';
@@ -41,23 +45,31 @@ function stubStorage(
       delete rows[key];
       return { ok: true, deleted: true };
     },
-    async list({ prefix = '', limit = 100 } = {}) {
+    // 🔴 MODELS THE HOST'S QUERY EXACTLY, AND THAT IS THE POINT OF THE STUB.
+    // civitai's `apps.router` runs `… AND key > $cursor ORDER BY key LIMIT $n`,
+    // so the ORDER decides which rows exist before the client sees anything and
+    // the LIMIT is applied by the database, not by us. A stub that sliced after
+    // sorting descending — i.e. one that quietly "helped" — would make every
+    // ordering bug below untestable, because the wrong dozen would never be the
+    // dozen returned.
+    async list({ prefix = '', limit = 100, cursor } = {}) {
       if (opts.listRejects) throw new Error('FORBIDDEN');
-      const keys = Object.keys(rows)
+      const all = Object.keys(rows)
         .filter((k) => k.startsWith(prefix))
-        .sort()
-        .slice(0, limit)
-        .map((key) => ({ key, updatedAt: new Date(keyTime(key)) }));
-      return { keys };
+        .sort();
+      const start = cursor ? all.findIndex((k) => k > cursor) : 0;
+      const page = (start < 0 ? [] : all.slice(start)).slice(0, limit);
+      const keys = page.map((key) => ({ key, updatedAt: new Date(keyTime(key)) }));
+      const last = page[page.length - 1];
+      const hasMore = last !== undefined && all.indexOf(last) < all.length - 1;
+      return hasMore ? { keys, nextCursor: last } : { keys };
     },
   };
 }
 
 /** Recover the ms a history key encodes, so the stub can stamp `updatedAt`. */
 function keyTime(key: string): number {
-  const iso = key.slice(HISTORY_PREFIX.length);
-  const t = Date.parse(iso);
-  return Number.isFinite(t) ? t : 0;
+  return historyKeyTimeMs(key) ?? 0;
 }
 
 /** N history rows, oldest first, one minute apart. */
@@ -125,6 +137,66 @@ describe('loadHistory', () => {
     expect(load.entries).toHaveLength(HISTORY_LIST_CAP);
   });
 
+  it('🔴 returns the NEWEST runs, not the oldest, when far more exist than the cap', async () => {
+    // 🔴 THE PANEL SHOWED THE VIEWER'S OLDEST MATRICES WHILE SAYING THEY WERE
+    // THE NEWEST. The host applies its LIMIT after `ORDER BY key` and before the
+    // client sees anything, so `limit: CAP + 1` returns whichever rows the KEY
+    // order puts first — under the old ISO-8601 key that was the CAP+1 OLDEST,
+    // and no client-side sort can recover rows that were never sent. Measured
+    // with 30 seeded runs, clicking the TOP row opened run 0.
+    //
+    // 30 is deliberately far more than CAP+1, so the returned set and the
+    // correct set are DISJOINT: a mutant that merely reverses the client sort
+    // still returns twelve wrong rows and cannot pass by accident.
+    const total = 30;
+    const start = Date.UTC(2026, 0, 1);
+    const load = await loadHistory(stubStorage(seedRuns(total, start)));
+    if (load.kind !== 'ok') throw new Error('unreachable');
+
+    const expected = Array.from({ length: HISTORY_LIST_CAP }, (_, i) =>
+      historyKeyFor(start + (total - 1 - i) * 60_000),
+    );
+    expect(load.entries.map((e) => e.key)).toEqual(expected);
+    // Named separately because it is the click the audit actually made: the top
+    // row must be the most recent matrix, not the first one ever generated.
+    expect(load.entries[0].updatedAt.getTime()).toBe(start + (total - 1) * 60_000);
+    expect(load.truncated).toBe(true);
+  });
+
+  it('orders the page by KEY even when the host hands it back unordered', async () => {
+    // The key is the column the host selected on, so it is the only order that
+    // agrees with the selection. `updatedAt` moves on any later write — under an
+    // `updatedAt` sort, merely re-saving an old run would float it to the top of
+    // a page it does not belong at the top of.
+    //
+    // 🔴 THE STUB DELIBERATELY SCRAMBLES THE PAGE, because the real host's
+    // guarantee is what makes the client sort look redundant — and a defensive
+    // sort that is never exercised is not a guard, it is a comment. Rows come
+    // back REVERSED, with `updatedAt` inverted relative to the keys, so passing
+    // the host's order through and sorting on `updatedAt` both produce the wrong
+    // answer and only sorting on the key produces the right one.
+    const older = historyKeyFor(Date.UTC(2026, 0, 1));
+    const newer = historyKeyFor(Date.UTC(2026, 0, 2));
+    const storage = stubStorage({ [older]: {}, [newer]: {} });
+    const inner = storage.list.bind(storage);
+    storage.list = async (o) => {
+      const res = await inner(o);
+      return {
+        ...res,
+        keys: [...res.keys]
+          .reverse()
+          .map((k) => ({
+            key: k.key,
+            updatedAt: new Date(k.key === newer ? 0 : 9_000_000_000),
+          })),
+      };
+    };
+
+    const load = await loadHistory(storage);
+    if (load.kind !== 'ok') throw new Error('unreachable');
+    expect(load.entries.map((e) => e.key)).toEqual([newer, older]);
+  });
+
   it('distinguishes a FAILED read from an empty one', async () => {
     // 🔴 THE LOAD-BEARING DISTINCTION. `{kind:'error'}` and `{kind:'ok',
     // entries:[]}` must never be the same value, because the UI renders one as
@@ -186,6 +258,25 @@ describe('migrateLegacyRun', () => {
     expect(storage.rows[RUN_STORAGE_KEY]).toEqual(legacy);
   });
 
+  it('🔴 does not mint a DEAD history row from a blob it cannot restore', async () => {
+    // 🔴 THE ROW WOULD BE CLICKABLE AND INERT, FOREVER. The old order was copy,
+    // point, delete, and only then — at `handleOpenHistory`, days later — did
+    // anything try to restore the blob. A manifest that fails validation
+    // therefore became a permanent history entry whose button silently did
+    // nothing, and the original key was already gone, so there was nothing left
+    // to diagnose or recover. Validate first; leave what we cannot read exactly
+    // where it is.
+    const storage = stubStorage({ [RUN_STORAGE_KEY]: { version: 99, cells: 'not-an-array' } });
+    const res = await migrateLegacyRun(storage);
+
+    expect(res).toEqual({ key: null, manifest: null });
+    expect(Object.keys(storage.rows).filter((k) => k.startsWith(HISTORY_PREFIX))).toEqual([]);
+    expect(storage.rows[ACTIVE_RUN_POINTER_KEY]).toBeUndefined();
+    // And it is NOT destroyed: a later version may be able to read it.
+    expect(storage.deleted).not.toContain(RUN_STORAGE_KEY);
+    expect(storage.rows[RUN_STORAGE_KEY]).toBeTruthy();
+  });
+
   it('rescues a legacy run whose savedAt is unusable rather than dropping it', async () => {
     const storage = stubStorage({ [RUN_STORAGE_KEY]: { version: 1, cells: [], savedAt: 'not-a-date' } });
     const res = await migrateLegacyRun(storage);
@@ -213,13 +304,26 @@ describe('historyAgeLabel', () => {
 });
 
 describe('historyKeyFor', () => {
-  it('produces prefixed keys that sort chronologically as strings', () => {
-    // The property `list` relies on: it returns keys in lexical order, so the
-    // key has to encode time in a form where lexical order IS time order.
+  it('🔴 sorts NEWEST-FIRST as a string, because the host pages on key order', () => {
+    // 🔴 THE INVERSION IS THE FIX, NOT A STYLE CHOICE. `list` runs
+    // `ORDER BY key LIMIT n` server-side, so the first n keys in LEXICAL order
+    // are the only rows that ever reach the client. Ascending-chronological keys
+    // therefore hand back the viewer's OLDEST runs; making the key descend by
+    // time turns the host's own scan into a newest-first scan.
     const early = historyKeyFor(Date.UTC(2026, 0, 1));
     const later = historyKeyFor(Date.UTC(2026, 11, 31));
     expect(early.startsWith(HISTORY_PREFIX)).toBe(true);
-    expect(early < later).toBe(true);
+    expect(later < early).toBe(true);
+  });
+
+  it('keeps that order across a digit-count change, because the stamp is padded', () => {
+    // Lexical order only tracks numeric order at a FIXED width — unpadded, the
+    // inverted stamps '999…' and '1000…' compare the wrong way round. These two
+    // times sit either side of a decade boundary in the inverted value.
+    const a = historyKeyFor(9_999_999_999_999 - 999);
+    const b = historyKeyFor(9_999_999_999_999 - 1_000);
+    expect(a < b).toBe(true);
+    expect(a.length).toBe(b.length);
   });
 
   it('is a pure function of the timestamp', () => {
@@ -227,5 +331,101 @@ describe('historyKeyFor', () => {
     expect(historyKeyFor(1_000)).toBe(historyKeyFor(1_000));
     expect(spy).not.toHaveBeenCalled();
     spy.mockRestore();
+  });
+
+  it('round-trips through historyKeyTimeMs, and rejects a foreign key', () => {
+    const at = Date.UTC(2026, 6, 4, 13, 45, 12, 345);
+    expect(historyKeyTimeMs(historyKeyFor(at))).toBe(at);
+    expect(historyKeyTimeMs(mintHistoryKey(at, () => 0.5))).toBe(at);
+    expect(historyKeyTimeMs(ACTIVE_RUN_POINTER_KEY)).toBeNull();
+    expect(historyKeyTimeMs(`${HISTORY_PREFIX}not-a-stamp`)).toBeNull();
+  });
+});
+
+describe('mintHistoryKey', () => {
+  it('🔴 is UNIQUE for two runs begun in the same millisecond', () => {
+    // A collision here does not fail loudly: the second run's manifest simply
+    // OVERWRITES the first one's row, and a matrix the viewer paid for vanishes
+    // from their history with nothing on screen to indicate it. The deterministic
+    // `historyKeyFor` cannot provide this — it is a pure function of the ms — so
+    // a new run must not be keyed with it.
+    const at = 1_700_000_000_000;
+    const seq = [0.1, 0.9];
+    let i = 0;
+    const a = mintHistoryKey(at, () => seq[i++]);
+    const b = mintHistoryKey(at, () => seq[i++]);
+    expect(a).not.toBe(b);
+    expect(historyKeyFor(at)).toBe(historyKeyFor(at)); // the contrast, stated
+  });
+
+  it('still sorts newest-first across different milliseconds', () => {
+    // The discriminator must not disturb the ordering it is appended to.
+    const older = mintHistoryKey(1_000, () => 0.999);
+    const newer = mintHistoryKey(2_000, () => 0.001);
+    expect(newer < older).toBe(true);
+  });
+});
+
+describe('evictBeyondRetention', () => {
+  it('🔴 deletes the OLDEST rows past the retention cap and keeps the rest', async () => {
+    // 🔴 THE QUOTA IS PER APP, NOT PER VIEWER. Every run minted a permanent row
+    // and nothing ever deleted one, so a heavy user's rows could cross the 50 MB
+    // app budget and make `set` reject — into a `.catch(() => undefined)` — for
+    // EVERY viewer, with nothing on screen saying persistence had stopped.
+    const start = Date.UTC(2026, 0, 1);
+    const total = HISTORY_RETENTION_CAP + 7;
+    const storage = stubStorage(seedRuns(total, start));
+
+    const deleted = await evictBeyondRetention(storage);
+
+    expect(deleted).toHaveLength(7);
+    // The seven OLDEST, named exactly — a mutant that trimmed from the other end
+    // would also delete seven rows, and would delete the newest matrices.
+    const oldest = Array.from({ length: 7 }, (_, i) => historyKeyFor(start + i * 60_000));
+    expect(new Set(deleted)).toEqual(new Set(oldest));
+    for (const key of oldest) expect(storage.rows[key]).toBeUndefined();
+    // And the newest survivor is untouched.
+    expect(storage.rows[historyKeyFor(start + (total - 1) * 60_000)]).toBeTruthy();
+    expect(Object.keys(storage.rows)).toHaveLength(HISTORY_RETENTION_CAP);
+  });
+
+  it('deletes nothing when the viewer is under the cap', async () => {
+    const storage = stubStorage(seedRuns(HISTORY_RETENTION_CAP));
+    expect(await evictBeyondRetention(storage)).toEqual([]);
+    expect(storage.deleted).toEqual([]);
+  });
+
+  it('🔴 never deletes a PROTECTED key, however old it is', async () => {
+    // Eviction walks a list the caller did not build, and the one row that must
+    // survive is the run on screen. The ordering already puts it first — but
+    // that is a property of the key FORMAT, and this argument is the guard that
+    // outlives the format changing again.
+    const start = Date.UTC(2026, 0, 1);
+    const rows = seedRuns(HISTORY_RETENTION_CAP + 3, start);
+    const oldest = historyKeyFor(start);
+    const storage = stubStorage(rows);
+
+    const deleted = await evictBeyondRetention(storage, HISTORY_RETENTION_CAP, [oldest, null]);
+
+    expect(deleted).not.toContain(oldest);
+    expect(storage.rows[oldest]).toBeTruthy();
+    expect(deleted).toHaveLength(2);
+  });
+
+  it('pages past the list limit rather than stopping at the first page', async () => {
+    // The eviction page size is smaller than a pathological history, so a
+    // single-page implementation would silently stop trimming exactly when the
+    // trimming matters most.
+    const start = Date.UTC(2026, 0, 1);
+    const total = 150;
+    const storage = stubStorage(seedRuns(total, start));
+    const deleted = await evictBeyondRetention(storage);
+    expect(deleted).toHaveLength(total - HISTORY_RETENTION_CAP);
+    expect(Object.keys(storage.rows)).toHaveLength(HISTORY_RETENTION_CAP);
+  });
+
+  it('is best-effort: a rejected list evicts nothing and does not throw', async () => {
+    const storage = stubStorage(seedRuns(HISTORY_RETENTION_CAP + 3), { listRejects: true });
+    await expect(evictBeyondRetention(storage)).resolves.toEqual([]);
   });
 });

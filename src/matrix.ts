@@ -86,6 +86,20 @@ export function sharedPromptFromCell(cell: Pick<MatrixCell, 'prompt' | 'modifier
   if (suffix.length === 0) return effective;
   // Shared prompt was empty → compose emitted the bare suffix.
   if (effective === suffix) return '';
+  // 🔴 AT THE CLAMP, THE ANSWER IS GENUINELY AMBIGUOUS — SAY SO.
+  // `clampPrompt` truncates to `PROMPT_MAX`, so an effective prompt sitting
+  // exactly on that bound has two readings that BOTH round-trip through
+  // `composeCellPrompt` to the same string: the shared prompt was `effective`
+  // minus the tail (composed to exactly the cap, nothing lost), or the shared
+  // prompt WAS `effective` and its own trailing text merely looks like the
+  // suffix, the appended one having been clamped away. Measured: a 1495-char
+  // prompt ending `, oil` with the suffix `oil` came back shortened by those
+  // five characters and was presented as "Prompt:" — a string the viewer never
+  // typed, offered with no hint it had been altered. Nothing downstream can
+  // distinguish the two readings either, so this returns `null` (rendered as no
+  // prompt line at all) rather than pick one. `sharedPromptFromCells` then falls
+  // through to a cell that CAN answer — a baseline column always can.
+  if (effective.length >= PROMPT_MAX) return null;
   const tail = `, ${suffix}`;
   if (effective.endsWith(tail)) return effective.slice(0, -tail.length);
   // Truncated by the length clamp, or otherwise not the string compose would
@@ -621,21 +635,41 @@ export function elapsedLabel(
 /**
  * The elapsed label for a run in a given phase — the ONLY form the UI calls.
  *
- * 🔴 THE `!running && finishedAt == null` BRANCH IS THE RESTORED-RUN GUARD, and
- * without it the feature is actively misleading. `runElapsedMs` treats a missing
- * `finishedAt` as "still going" and measures to NOW, which is right for a live
- * run and catastrophic for a finished one: reopen a matrix generated last
- * Tuesday and the header would claim it took six days. A run that is over but
- * never recorded its end has an UNKNOWN duration, and unknown must render as
- * nothing at all — the same rule `runElapsedMs` applies to a missing start.
+ * 🔴 A DURATION MEASURED TO *NOW* IS ONLY HONEST FOR A RUN THIS SESSION WATCHED
+ * START. `runElapsedMs` treats a missing `finishedAt` as "still going" and
+ * measures to now. That is right for a live run and a fabrication for every
+ * other case, and there are TWO of them, not one:
+ *
+ *  - the run is over but never recorded its end (`running === false`). Reopen a
+ *    matrix from last Tuesday and the header claims it took six days.
+ *  - the run is RESTORED and still reports `running`. Any run interrupted
+ *    mid-flight persists with a re-pollable cell, so `restoreStateFromManifest`
+ *    rebuilds it as `running` and the clock measures from a start weeks in the
+ *    past. Measured on a reopened matrix: `5927h 42m` — about 247 days — ticking
+ *    up once a second. The earlier `!running && finishedAt == null` guard could
+ *    not see this at all, because the phase it keys on is exactly the one this
+ *    case reports.
+ *
+ * So a duration is rendered only when it is either RECORDED (`finishedAt` is
+ * present, so the arithmetic uses two stamps we own) or WITNESSED (this session
+ * started the run, so "now" is a stamp we own too). Anything else is unknown,
+ * and unknown renders as nothing at all — the same rule `runElapsedMs` applies
+ * to a missing start.
+ *
+ * `startedThisSession` defaults to FALSE so a caller that forgets it omits the
+ * label rather than fabricating one.
  */
 export function runElapsedLabel(
   timing: { startedAt?: number | null; finishedAt?: number | null },
   running: boolean,
   nowMs: number,
+  opts: { startedThisSession?: boolean } = {},
 ): string | null {
   if (timing.startedAt == null) return null;
-  if (!running && timing.finishedAt == null) return null;
+  // A recorded end is exact whatever the phase says.
+  if (timing.finishedAt != null) return elapsedLabel(timing.startedAt, timing.finishedAt, nowMs);
+  if (!running) return null;
+  if (!opts.startedThisSession) return null;
   return elapsedLabel(timing.startedAt, timing.finishedAt, nowMs);
 }
 

@@ -3,7 +3,12 @@ import userEvent from '@testing-library/user-event';
 import { describe, expect, it, vi } from 'vitest';
 
 import { HistoryPanel, ResultGrid, Lightbox } from './App.js';
-import { HISTORY_LIST_CAP, historyKeyFor, type HistoryLoad } from './history.js';
+import {
+  HISTORY_LIST_CAP,
+  HISTORY_RETENTION_CAP,
+  historyKeyFor,
+  type HistoryLoad,
+} from './history.js';
 import { buildMatrix, type MatrixCell } from './matrix.js';
 import { palette } from './theme.js';
 import type { CheckpointOption, ModifierOption } from './models.js';
@@ -89,6 +94,22 @@ describe('HistoryPanel', () => {
     expect(note.textContent).toContain(String(HISTORY_LIST_CAP));
     expect(note.textContent).toMatch(/most recent/i);
   });
+
+  it('🔴 also discloses that older matrices are DELETED, not merely hidden', () => {
+    // 🔴 TWO DIFFERENT TRUNCATIONS, AND ONLY ONE WAS DISCLOSED. "Showing your 12
+    // most recent" describes the LIST. It does not describe storage, which now
+    // keeps `HISTORY_RETENTION_CAP` runs and evicts the rest — because the quota
+    // is per APP and unbounded rows silently disable persistence for every
+    // viewer. Saying only the first leaves someone believing their 30th matrix
+    // is still behind this list somewhere. It is not.
+    const rows = entries(HISTORY_LIST_CAP);
+    render(
+      <HistoryPanel c={c} load={{ kind: 'ok', entries: rows, truncated: true }} now={NOW} onOpen={vi.fn()} />,
+    );
+    const note = screen.getByTestId('gm-history-truncated');
+    expect(note.textContent).toContain(String(HISTORY_RETENTION_CAP));
+    expect(note.textContent).toMatch(/we keep your last/i);
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -173,6 +194,30 @@ describe('the results header names the prompt and the elapsed time', () => {
     const failed = built.map((cell, i) => (i === 0 ? { ...cell, status: 'failed' as const } : cell));
     grid({ cells: failed, canRetry: true, readOnly: false });
     expect(screen.getByTestId('gm-retry')).toBeInTheDocument();
+  });
+
+  it('🔴 withholds Re-check on a reopened matrix, so it cannot re-enter a live run', () => {
+    // 🔴 THE LAST DOOR BACK INTO THE WEDGE. `RECHECK_TIMEDOUT` puts the WHOLE
+    // run back into `phase: 'running'` — which is precisely the state a reopened
+    // matrix is forced out of, and which brings back the screen whose only
+    // control is Stop. Reopening is viewing an archive; nothing on it may start
+    // a run again.
+    const timedout = built.map((cell, i) =>
+      i === 0 ? { ...cell, status: 'timedout' as const, workflowId: 'wf_0' } : cell,
+    );
+    grid({ cells: timedout, readOnly: true });
+    expect(screen.queryByTestId('gm-recheck')).toBeNull();
+  });
+
+  it('still offers Re-check on a live run, where recovery is the point', () => {
+    // The affordance is genuinely useful in-session: it re-polls the SAME
+    // workflow, so it never re-submits and never re-charges. Withholding it
+    // everywhere would trade one defect for a lost recovery path.
+    const timedout = built.map((cell, i) =>
+      i === 0 ? { ...cell, status: 'timedout' as const, workflowId: 'wf_0' } : cell,
+    );
+    grid({ cells: timedout, readOnly: false });
+    expect(screen.getByTestId('gm-recheck')).toBeInTheDocument();
   });
 });
 

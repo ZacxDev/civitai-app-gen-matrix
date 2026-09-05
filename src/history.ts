@@ -18,7 +18,7 @@
 // version carrying it. Read `loadHistory`'s error branch as the state this app
 // is genuinely in on merge — not as a hypothetical.
 
-import { RUN_STORAGE_KEY, type RunManifest } from './persistence.js';
+import { RUN_STORAGE_KEY, restoreStateFromManifest, type RunManifest } from './persistence.js';
 
 /**
  * The prefix every persisted run lives under. `v2` marks the KEYSPACE change
@@ -43,6 +43,24 @@ export const ACTIVE_RUN_POINTER_KEY = 'gen-matrix:active:v1';
  * applied in one spot and disclosed from another drifts.
  */
 export const HISTORY_LIST_CAP = 12;
+
+/**
+ * How many runs are KEPT in storage. Everything older is evicted.
+ *
+ * 🔴 THE QUOTA IS PER APP, NOT PER VIEWER. The host bills every viewer's rows
+ * against one 50 MB budget keyed on `app_block_id`, and a `set` over that cap
+ * REJECTS — into a `.catch(() => undefined)`, because a failed save must never
+ * interrupt a run someone is paying for. Unbounded growth therefore does not
+ * degrade the heavy user who caused it; it silently turns persistence off for
+ * EVERY viewer, and nothing on screen says so. A single-slot design could not
+ * do that, so keeping every run forever is a shared-fate failure this feature
+ * introduced and has to close.
+ *
+ * Deliberately larger than `HISTORY_LIST_CAP`: the panel shows 12, storage
+ * keeps 24, so the "showing your 12 most recent" disclosure stays true and a
+ * viewer who raises the cap later still has the rows.
+ */
+export const HISTORY_RETENTION_CAP = 24;
 
 /** One row of the history index. Values are not fetched — `key` reopens it. */
 export interface HistoryEntry {
@@ -81,16 +99,80 @@ export interface HistoryStorage {
 }
 
 /**
- * The storage key for a run saved at `savedAtMs`.
+ * Digits in a key's timestamp field. 13 covers every millisecond value from the
+ * epoch to the year 2286, which is every timestamp this app can ever mint.
+ */
+const KEY_STAMP_DIGITS = 13;
+/** The value a stamp is subtracted FROM, so bigger times give smaller strings. */
+const KEY_STAMP_MAX = 10 ** KEY_STAMP_DIGITS - 1;
+
+/**
+ * A run's timestamp, encoded so that LEXICALLY SMALLEST = MOST RECENT.
  *
- * DERIVED FROM THE TIMESTAMP, not from a counter or a random id, for two
- * reasons: an ISO-8601 UTC string sorts lexically in chronological order (which
- * is how `list` returns it), and deriving it makes the legacy migration
- * IDEMPOTENT — re-running it writes the same key rather than minting a second
- * copy of the same run on every mount.
+ * 🔴 THE INVERSION IS THE WHOLE FIX, AND IT IS FORCED BY THE HOST'S QUERY.
+ * `storage.list` runs `… AND key > $cursor ORDER BY key LIMIT $limit` — the
+ * LIMIT is applied by the database AFTER the ordering but BEFORE anything the
+ * client can do, so whatever `ORDER BY key ASC` puts first is what comes back
+ * and nothing else exists to sort. Under the previous ISO-8601 key that was the
+ * viewer's OLDEST runs: asking for 13 rows returned the thirteen oldest, and
+ * re-sorting them descending on the client could only reorder the wrong dozen.
+ * Measured with 30 seeded runs, clicking the TOP history row opened run 0.
+ *
+ * Inverting the stamp makes the host's own ascending scan a newest-first scan,
+ * so `LIMIT n` returns the n most recent by construction — no paging, and the
+ * "showing your 12 most recent" disclosure becomes true again.
+ *
+ * Zero-padded to a FIXED width, because lexical order only tracks numeric order
+ * when every string is the same length ('999' < '1000' as text).
+ */
+function invertedStamp(savedAtMs: number): string {
+  const ms = Number.isFinite(savedAtMs) ? Math.trunc(savedAtMs) : 0;
+  const clamped = Math.min(Math.max(ms, 0), KEY_STAMP_MAX);
+  return String(KEY_STAMP_MAX - clamped).padStart(KEY_STAMP_DIGITS, '0');
+}
+
+/**
+ * The storage key for a run saved at `savedAtMs` — DETERMINISTIC.
+ *
+ * Derived from the timestamp rather than a counter or a random id so the legacy
+ * migration is IDEMPOTENT: re-running it writes the same key rather than minting
+ * a second copy of the same run on every mount.
+ *
+ * 🔴 Being a pure function of the millisecond, it CANNOT be unique for two runs
+ * minted in the same one. Use `mintHistoryKey` for a NEW run; this form is for
+ * the migration, where determinism is the point and there is exactly one blob.
  */
 export function historyKeyFor(savedAtMs: number): string {
-  return `${HISTORY_PREFIX}${new Date(savedAtMs).toISOString()}`;
+  return `${HISTORY_PREFIX}${invertedStamp(savedAtMs)}`;
+}
+
+/**
+ * A UNIQUE key for a newly-started run.
+ *
+ * `historyKeyFor` plus a random discriminator: two runs begun in the same
+ * millisecond must not collide, because a collision does not fail loudly — the
+ * second run's manifest simply OVERWRITES the first one's row, and a matrix the
+ * viewer paid for disappears from their history with nothing to indicate it.
+ * The discriminator sorts after the stamp, so it never disturbs the ordering
+ * between different milliseconds.
+ */
+export function mintHistoryKey(savedAtMs: number, rand: () => number = Math.random): string {
+  const suffix = Math.floor(rand() * 36 ** 6)
+    .toString(36)
+    .padStart(6, '0');
+  return `${historyKeyFor(savedAtMs)}.${suffix}`;
+}
+
+/**
+ * The millisecond a history key encodes, or `null` when it is not one of ours.
+ * The inverse of `invertedStamp` — exported so the ordering property is
+ * checkable rather than merely asserted in prose.
+ */
+export function historyKeyTimeMs(key: string): number | null {
+  if (!key.startsWith(HISTORY_PREFIX)) return null;
+  const stamp = key.slice(HISTORY_PREFIX.length, HISTORY_PREFIX.length + KEY_STAMP_DIGITS);
+  if (!/^\d+$/.test(stamp) || stamp.length !== KEY_STAMP_DIGITS) return null;
+  return KEY_STAMP_MAX - Number(stamp);
 }
 
 /**
@@ -101,6 +183,14 @@ export function historyKeyFor(savedAtMs: number): string {
  * cannot distinguish "exactly CAP runs" from "hundreds" — a UI built on that
  * would have to either claim truncation it cannot see, or stay silent when it is
  * really hiding rows. Both are dishonest; one extra row settles it.
+ *
+ * 🔴 THE OVER-FETCH ONLY MEANS THAT BECAUSE THE KEY SORTS NEWEST-FIRST. The host
+ * applies its LIMIT after `ORDER BY key` and before the client sees anything, so
+ * the rows it returns are decided entirely by the key's order — see
+ * `invertedStamp`. Sorting here is by KEY for the same reason: the key is the
+ * column the host selected on, so ordering by anything else (an `updatedAt` that
+ * a later write can move) would present a page in an order the selection did not
+ * use, and the top row would stop being the newest of the page.
  */
 export async function loadHistory(storage: HistoryStorage): Promise<HistoryLoad> {
   try {
@@ -109,16 +199,65 @@ export async function loadHistory(storage: HistoryStorage): Promise<HistoryLoad>
       limit: HISTORY_LIST_CAP + 1,
     });
     const all = (res?.keys ?? []).map((k) => ({ key: k.key, updatedAt: k.updatedAt }));
-    // Newest first. `list` sorts ascending by key, and the key embeds the ISO
-    // timestamp, so a plain reverse would do — but sorting on `updatedAt` keeps
-    // the order correct if the host ever returns rows in another order.
-    all.sort((a, b) => timeOf(b.updatedAt) - timeOf(a.updatedAt));
+    all.sort((a, b) => (a.key < b.key ? -1 : a.key > b.key ? 1 : 0));
     const truncated = all.length > HISTORY_LIST_CAP;
     return { kind: 'ok', entries: all.slice(0, HISTORY_LIST_CAP), truncated };
   } catch {
     // No `entries: []` fallback here on purpose — see `HistoryLoad`.
     return { kind: 'error' };
   }
+}
+
+/** How many rows one eviction page asks for. */
+const EVICT_PAGE_SIZE = 64;
+/** A hard bound on eviction paging, so a pathological cursor cannot loop. */
+const EVICT_MAX_PAGES = 8;
+
+/**
+ * Delete every run past `cap`, oldest first. Returns the keys it removed.
+ *
+ * Best-effort in the same sense every other write here is — a viewer whose
+ * scopes are not approved simply evicts nothing. See `HISTORY_RETENTION_CAP`
+ * for why unbounded growth is a shared-fate failure rather than a personal one.
+ *
+ * 🔴 `protect` IS NOT DECORATION. Eviction walks a list the caller did not
+ * build, and the one row that must never be deleted is the run currently on
+ * screen. The key ordering already puts it first (it is the newest), but that is
+ * a property of the key format — an argument the caller controls is the guard
+ * that survives the key format changing again.
+ */
+export async function evictBeyondRetention(
+  storage: HistoryStorage,
+  cap: number = HISTORY_RETENTION_CAP,
+  protect: readonly (string | null | undefined)[] = [],
+): Promise<string[]> {
+  const keep = new Set(protect.filter((k): k is string => typeof k === 'string'));
+  const deleted: string[] = [];
+  try {
+    let cursor: string | undefined;
+    let seen = 0;
+    for (let page = 0; page < EVICT_MAX_PAGES; page += 1) {
+      const res = await storage.list({
+        prefix: HISTORY_PREFIX,
+        limit: EVICT_PAGE_SIZE,
+        cursor,
+      });
+      const keys = res?.keys ?? [];
+      if (keys.length === 0) break;
+      for (const row of keys) {
+        if (seen >= cap && !keep.has(row.key)) {
+          await storage.delete(row.key).catch(() => undefined);
+          deleted.push(row.key);
+        }
+        seen += 1;
+      }
+      cursor = res.nextCursor;
+      if (!cursor) break;
+    }
+  } catch {
+    /* best-effort — a failed eviction must never break the history read */
+  }
+  return deleted;
 }
 
 function timeOf(d: Date | string | number): number {
@@ -157,6 +296,16 @@ export async function migrateLegacyRun(storage: HistoryStorage): Promise<Migrati
     return empty;
   }
   if (legacy == null || typeof legacy !== 'object') return empty;
+
+  // 🔴 VALIDATE BEFORE COPYING, NOT AFTER. A blob that `restoreStateFromManifest`
+  // rejects still copies and deletes perfectly happily — and the result is a
+  // history row the viewer can see and click that does NOTHING, forever, because
+  // `handleOpenHistory` re-runs the same rejected restore and returns. Worse, the
+  // original key is gone by then, so there is nothing left to diagnose. A blob we
+  // cannot restore is left exactly where it is and reported as "nothing
+  // migrated": no dead row, and no destruction of something a later version might
+  // be able to read.
+  if (restoreStateFromManifest(legacy) == null) return empty;
 
   const savedAt = (legacy as { savedAt?: unknown }).savedAt;
   const savedAtMs = typeof savedAt === 'string' ? Date.parse(savedAt) : NaN;

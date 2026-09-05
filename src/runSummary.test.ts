@@ -72,7 +72,35 @@ describe('formatElapsed', () => {
 
 describe('runElapsedLabel — the form the header actually calls', () => {
   it('shows a live duration while the run is in progress', () => {
-    expect(runElapsedLabel({ startedAt: 1_000, finishedAt: null }, true, 13_000)).toBe('12s');
+    // `startedThisSession` is what makes measuring to NOW honest — this session
+    // watched the clock start, so both ends of the arithmetic are stamps we own.
+    expect(
+      runElapsedLabel({ startedAt: 1_000, finishedAt: null }, true, 13_000, {
+        startedThisSession: true,
+      }),
+    ).toBe('12s');
+  });
+
+  it('🔴 shows NOTHING for a RESTORED run that still reports `running`', () => {
+    // 🔴 THE 247-DAY CLOCK. Any run interrupted mid-flight persists with a
+    // re-pollable cell, so it rebuilds as `phase: 'running'` — and the old guard
+    // (`!running && finishedAt == null`) keys on exactly the phase this case
+    // reports, so it could not see it at all. The header then measured from a
+    // `startedAt` read out of storage to now: a measured `5927h 42m`, ticking up
+    // once a second, on a matrix that finished weeks earlier.
+    //
+    // `startedThisSession` defaults to false, so the same call that used to
+    // fabricate a duration now omits one.
+    const aWeek = 7 * 86_400_000;
+    expect(runElapsedLabel({ startedAt: 1_000, finishedAt: null }, true, 1_000 + aWeek)).toBeNull();
+  });
+
+  it('still shows a RECORDED duration on a restored run, whatever its phase says', () => {
+    // The witness rule must not swallow the case where both stamps are on the
+    // manifest — that arithmetic never touches `now` and is exact.
+    expect(
+      runElapsedLabel({ startedAt: 1_000, finishedAt: 13_000 }, true, 9_999_999_999),
+    ).toBe('12s');
   });
 
   it('shows the final duration once the run is done', () => {
@@ -128,6 +156,25 @@ describe('sharedPromptFromCell — the inverse of composeCellPrompt', () => {
     const long = 'x'.repeat(PROMPT_MAX);
     const cell = { prompt: composeCellPrompt(long, cine), modifier: cine };
     expect(cell.prompt.endsWith('cinematic')).toBe(false);
+    expect(sharedPromptFromCell(cell)).toBeNull();
+  });
+
+  it('🔴 refuses at the clamp, instead of returning a SILENTLY SHORTENED prompt', () => {
+    // 🔴 THE CASE THE `endsWith` CHECK CANNOT SEE. When the shared prompt itself
+    // ends with the suffix AND the composition hit `PROMPT_MAX`, the stored
+    // prompt still ends with `, <suffix>` — so the strip fires and returns the
+    // viewer's own prompt MINUS its last five characters, presented as
+    // "Prompt:" with nothing to say it was altered. Both readings even
+    // round-trip through `composeCellPrompt` to the same string, so no recompose
+    // check can separate them; the answer is genuinely unknown and must be null.
+    const shared = 'x'.repeat(PROMPT_MAX - 5) + ', oil';
+    const oil: ModifierOption = { key: 'oil', label: 'Oil', promptSuffix: 'oil', loraVersionId: null };
+    const cell = { prompt: composeCellPrompt(shared, oil), modifier: oil };
+
+    // The clamp really did bite: the appended suffix is gone, and what remains
+    // ends with the shared prompt's OWN trailing ', oil'.
+    expect(cell.prompt).toBe(shared);
+    expect(cell.prompt.endsWith(', oil')).toBe(true);
     expect(sharedPromptFromCell(cell)).toBeNull();
   });
 

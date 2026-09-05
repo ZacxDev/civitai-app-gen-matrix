@@ -13,6 +13,7 @@ import {
   RUN_MANIFEST_VERSION,
   type AppWorkflowLike,
   appWorkflowStatusToCell,
+  archiveStateFromManifest,
   buildRunManifest,
   isPersistableRun,
   reconcileCells,
@@ -357,6 +358,64 @@ describe('reducer: RESTORE / RECONCILE / RECHECK_TIMEDOUT', () => {
 // ---------------------------------------------------------------------------
 // G1 — shouldBlurResult maturity gate
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// archiveStateFromManifest — reopening from history is VIEWING, not resuming
+// ---------------------------------------------------------------------------
+
+describe('archiveStateFromManifest', () => {
+  const cells = buildMatrix('a lake', ckpts, mods);
+
+  /** A manifest whose run was interrupted mid-flight — the wedge case. */
+  function interruptedManifest() {
+    const inflight = [
+      withStatus(cells[0], 'polling', { workflowId: 'wf_0' }),
+      withStatus(cells[1], 'done', { workflowId: 'wf_1', imageUrl: 'https://i/1.jpg', cost: 7 }),
+      withStatus(cells[2], 'failed', { workflowId: 'wf_2', error: 'boom' }),
+      withStatus(cells[3], 'blocked', { workflowId: null }),
+    ];
+    return buildRunManifest(runningState(inflight));
+  }
+
+  it('🔴 forces a terminal phase, so a reopened matrix can never WEDGE', () => {
+    // 🔴 THE SCREEN THE VIEWER COULD NOT LEAVE. `restoreStateFromManifest`
+    // reports `running` for any run interrupted mid-flight — right on mount,
+    // catastrophic when the run is one you picked out of a list. "New matrix" is
+    // gated on `phase === 'done'`, so it was withheld; Stop was the only control
+    // left, and Stop marks paid cells `canceled` / "no charge".
+    const raw = interruptedManifest();
+    // The contrast is the point: the restore form really does say `running`, so
+    // this is not asserting a difference that was never there.
+    expect(restoreStateFromManifest(raw)?.phase).toBe('running');
+    expect(archiveStateFromManifest(raw)?.phase).toBe('done');
+  });
+
+  it('🔴 lands a still-in-flight cell on `timedout`, never on `canceled`', () => {
+    // The honest terminal state for a cell that WAS submitted: "may still
+    // finish", never re-charged. `canceled` would print "no charge" over a cell
+    // that may well have been billed.
+    const archived = archiveStateFromManifest(interruptedManifest());
+    const byId = new Map(archived!.cells.map((cell) => [cell.id, cell]));
+    expect(byId.get(cells[0].id)?.status).toBe('timedout');
+    expect(byId.get(cells[0].id)?.workflowId).toBe('wf_0');
+  });
+
+  it('leaves every already-terminal cell exactly as it was', () => {
+    // The archive must not rewrite outcomes the viewer paid for.
+    const archived = archiveStateFromManifest(interruptedManifest());
+    const byId = new Map(archived!.cells.map((cell) => [cell.id, cell]));
+    expect(byId.get(cells[1].id)?.status).toBe('done');
+    expect(byId.get(cells[1].id)?.cost).toBe(7);
+    expect(byId.get(cells[2].id)?.status).toBe('failed');
+    expect(byId.get(cells[3].id)?.status).toBe('blocked');
+    expect(archived!.perCellEstimate).toBe(8);
+  });
+
+  it('rejects the same malformed manifests the restore form rejects', () => {
+    expect(archiveStateFromManifest(null)).toBeNull();
+    expect(archiveStateFromManifest({ version: 99, cells: [] })).toBeNull();
+  });
+});
 
 describe('shouldBlurResult (G1 maturity gate)', () => {
   const sfwGate = { isSfw: true, isLevelAllowed: (lvl: number) => lvl <= 1 };

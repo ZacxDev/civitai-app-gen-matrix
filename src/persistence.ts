@@ -215,6 +215,43 @@ export function restoreStateFromManifest(manifest: unknown): MatrixState | null 
   return { phase, cells, perCellEstimate };
 }
 
+/**
+ * Rebuild a manifest as an ARCHIVE — a finished matrix you are looking at, not a
+ * run you are in.
+ *
+ * 🔴 REOPENING FROM HISTORY IS VIEWING, NOT RESUMING, AND CONFLATING THE TWO
+ * WEDGED THE APP. `restoreStateFromManifest` deliberately reports `running` when
+ * any cell is still re-pollable, because on mount that IS the state: the active
+ * run was interrupted and should carry on. Handing the same value to a matrix
+ * picked out of a list produces a screen that is running and cannot be left —
+ * every cell frozen on "Generating…", an elapsed clock measured from a start
+ * weeks ago (a measured `5927h 42m`, ticking up once a second), "New matrix"
+ * withheld because it is gated on `phase === 'done'`, and Stop the only control
+ * on screen, which marks paid cells `canceled` / "no charge".
+ *
+ * So an archive is forced terminal:
+ *  - `phase: 'done'` — the run is over as far as this screen is concerned, which
+ *    restores "New matrix" and withdraws Stop.
+ *  - a still-`polling` cell becomes `timedout`, the app's existing honest
+ *    "submitted, may still finish, never re-charged" state. It is NOT flipped to
+ *    `canceled`: that would say "no charge" about a cell that was submitted and
+ *    may well have been billed.
+ *
+ * Nothing here is written back — see `handleOpenHistory`, which does not point
+ * the active-run pointer at an archive and does not persist it.
+ */
+export function archiveStateFromManifest(manifest: unknown): MatrixState | null {
+  const restored = restoreStateFromManifest(manifest);
+  if (!restored) return null;
+  return {
+    ...restored,
+    phase: 'done',
+    cells: restored.cells.map((cell) =>
+      cell.status === 'polling' ? { ...cell, status: 'timedout' as const } : cell,
+    ),
+  };
+}
+
 function isValidManifest(manifest: unknown): manifest is RunManifest {
   if (typeof manifest !== 'object' || manifest === null) return false;
   const m = manifest as Partial<RunManifest>;

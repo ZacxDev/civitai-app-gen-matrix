@@ -3,13 +3,14 @@ import userEvent from '@testing-library/user-event';
 import type { ReactNode } from 'react';
 import { describe, expect, it } from 'vitest';
 
-import { Harness } from '@civitai/blocks-react/testing';
+import { Harness, createMockHost, resetTransport } from '@civitai/blocks-react/testing';
 import { ToastProvider } from '@civitai/components-react';
 
 import { App } from './App.js';
 import { CHECKPOINTS, MODIFIERS } from './models.js';
 import { buildMatrix, type MatrixCell } from './matrix.js';
 import { RUN_STORAGE_KEY, buildRunManifest } from './persistence.js';
+import { historyKeyFor } from './history.js';
 
 // The block bundles its allowed-parent-origins from env; in the test env the mock
 // host fires from window.location.origin, so allow it via the transport (main.tsx
@@ -26,6 +27,61 @@ function renderApp(harnessProps: Record<string, unknown>): void {
     </ToastProvider>
   );
   render(wrap(<App />));
+}
+
+/**
+ * Mount the app against a mock host the TEST owns, so it can be remounted
+ * against the SAME backing store.
+ *
+ * 🔴 `<Harness>` CANNOT EXPRESS A RELOAD, AND A RELOAD IS THE WHOLE DEFECT.
+ * `Harness` installs a fresh `createMockHost` on mount and tears it down on
+ * unmount, and the KV store is built once from `storage.seed` at CREATION — so
+ * re-rendering it hands the app a brand-new store and every write the first
+ * mount made is gone. A defect whose symptom is "this state does not survive a
+ * reload" is therefore structurally invisible through it: the second mount can
+ * only ever see the seed. Installing the host once and rendering twice against
+ * it is what makes the second mount read what the first mount actually wrote.
+ */
+function mountShared(options: Record<string, unknown>): {
+  remount: () => void;
+  cleanup: () => void;
+} {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const host = createMockHost(options as any);
+  let uninstall: () => void = () => {};
+  let view: ReturnType<typeof render> | null = null;
+
+  // 🔴 The host must be UNINSTALLED and re-installed around a remount.
+  // `install()` is idempotent and dispatches `BLOCK_INIT` exactly once, so a
+  // second `render` against a still-installed host never completes the handshake
+  // and sits on the loading skeleton forever — which reads as "the app failed to
+  // restore" and would make this test lie in the direction of a false PASS if it
+  // were asserting an absence. The KV store is built at `createMockHost` time,
+  // outside `install()`, so it survives the cycle: that is what makes this a
+  // reload rather than a fresh app.
+  const mount = () => {
+    resetTransport();
+    getTransport({ allowedParentOrigins: [window.location.origin] });
+    uninstall = host.install();
+    view = render(
+      <ToastProvider>
+        <App />
+      </ToastProvider>,
+    );
+  };
+
+  mount();
+  return {
+    remount: () => {
+      view?.unmount();
+      uninstall();
+      mount();
+    },
+    cleanup: () => {
+      view?.unmount();
+      uninstall();
+    },
+  };
 }
 
 const viewer = { id: 42, username: 'tester' };
@@ -210,22 +266,49 @@ describe('a restored matrix shows the prompt that produced IT', () => {
     expect(screen.getByTestId('gm-run-prompt').textContent).toContain(restoredPrompt);
   });
 
-  it('migrates the legacy single-slot run instead of stranding it', async () => {
-    // The viewer who was mid-run when this shipped: their matrix lives in the
-    // OLD `gen-matrix:run:v1` key. If the app only ever looked at the new
-    // keyspace they would land on an empty build screen while a run they paid
-    // for sat unreachable in storage.
-    renderApp({
+  it('migrates the legacy single-slot run into a LISTED, REOPENABLE history row', async () => {
+    // 🔴 THIS TEST USED TO ASSERT NOTHING ABOUT MIGRATION. Its body was the M1
+    // restore test verbatim — two images on screen, no build panel — which is
+    // true whether the legacy blob was MIGRATED or merely read in place. It
+    // named the copy, the pointer and the delete and checked none of them.
+    //
+    // What only an App-level test can see is the seam: the legacy blob becoming
+    // a row in the history KEYSPACE that the viewer can find and open again. So
+    // this drives the whole round trip — migrate, clear the screen, find the row
+    // in the list, reopen it, and get the paid images back.
+    const shared = mountShared({
       viewer,
       consentGranted: true,
       storage: { seed: seedDoneRun(RUN_STORAGE_KEY) },
     });
+    try {
+      // Restored: the paid images are on screen and the build panel is gone.
+      await waitFor(() => expect(screen.getAllByTestId('gm-maturity-image')).toHaveLength(2), {
+        timeout: 4000,
+      });
+      expect(screen.queryByLabelText('Shared generation prompt')).toBeNull();
 
-    // Restored: the paid images are on screen and the build panel is gone.
-    await waitFor(() => expect(screen.getAllByTestId('gm-maturity-image')).toHaveLength(2), {
-      timeout: 4000,
-    });
-    expect(screen.queryByLabelText('Shared generation prompt')).toBeNull();
+      // Clear the screen. This deletes the POINTER, never the run — so if the
+      // migration copied the blob into the history keyspace, it is still there.
+      await userEvent.click(screen.getByTestId('gm-newrun'));
+      await userEvent.click(await screen.findByTestId('gm-reset-confirm'));
+      await screen.findByLabelText('Shared generation prompt');
+
+      // Exactly one row: the migrated run, and no duplicate of it.
+      const rows = await screen.findByTestId('gm-history-list');
+      await waitFor(() => expect(screen.getAllByTestId('gm-history-item')).toHaveLength(1));
+      expect(rows).toBeInTheDocument();
+
+      // And it genuinely reopens — a row that lists but cannot be opened would
+      // be exactly the dead-row failure the migration's validation guard exists
+      // to prevent.
+      await userEvent.click(screen.getByTestId('gm-history-open'));
+      await waitFor(() => expect(screen.getAllByTestId('gm-maturity-image')).toHaveLength(2), {
+        timeout: 4000,
+      });
+    } finally {
+      shared.cleanup();
+    }
   });
 
   it('replays the elapsed time the run RECORDED, not one measured from the reload', async () => {
@@ -286,6 +369,112 @@ describe('a restored matrix shows the prompt that produced IT', () => {
     expect(shown).toContain(MODIFIERS[1].promptSuffix);
     // And it is genuinely the per-cell string, not the shared one echoed twice.
     expect(shown.length).toBeGreaterThan(restoredPrompt.length);
+  });
+});
+
+/**
+ * 🔴 REOPENING FROM HISTORY IS *VIEWING*, AND THE APP IS THE ONLY PLACE THAT
+ * DECIDES SO. `archiveStateFromManifest` is verified as a pure function and
+ * `ResultGrid` is verified against a `readOnly` prop, but WHICH restore App
+ * calls, and whether it makes the archive your active run, is decided in App and
+ * nowhere else. Both halves were individually correct while the screen wedged.
+ */
+describe('a matrix reopened from history is an archive, not a run you are in', () => {
+  const archivedPrompt = 'a lighthouse in fog';
+  const ARCHIVE_KEY = historyKeyFor(Date.UTC(2026, 0, 2, 3, 4, 5));
+
+  /** A run interrupted mid-flight: one paid+done cell, one still in flight. */
+  function seedInterruptedRun() {
+    const cells = buildMatrix(archivedPrompt, [CHECKPOINTS[0]], [MODIFIERS[0], MODIFIERS[1]]).map(
+      (cell, i): MatrixCell => ({
+        ...cell,
+        workflowId: `wf_${i}`,
+        status: i === 0 ? 'done' : 'polling',
+        imageUrl: i === 0 ? 'https://img.example/0.jpeg' : null,
+        cost: i === 0 ? 8 : null,
+        nsfwLevel: 1,
+      }),
+    );
+    return {
+      [ARCHIVE_KEY]: buildRunManifest({ phase: 'running', cells, perCellEstimate: 8 }, Date.now, {
+        // A start stamp and NO finish — the shape every interrupted run persists
+        // with, and the one that produced the 247-day clock.
+        startedAt: Date.UTC(2026, 0, 2, 3, 0, 0),
+      }),
+    };
+  }
+
+  it('🔴 opens terminal: no Stop, no fabricated clock, and a way out', async () => {
+    // 🔴 THE SCREEN THE VIEWER COULD NOT LEAVE. Restored with the mount-time
+    // form, this manifest rebuilds as `phase: 'running'` — so "New matrix" was
+    // withheld (it is gated on `phase === 'done'`), the elapsed header measured
+    // from a start weeks old (measured: `5927h 42m`, ticking once a second), and
+    // Stop was the only control left — which marks paid cells `canceled` /
+    // "no charge".
+    const shared = mountShared({
+      viewer,
+      consentGranted: true,
+      storage: { seed: seedInterruptedRun() },
+    });
+    try {
+      await userEvent.click(await screen.findByTestId('gm-history-open'));
+
+      // A way out exists...
+      await waitFor(() => expect(screen.getByTestId('gm-newrun')).toBeInTheDocument(), {
+        timeout: 4000,
+      });
+      // ...Stop is gone, so the only control is no longer one that cancels paid
+      // cells...
+      expect(screen.queryByTestId('gm-stop')).toBeNull();
+      // ...and no duration is claimed for a run whose end was never recorded.
+      expect(screen.queryByTestId('gm-elapsed')).toBeNull();
+      // The archive really is the one we seeded, not an empty shell.
+      expect(screen.getByTestId('gm-run-prompt').textContent).toContain(archivedPrompt);
+    } finally {
+      shared.cleanup();
+    }
+  });
+
+  it('🔴 does not become the ACTIVE run — a reload returns to the build screen', async () => {
+    // 🔴 `readOnly` LIVED ONLY IN REACT STATE, AND THE POINTER OUTLIVED IT.
+    // Opening an archive wrote the active-run pointer at it AND set the persist
+    // key to it, so a reload followed the pointer back into the same matrix with
+    // `viewingHistory` reset to false — `readOnly` undefined, "Retry failed"
+    // rendered, no confirm gate in front of it. One click, real Buzz, on a
+    // matrix the viewer had treated as finished.
+    //
+    // The remount below is a genuine reload against the SAME store, so it sees
+    // what the first mount actually wrote. Either the explicit pointer write or
+    // the persist effect's 250 ms write is enough to fail it.
+    const shared = mountShared({
+      viewer,
+      consentGranted: true,
+      storage: { seed: seedInterruptedRun() },
+    });
+    try {
+      await userEvent.click(await screen.findByTestId('gm-history-open'));
+      // Wait on the run PROMPT, not on "New matrix": the prompt line renders in
+      // every phase, so this test stays keyed on the reload it is about rather
+      // than also failing whenever the terminal-view fix regresses — that is the
+      // sibling test's property, and one mutation reddening both would leave
+      // neither testing its own.
+      await waitFor(() => expect(screen.getByTestId('gm-run-prompt')).toBeInTheDocument(), {
+        timeout: 4000,
+      });
+      // Well past the persist effect's 250 ms debounce, so a write it should not
+      // be making has had every chance to land.
+      await new Promise((resolve) => setTimeout(resolve, 700));
+
+      shared.remount();
+
+      // The build screen, with the archive still listed and still openable —
+      // NOT the archive reopened as if it were the run you were in.
+      expect(await screen.findByLabelText('Shared generation prompt')).toBeInTheDocument();
+      expect(screen.queryByTestId('gm-newrun')).toBeNull();
+      await waitFor(() => expect(screen.getAllByTestId('gm-history-item')).toHaveLength(1));
+    } finally {
+      shared.cleanup();
+    }
   });
 });
 

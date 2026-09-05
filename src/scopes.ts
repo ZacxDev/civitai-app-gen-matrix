@@ -15,14 +15,27 @@
  * other, and cannot be added anywhere without a written reason.
  */
 
+import { BLOCK_SCOPES } from '@civitai/app-sdk/blocks';
+
+/**
+ * 🔴 IMPORTED FROM THE SDK, NOT RE-TYPED. `BLOCK_SCOPES` is the vocabulary the
+ * canonical manifest schema validates against by MEMBERSHIP, and `defineBlock`
+ * gates on it. A second hand-written copy of those strings is the same defect
+ * this change removed from `persistence.ts`'s status list: two lists of one
+ * thing drift in one direction, and here the drift is silent in the worst
+ * possible place — a typo'd scope literal type-checks, ships in the manifest,
+ * and fails at approval or, worse, at the first privileged call, as a FORBIDDEN
+ * the app reports as "storage is unavailable".
+ */
+
 /** Spends the viewer's Buzz, capped by `page.buzzBudgetPerGen`. */
-export const BUDGETED_SCOPE = 'ai:write:budgeted';
+export const BUDGETED_SCOPE = BLOCK_SCOPES.AI_WRITE_BUDGETED;
 
 /** Reads this viewer's own private per-app KV rows (`useAppStorage().get/list`). */
-export const STORAGE_READ_SCOPE = 'apps:storage:read';
+export const STORAGE_READ_SCOPE = BLOCK_SCOPES.APPS_STORAGE_READ;
 
 /** Writes this viewer's own private per-app KV rows (`useAppStorage().set/delete`). */
-export const STORAGE_WRITE_SCOPE = 'apps:storage:write';
+export const STORAGE_WRITE_SCOPE = BLOCK_SCOPES.APPS_STORAGE_WRITE;
 
 /**
  * Every scope the manifest declares, in manifest order.

@@ -74,6 +74,7 @@ import { palette, type Palette } from './theme.js';
 import { paintTheme } from './bootTheme.js';
 import { MaturityImage } from './MaturityImage.js';
 import {
+  archiveStateFromManifest,
   buildRunManifest,
   isPersistableRun,
   reconcileCells,
@@ -85,10 +86,12 @@ import {
 import {
   ACTIVE_RUN_POINTER_KEY,
   HISTORY_LIST_CAP,
+  HISTORY_RETENTION_CAP,
+  evictBeyondRetention,
   historyAgeLabel,
-  historyKeyFor,
   loadHistory,
   migrateLegacyRun,
+  mintHistoryKey,
   type HistoryLoad,
 } from './history.js';
 
@@ -837,19 +840,27 @@ export function App() {
     if (!ready) return;
     let cancelled = false;
     setHistory(null);
-    loadHistory(storage)
-      .then((h) => {
-        if (!cancelled) setHistory(h);
-      })
-      .catch(() => {
+    void (async () => {
+      // Trim the keyspace BEFORE reading it, so the list the viewer sees is the
+      // list that survives. Signed-in only: an anon viewer cannot write, and the
+      // deletes would simply reject. See `HISTORY_RETENTION_CAP` — the quota is
+      // per APP, so one heavy viewer's unbounded rows turn persistence off for
+      // everyone, silently.
+      if (viewer) {
+        await evictBeyondRetention(storage, HISTORY_RETENTION_CAP, [currentRunKeyRef.current]);
+      }
+      if (cancelled) return;
+      const h = await loadHistory(storage).catch(
         // `loadHistory` already maps a rejection to `{kind:'error'}`; this is the
         // belt for anything thrown before it. Never a silent empty list.
-        if (!cancelled) setHistory({ kind: 'error' });
-      });
+        () => ({ kind: 'error' }) as HistoryLoad,
+      );
+      if (!cancelled) setHistory(h);
+    })();
     return () => {
       cancelled = true;
     };
-  }, [ready, storage, historyNonce]);
+  }, [ready, viewer, storage, historyNonce]);
 
   // ---- Release A — stamp the run's finish, once, in the session that ran it ----
   // 🔴 GATED ON `startedThisSessionRef`. Stamping any run that merely LOOKS done
@@ -964,7 +975,10 @@ export function App() {
   // confirmed spends nothing and is not a matrix anyone should find in history.
   const beginRun = useCallback(() => {
     const at = Date.now();
-    currentRunKeyRef.current = historyKeyFor(at);
+    // `mintHistoryKey`, not `historyKeyFor`: two runs begun in the same
+    // millisecond must not share a row, because the collision is silent — the
+    // second manifest overwrites the first and a paid matrix leaves the history.
+    currentRunKeyRef.current = mintHistoryKey(at);
     setRunStartedAt(at);
     setRunFinishedAt(null);
     setNowTick(at);
@@ -1017,25 +1031,45 @@ export function App() {
     dispatch({ type: 'RESET' });
   }, [storage]);
 
-  // Reopen a matrix from history, read-only. Never re-submits and never
-  // re-charges: it only rebuilds a state that was already paid for.
+  // Reopen a matrix from history — VIEWING AN ARCHIVE, not resuming a run.
+  //
+  // 🔴 THE DISTINCTION IS THE FIX FOR THREE DEFECTS AT ONCE, and the reason it
+  // is spelled out here rather than left implicit:
+  //
+  //  - `archiveStateFromManifest`, not `restoreStateFromManifest`. The restore
+  //    form reports `running` for any run interrupted mid-flight, which on this
+  //    screen means: every cell frozen on "Generating…" (nothing re-attaches a
+  //    poll loop here, deliberately), an elapsed clock ticking from a start
+  //    weeks ago, and "New matrix" withheld because it is gated on
+  //    `phase === 'done'` — leaving Stop as the only control, which marks paid
+  //    cells `canceled` / "no charge". The archive form forces a terminal view.
+  //  - THE ACTIVE-RUN POINTER IS NOT MOVED. Pointing it at an archive made
+  //    "which run am I in" a lie that survived a reload: the mount path follows
+  //    the pointer but never sets `viewingHistory`, so after a refresh the same
+  //    archive came back with `readOnly` undefined and "Retry failed" on it —
+  //    one click, no confirm, real Buzz, on a matrix the viewer had treated as
+  //    finished weeks ago.
+  //  - `currentRunKeyRef` IS CLEARED, NOT SET. It is the persist effect's gate,
+  //    and setting it made merely LOOKING at a matrix rewrite its row 250 ms
+  //    later. Rows are labelled and ordered by their write time, so opening a
+  //    three-week-old matrix relabelled it "just now" and moved it to the top of
+  //    the list — a read that edits the thing it read.
   const handleOpenHistory = useCallback(
     async (key: string) => {
       try {
         const raw = await storage.get<unknown>(key);
-        const restored = restoreStateFromManifest(raw);
-        if (!restored) return;
+        const archived = archiveStateFromManifest(raw);
+        if (!archived) return;
         const timing = runTimingFromManifest(raw);
-        currentRunKeyRef.current = key;
+        currentRunKeyRef.current = null;
         startedThisSessionRef.current = false;
         setRunStartedAt(timing.startedAt ?? null);
         setRunFinishedAt(timing.finishedAt ?? null);
         setViewingHistory(true);
-        for (const cell of restored.cells) {
+        for (const cell of archived.cells) {
           if (cell.workflowId != null) submittedRef.current.add(cell.id);
         }
-        dispatch({ type: 'RESTORE', state: restored });
-        storage.set(ACTIVE_RUN_POINTER_KEY, { key }).catch(() => undefined);
+        dispatch({ type: 'RESTORE', state: archived });
       } catch {
         /* best-effort — a failed reopen leaves the build screen as it was */
       }
@@ -1130,10 +1164,13 @@ export function App() {
   // with a prompt they did not run — usually a blank one.
   const runSharedPrompt = sharedPromptFromCells(state.cells);
   // Change 5 — elapsed, from the run's own stamps.
+  // `startedThisSession` is what separates a clock we can vouch for from one
+  // measured against a start we only read out of storage — see runElapsedLabel.
   const runElapsed = runElapsedLabel(
     { startedAt: runStartedAt, finishedAt: runFinishedAt },
     state.phase === 'running',
     nowTick,
+    { startedThisSession: startedThisSessionRef.current },
   );
   // Retry is offered once the run is done and at least one cell is retryable.
   const canRetry =
@@ -1936,10 +1973,18 @@ export function HistoryPanel({
       {/* 🔴 RENDERED ONLY WHEN THE CAP ACTUALLY BINDS. `loadHistory` fetches one
           row beyond the cap purely so this can be true or false honestly; a
           notice that shows unconditionally would tell a viewer with three
-          matrices that some are being withheld. */}
+          matrices that some are being withheld.
+
+          It names the RETENTION cap as well, because the list being shorter than
+          your history and your history being shorter than everything you ever
+          ran are two different truncations. Storage keeps HISTORY_RETENTION_CAP
+          runs and drops the rest (see `evictBeyondRetention`); saying only "12
+          most recent" would leave a viewer believing the 30th matrix is still
+          somewhere behind this list. */}
       {load.truncated && (
         <p style={{ ...noteStyle(c), margin: 0 }} data-testid="gm-history-truncated">
-          Showing your {HISTORY_LIST_CAP} most recent matrices.
+          Showing your {HISTORY_LIST_CAP} most recent matrices. We keep your last{' '}
+          {HISTORY_RETENTION_CAP}.
         </p>
       )}
     </section>
@@ -2107,7 +2152,7 @@ export function ResultGrid(props: {
                           ['--gm-stagger' as string]: `${Math.min(idx, totalCells) * 40}ms`,
                         }}
                       >
-                        <CellView c={c} cell={cell} maturityGate={maturityGate} onRecheck={onRecheck} onEnlarge={onEnlarge} />
+                        <CellView c={c} cell={cell} maturityGate={maturityGate} readOnly={readOnly} onRecheck={onRecheck} onEnlarge={onEnlarge} />
                       </div>
                     </td>
                   );
@@ -2129,6 +2174,36 @@ export function ResultGrid(props: {
  * number — a duplicated literal would let the shell and its guard drift apart.
  */
 export const CELL_CAPTION_HEIGHT = 16;
+
+/**
+ * The class every `Tooltip` INSIDE a cell must carry.
+ *
+ * 🔴 A TOOLTIP WAS SILENTLY SHRINKING THE CELL IT WRAPPED, AND THE SHELL COULD
+ * NOT SEE IT. `CellShell` reserves the caption row so a cell's height is a
+ * function of its WIDTH — the media row is an `aspect-ratio: 1 / 1` square. That
+ * holds only while the square actually gets the column's width. The design-system
+ * `Tooltip` renders its trigger inside an `inline-flex` wrapper, and an
+ * inline-level box shrink-wraps to its content instead of stretching to its
+ * containing block: measured in Chromium at a 136px column, the `blocked` cell's
+ * wrapper came back **86px** wide, so its square was 86px and the whole cell was
+ * **106px tall against every other status's 156px**. The `failed` cell uses the
+ * same Tooltip and happened to measure 136 only because its label's max-content
+ * width already exceeded the column — an accident of copy length, not a
+ * property, which is why this is a shared class rather than a fix at one site.
+ *
+ * The rule lives in `index.css` (`display: block`), which is UNLAYERED and
+ * therefore beats the component library's `@layer civitai.components` regardless
+ * of injection order. `position: relative` survives, so the bubble still anchors
+ * to the wrapper.
+ *
+ * ⚠️ Setting `aspect-ratio` on the inner span does NOT fix this — verified in a
+ * real engine, the height stayed 106. The WIDTH is what is wrong.
+ *
+ * 🔴 NOT TEST-ENFORCED AS A HEIGHT. jsdom performs no layout, so this suite
+ * cannot assert 156 === 156; `cellShell.test.tsx` pins the class and the CSS rule
+ * that produce it, which is the strongest claim this harness supports.
+ */
+export const CELL_TOOLTIP_CLASS = 'gm-cell-tooltip';
 
 /**
  * The one shell every cell renders through, whatever its status.
@@ -2191,16 +2266,19 @@ export function CellView({
   c,
   cell,
   maturityGate,
+  readOnly,
   onRecheck,
   onEnlarge,
 }: {
   c: Palette;
   cell: MatrixCell | undefined;
   maturityGate: MaturityGate;
+  /** True for a matrix reopened from history — see `cellContent`'s timedout arm. */
+  readOnly?: boolean;
   onRecheck: (cell: MatrixCell) => void;
   onEnlarge: (cell: MatrixCell) => void;
 }) {
-  const { body, caption } = cellContent({ c, cell, maturityGate, onRecheck, onEnlarge });
+  const { body, caption } = cellContent({ c, cell, maturityGate, readOnly, onRecheck, onEnlarge });
   return (
     <CellShell c={c} caption={caption}>
       {body}
@@ -2219,12 +2297,14 @@ function cellContent({
   c,
   cell,
   maturityGate,
+  readOnly,
   onRecheck,
   onEnlarge,
 }: {
   c: Palette;
   cell: MatrixCell | undefined;
   maturityGate: MaturityGate;
+  readOnly?: boolean;
   onRecheck: (cell: MatrixCell) => void;
   onEnlarge: (cell: MatrixCell) => void;
 }): { body: React.ReactNode; caption?: React.ReactNode } {
@@ -2236,7 +2316,7 @@ function cellContent({
       const reason = incompatibleCellReason(cell);
       return {
         body: (
-          <Tooltip label={reason}>
+          <Tooltip label={reason} className={CELL_TOOLTIP_CLASS}>
             <span tabIndex={0} data-testid="gm-incompatible-detail" style={{ display: 'block' }}>
               <CellBox c={c} label="Incompatible" sub="no charge" tone="muted" />
             </span>
@@ -2279,10 +2359,14 @@ function cellContent({
       // Polling gave up; the gen may still finish + bill — so it's a muted
       // "still working" state, never a failure and never "no charge". M2: a
       // Re-check re-polls the SAME workflow (no re-submit → no re-charge).
+      // 🔴 NO Re-check ON AN ARCHIVE. `RECHECK_TIMEDOUT` puts the whole run back
+      // into `phase: 'running'`, which is the exact state a reopened matrix is
+      // forced out of — it would restore the Stop-only screen this fix removes.
+      // The label stays; only the re-entry into a live run is withheld.
       return {
         body: (
           <CellBox c={c} label={timedOutCellLabel()} sub="may still finish" tone="muted">
-            <button
+            {!readOnly && <button
               type="button"
               onClick={() => onRecheck(cell)}
               className="gm-chip"
@@ -2300,7 +2384,7 @@ function cellContent({
               }}
             >
               Re-check
-            </button>
+            </button>}
           </CellBox>
         ),
       };
@@ -2311,7 +2395,7 @@ function cellContent({
       const box = <CellBox c={c} label={failedCellLabel()} tone="danger" />;
       return {
         body: detail ? (
-          <Tooltip label={detail}>
+          <Tooltip label={detail} className={CELL_TOOLTIP_CLASS}>
             <span tabIndex={0} data-testid="gm-failed-detail" style={{ display: 'block' }}>
               {box}
             </span>
