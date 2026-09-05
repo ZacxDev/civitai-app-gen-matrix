@@ -83,9 +83,18 @@ export function GalleryPanel(props: GalleryPanelProps) {
           id in public source). So the claim is dropped rather than faked, and
           each row carries the only provenance the app can prove — see
           `provenanceLabel`. */}
+      {/* 🔴 THIS SITS NEXT TO THE PUBLISH PANEL'S "limited to moderators and
+          app-developer testers", AND SIDE BY SIDE THE TWO READ AS A
+          CONTRADICTION unless the reader already knows they describe different
+          mechanisms: CREATING the images through this app is cohort-gated
+          (`assertViewerIsAppDeveloper`), while ADDING a gallery row is not
+          (`resolveSharedContext` deliberately omits that assert). A viewer
+          cannot be expected to infer that, so this says both halves in one
+          breath rather than leaving them to collide. */}
       <p style={{ ...noteStyle(c), margin: 0 }} data-testid="gm-gallery-provenance-note">
-        Matrices published to this app&rsquo;s gallery by Civitai members. Each image is a real,
-        public Civitai image, shown to you under your own browsing settings.
+        Any signed-in Civitai member can add an entry here; creating new images through this app
+        is limited to moderators and app-developer testers. Each image is a real, public Civitai
+        image, shown to you under your own browsing settings.
       </p>
 
       {load == null && (
@@ -237,7 +246,16 @@ function GalleryEntryCard({
         </p>
       )}
 
+      {/* 🔴 THE GRID GETS ITS OWN SCROLL CONTAINER. Up to 12 columns at
+          `minWidth: 90` is ~1080px of table plus headers — far past a narrow
+          embed — and text wrapping does nothing for it, because the width comes
+          from the cells' own minimum, not from a long word. Scrolling the table
+          keeps the overflow inside the card instead of widening the page. */}
       {view != null && !view.allGone && (
+        <div
+          style={{ overflowX: 'auto', maxWidth: '100%' }}
+          data-testid="gm-gallery-grid-scroll"
+        >
         <table style={{ borderCollapse: 'collapse' }} data-testid="gm-gallery-grid">
           <thead>
             <tr>
@@ -291,6 +309,7 @@ function GalleryEntryCard({
             ))}
           </tbody>
         </table>
+        </div>
       )}
 
       <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
@@ -415,8 +434,13 @@ function WithdrawControl({
  * 🔴 Moderated text still comes off the wire as an ARBITRARY string. Length is
  * bounded in `toGalleryEntry`; this bounds the other axis — a single unbroken
  * token (a 300-character "word", a pasted URL) has no break opportunity, so
- * without this it pushes the card wider than the iframe, and nothing else
- * constrains the iframe's width.
+ * without this it pushes the card wider than its container.
+ *
+ * ⚠️ SCOPE, because the earlier wording overclaimed: this governs the TEXT only.
+ * The image grid has its own overflow problem — up to 12 columns at
+ * `minWidth: 90` — and its own answer, the `overflow-x: auto` wrapper around the
+ * table below. Neither is a claim about the iframe's own width, which this block
+ * does not control.
  */
 const WRAP_ANYWHERE: React.CSSProperties = {
   overflowWrap: 'anywhere',

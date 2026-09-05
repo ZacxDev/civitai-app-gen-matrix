@@ -40,7 +40,7 @@
 // state this app is genuinely in on merge — not as a hypothetical — and note
 // that it is deliberately NOT the same value as an empty gallery.
 
-import { MAX_CELLS, type MatrixCell } from './matrix.js';
+import { MAX_CELLS, PROMPT_MAX, type MatrixCell } from './matrix.js';
 import { CHECKPOINTS, MODIFIERS } from './models.js';
 
 /**
@@ -70,11 +70,23 @@ export const GALLERY_LIST_CAP = 12;
  */
 export const MAX_GALLERY_IMAGES = MAX_CELLS;
 
+/**
+ * How many candidate ids one grid coordinate may carry.
+ *
+ * A published matrix writes exactly one, so this only ever binds on a forged or
+ * hand-edited blob — where its job is to stop a single coordinate consuming the
+ * whole `MAX_GALLERY_IMAGES` budget and hiding every other cell.
+ */
+export const MAX_CELL_CANDIDATES = 3;
+
 /** Hard bound on ids in ONE `getImages` call across every listed entry. */
 export const MAX_GATED_IMAGE_IDS = GALLERY_LIST_CAP * MAX_GALLERY_IMAGES;
 
 /** Longest title accepted from the author (the host also enforces its own cap). */
 export const GALLERY_TITLE_MAX = 120;
+
+/** The literal `composeGalleryBody` prefixes a body with. */
+export const BODY_PROMPT_PREFIX = 'Prompt: ';
 
 /**
  * Longest body rendered from a gallery row.
@@ -86,16 +98,32 @@ export const GALLERY_TITLE_MAX = 120;
  * every row this app READS was written by somebody else's client under somebody
  * else's limits. A 5,000-character title is a wall of text in every viewer's
  * gallery. The app applies its own bound to what it renders.
+ *
+ * 🔴 BUT A READ BOUND CHOSEN WITHOUT LOOKING AT THE WRITE BOUND TRUNCATES YOUR
+ * OWN CONTENT, WHICH IS WHAT HAPPENED. This was a flat `600`, picked as "long
+ * enough for a card". The app's own textarea admits `PROMPT_MAX` (1500)
+ * characters and `composeGalleryBody` prefixes them, so an ordinary 700-character
+ * prompt — under half the app's own cap, and entirely legal — produced a
+ * 708-character body that this bound then cut, for every viewer including the
+ * author, with no expand control. It is now DERIVED: exactly the longest body
+ * this app can legally write, so the app's own maximum can never be truncated
+ * while a row from somebody else's client still gets bounded.
  */
-export const GALLERY_BODY_MAX = 600;
+export const GALLERY_BODY_MAX = BODY_PROMPT_PREFIX.length + PROMPT_MAX;
 
 /**
  * Clamp text read back off the wire, marking the cut so the truncation is
  * visible rather than silent.
+ *
+ * 🔴 COUNTS CODE POINTS, NOT UTF-16 CODE UNITS. `String.prototype.slice` cuts
+ * between the halves of a surrogate pair, so a title whose boundary lands inside
+ * an astral emoji renders a lone surrogate (`\uFFFD` in practice). `Array.from`
+ * iterates by code point, so a pair is either wholly kept or wholly dropped.
  */
 export function clampRenderedText(raw: string, max: number): string {
-  if (raw.length <= max) return raw;
-  return `${raw.slice(0, max)}…`;
+  const points = Array.from(raw);
+  if (points.length <= max) return raw;
+  return `${points.slice(0, max).join('')}…`;
 }
 
 /**
@@ -204,6 +232,39 @@ export function buildGalleryData(landed: readonly PublishedCell[]): GalleryData 
 }
 
 /**
+ * Fold newly-landed cells into an existing entry's payload.
+ *
+ * The prior images keep their coordinates, so extending a matrix never moves a
+ * cell that was already published; a coordinate republished (which the per-cell
+ * ledger normally prevents) keeps the ORIGINAL id, because that is the one
+ * viewers may already have voted on and reported.
+ */
+export function mergeGalleryData(
+  existing: GalleryData,
+  landed: readonly PublishedCell[],
+): GalleryData {
+  const fresh = buildGalleryData(landed);
+  const seenIds = new Set(existing.images.map((i) => i.imageId));
+  const rows = new Map(existing.rows.map((r) => [r.row, r]));
+  const cols = new Map(existing.cols.map((col) => [col.col, col]));
+  for (const r of fresh.rows) if (!rows.has(r.row)) rows.set(r.row, r);
+  for (const col of fresh.cols) if (!cols.has(col.col)) cols.set(col.col, col);
+  const images = [...existing.images];
+  for (const image of fresh.images) {
+    if (seenIds.has(image.imageId)) continue;
+    if (images.length >= MAX_GALLERY_IMAGES) break;
+    seenIds.add(image.imageId);
+    images.push(image);
+  }
+  return {
+    v: GALLERY_DATA_VERSION,
+    rows: [...rows.values()].sort((a, b) => a.row - b.row),
+    cols: [...cols.values()].sort((a, b) => a.col - b.col),
+    images,
+  };
+}
+
+/**
  * Read a `data` blob back, or `null` when it is not a matrix this app wrote.
  *
  * 🔴 EVERY FIELD IS UNTRUSTED. The blob is client-written and unmoderated, so
@@ -225,7 +286,7 @@ export function parseGalleryData(raw: unknown): GalleryData | null {
 
   const images: GalleryImageRef[] = [];
   const seenIds = new Set<number>();
-  const seenCells = new Set<string>();
+  const perCell = new Map<string, number>();
   const rawImages = Array.isArray(raw.images) ? raw.images : [];
   for (const entry of rawImages) {
     if (images.length >= MAX_GALLERY_IMAGES) break;
@@ -236,16 +297,21 @@ export function parseGalleryData(raw: unknown): GalleryData | null {
     if (imageId == null || row == null || col == null) continue;
     // A repeated id would ask the host for it twice and paint it twice.
     if (seenIds.has(imageId)) continue;
-    // 🔴 AND A REPEATED CELL LETS A FORGED BLOB STEER WHAT A CELL SAYS. Two
-    // DIFFERENT ids at one `(row, col)` are both accepted by the id check above,
-    // and the renderer takes the FIRST match — so a blob pairing an unresolvable
-    // id with a resolvable one at the same coordinate paints "No longer
-    // available" over an image that is right there. One image per cell, first
-    // wins, decided HERE rather than by the renderer's lookup order.
+    // 🔴 SEVERAL IDS MAY SHARE A COORDINATE, AND DROPPING THE EXTRAS WAS NOT A
+    // DEFENCE. The previous version kept only the FIRST id at each `(row, col)`
+    // and claimed that stopped a forged blob steering what a cell says. It did
+    // not: ordering is attacker-controlled on BOTH sides, so a blob listing an
+    // unresolvable id first still produced "No longer available" — and for a
+    // single-cell entry it was marginally WORSE, because dropping the resolvable
+    // id made the whole entry read as `allGone`. The candidates are kept here and
+    // `resolveEntryImages` prefers the first one the HOST resolved, which is the
+    // half an attacker does not control. Bounded per cell so one coordinate
+    // cannot eat the whole image budget and hide the rest of the grid.
     const cell = `${row}:${col}`;
-    if (seenCells.has(cell)) continue;
+    const seenAtCell = perCell.get(cell) ?? 0;
+    if (seenAtCell >= MAX_CELL_CANDIDATES) continue;
     seenIds.add(imageId);
-    seenCells.add(cell);
+    perCell.set(cell, seenAtCell + 1);
     images.push({ imageId, row, col });
   }
   if (images.length === 0) return null;
@@ -385,39 +451,190 @@ export function publishableCells(cells: readonly MatrixCell[]): PublishableCell[
 }
 
 /**
- * A stable identity for the matrix currently on screen.
- *
- * 🔴 THIS IS WHAT STOPS A SECOND PUBLISH OF THE SAME GRID. A completed publish
- * used to return the button to enabled with the same label and the same title
- * still in the box, so a second click published the identical matrix again —
- * measured: one click gave one gallery row, two clicks gave two, each backed by
- * its own `publish()` call and its own set of REAL, PERMANENT public images.
- * There is no un-publish, so an accidental double-click is not recoverable.
- *
- * Keyed on the cells' identity AND their workflow ids rather than on a boolean,
- * because the control must RE-ARM for a different matrix: starting a new run or
- * reopening one from history is a different grid and is legitimately publishable.
+ * The durable identity of ONE publishable cell: which cell, and which workflow
+ * produced the output. Both survive a reload (`persistence.ts` sanitises `id`
+ * and `workflowId` back out of the run manifest).
  */
-export function runPublishSignature(cells: readonly MatrixCell[]): string {
-  return publishableCells(cells)
-    .map((item) => `${item.cell.id}@${item.workflowId}`)
-    .join('|');
+export function cellPublishKey(cellId: string, workflowId: string): string {
+  return `${cellId}@${workflowId}`;
+}
+
+/**
+ * What this viewer has already published, per cell.
+ *
+ * 🔴 THIS REPLACES A SESSION-HELD SIGNATURE OF THE WHOLE PUBLISHABLE SET, WHICH
+ * FAILED TWO WAYS, BOTH MEASURED, BOTH CREATING DUPLICATE PERMANENT PUBLIC
+ * IMAGES:
+ *
+ *  - **A superset re-armed it.** A grid with 3 `done` + 1 `failed` reaches
+ *    `phase === 'done'`, so Publish and "Retry failed" are offered together.
+ *    Publish the 3; retry the 4th; `RETRY_FAILED` preserves every done cell WITH
+ *    its id and workflowId, so the set becomes 4, the exact-set key misses, the
+ *    button re-arms as "Publish 4 images" — and republishes all four.
+ *  - **A reload re-armed it.** The signature lived in `useState`, so remounting
+ *    against the same storage lost it entirely while the cell ids and workflow
+ *    ids came back intact.
+ *
+ * The question is per CELL, not per set — "has this `(cellId, workflowId)` been
+ * published by this viewer?" — and the answer has to outlive the session, so it
+ * lives in the viewer's own private KV alongside the other gallery bookkeeping.
+ * `entryKey` is what lets a later publish EXTEND the matrix's existing gallery
+ * row instead of minting a second one for the same grid.
+ */
+export const PUBLISHED_CELLS_STORAGE_KEY = 'gen-matrix:gallery:cells:v1';
+
+/** How many per-cell publish records are retained (newest first). */
+export const PUBLISHED_CELLS_CAP = 200;
+
+export interface PublishedCellRecord {
+  /** `cellPublishKey(cellId, workflowId)`. */
+  cell: string;
+  /** The `Image` row the host created for it. */
+  imageId: number;
+  /** The gallery entry that carries it. */
+  entryKey: string;
+}
+
+/** Read the per-cell publish ledger defensively — it is a JSON blob like any other. */
+export function parsePublishedCells(raw: unknown): PublishedCellRecord[] {
+  if (!isObj(raw)) return [];
+  const rows = raw.cells;
+  if (!Array.isArray(rows)) return [];
+  const out: PublishedCellRecord[] = [];
+  const seen = new Set<string>();
+  for (const row of rows) {
+    if (out.length >= PUBLISHED_CELLS_CAP) break;
+    if (!isObj(row)) continue;
+    const cell = typeof row.cell === 'string' ? row.cell : null;
+    const imageId = rowId(row.imageId);
+    // 🔴 An EMPTY entryKey is not a usable entry reference — it would make
+    // `publishTargetKey` resolve to `''` and send `update('')` at the host. The
+    // length check is the guard; `typeof` alone lets it through.
+    const entryKey =
+      typeof row.entryKey === 'string' && row.entryKey.length > 0 ? row.entryKey : null;
+    if (cell == null || cell.length === 0 || imageId == null || entryKey == null) continue;
+    if (seen.has(cell)) continue;
+    seen.add(cell);
+    out.push({ cell, imageId, entryKey });
+  }
+  return out;
+}
+
+/** Add records, newest-first, deduped by cell, bounded. Pure. */
+export function addPublishedCells(
+  existing: readonly PublishedCellRecord[],
+  added: readonly PublishedCellRecord[],
+): PublishedCellRecord[] {
+  const addedKeys = new Set(added.map((r) => r.cell));
+  return [...added, ...existing.filter((r) => !addedKeys.has(r.cell))].slice(
+    0,
+    PUBLISHED_CELLS_CAP,
+  );
+}
+
+/** The stored shape of the ledger. */
+export function publishedCellsBlob(rows: readonly PublishedCellRecord[]): {
+  cells: PublishedCellRecord[];
+} {
+  return { cells: [...rows] };
+}
+
+/** Index a ledger by cell key. */
+export function indexPublishedCells(
+  rows: readonly PublishedCellRecord[],
+): Map<string, PublishedCellRecord> {
+  return new Map(rows.map((r) => [r.cell, r]));
+}
+
+/**
+ * The cells of `plan` this viewer has NOT already published.
+ *
+ * This is what a Publish click acts on, so a retry that adds a fourth cell
+ * publishes ONE image rather than four.
+ */
+export function unpublishedCells(
+  plan: readonly PublishableCell[],
+  published: ReadonlyMap<string, PublishedCellRecord>,
+): PublishableCell[] {
+  return plan.filter(
+    (item) => !published.has(cellPublishKey(item.cell.id, item.workflowId)),
+  );
+}
+
+/**
+ * The gallery entry this matrix's already-published cells live in, or `null`
+ * when none of them have been published (or they disagree).
+ *
+ * 🔴 EXTEND, DON'T MINT A SECOND ROW. Publishing the one retried cell of a 2×2
+ * as its OWN gallery entry would leave two rows for one matrix — a 3-cell grid
+ * and a 1-cell grid, with the votes and reports split between them and neither
+ * showing what the viewer actually ran. `update` is author-scoped and preserves
+ * the key, the vote total and the report total, which is exactly the semantics
+ * this needs. When the prior cells disagree about their entry (a withdrawn row,
+ * a ledger carried across a republish) there is no single row to extend, so a
+ * new one is the honest fallback.
+ */
+export function publishTargetKey(
+  plan: readonly PublishableCell[],
+  published: ReadonlyMap<string, PublishedCellRecord>,
+): string | null {
+  const keys = new Set<string>();
+  for (const item of plan) {
+    const record = published.get(cellPublishKey(item.cell.id, item.workflowId));
+    if (record != null) keys.add(record.entryKey);
+  }
+  return keys.size === 1 ? [...keys][0] : null;
 }
 
 /** The host calls `publishMatrix` needs. Structural, so tests need no SDK. */
 export interface PublishDeps {
   publish(args: { workflowId: string; imageIndexes?: number[]; title?: string }): Promise<number[]>;
   append(value: { title: string; body?: string; data?: unknown }): Promise<{ key: string }>;
+  /** Author-scoped in-place update — preserves the key, votes and reports. */
+  update(key: string, value: { title: string; body?: string; data?: unknown }): Promise<void>;
+}
+
+/** An existing gallery row to EXTEND rather than duplicate. */
+export interface PublishTarget {
+  entryKey: string;
+  /** The row's own moderated text — kept, not overwritten with the current form. */
+  title: string;
+  body?: string;
+  /** The images already in the row, so the merge preserves them. */
+  data: GalleryData;
 }
 
 /** What one publish attempt ended as. */
 export type PublishResult =
   /** Nothing was publishable — no host call was made and nothing was spent. */
   | { kind: 'empty' }
-  /** Every cell landed and the gallery entry exists. */
-  | { kind: 'ok'; key: string; published: number; total: number }
+  /**
+   * Every cell landed and the gallery entry exists.
+   *
+   * `landed` carries the actual `(cell, imageId)` pairs rather than leaving the
+   * caller to infer them from `published` as a prefix of the plan. The prefix
+   * reasoning was correct but fragile — it depends on the loop's stop-and-skip
+   * behaviour staying exactly as it is — and the caller needs the real image ids
+   * for its durable per-cell ledger anyway.
+   */
+  | {
+      kind: 'ok';
+      key: string;
+      published: number;
+      total: number;
+      landed: PublishedCell[];
+      extended?: true;
+    }
   /** Some cells landed; the entry describes exactly those. */
-  | { kind: 'partial'; key: string; published: number; total: number; error: string }
+  | {
+      kind: 'partial';
+      key: string;
+      published: number;
+      total: number;
+      error: string;
+      landed: PublishedCell[];
+      extended?: true;
+    }
   /** No image landed, so no entry was created. */
   | { kind: 'failed'; error: string }
   /**
@@ -456,6 +673,7 @@ export async function publishMatrix(
   meta: { title: string; body?: string },
   deps: PublishDeps,
   onProgress?: (done: number, total: number) => void,
+  target?: PublishTarget | null,
 ): Promise<PublishResult> {
   // 🔴 An empty plan is its OWN state, and the guard is what makes it one.
   // Measured by removing it: the loop simply never runs, so nothing is
@@ -492,19 +710,37 @@ export async function publishMatrix(
   }
 
   let key: string;
+  const extended = target != null;
   try {
-    const appended = await deps.append({
-      title: meta.title,
-      ...(meta.body !== undefined ? { body: meta.body } : {}),
-      data: buildGalleryData(landed),
-    });
-    key = appended.key;
+    if (target != null) {
+      // Extend the matrix's existing row. Its OWN title/body are re-sent, not the
+      // current form's — the author already chose them, and `update` replaces the
+      // whole value.
+      await deps.update(target.entryKey, {
+        title: target.title,
+        ...(target.body !== undefined ? { body: target.body } : {}),
+        data: mergeGalleryData(target.data, landed),
+      });
+      key = target.entryKey;
+    } else {
+      const appended = await deps.append({
+        title: meta.title,
+        ...(meta.body !== undefined ? { body: meta.body } : {}),
+        data: buildGalleryData(landed),
+      });
+      key = appended.key;
+    }
   } catch (err) {
     return {
       kind: 'orphaned',
       published: landed.length,
       total: plan.length,
-      error: errorText(err, 'the gallery entry could not be saved'),
+      error: errorText(
+        err,
+        extended
+          ? 'the existing gallery entry could not be updated'
+          : 'the gallery entry could not be saved',
+      ),
     };
   }
 
@@ -515,9 +751,18 @@ export async function publishMatrix(
       published: landed.length,
       total: plan.length,
       error: failure ?? 'some images could not be published',
+      landed: [...landed],
+      ...(extended ? { extended: true as const } : {}),
     };
   }
-  return { kind: 'ok', key, published: landed.length, total: plan.length };
+  return {
+    kind: 'ok',
+    key,
+    published: landed.length,
+    total: plan.length,
+    landed: [...landed],
+    ...(extended ? { extended: true as const } : {}),
+  };
 }
 
 /**
@@ -532,7 +777,9 @@ export function publishResultMessage(result: PublishResult): string {
     case 'empty':
       return 'There is nothing to publish yet — finish a matrix first.';
     case 'ok':
-      return `Published ${result.published} ${result.published === 1 ? 'image' : 'images'} to the gallery.`;
+      return result.extended === true
+        ? `Added ${result.published} ${result.published === 1 ? 'image' : 'images'} to this matrix’s gallery entry.`
+        : `Published ${result.published} ${result.published === 1 ? 'image' : 'images'} to the gallery.`;
     case 'partial':
       return `Published ${result.published} of ${result.total} images. The gallery entry shows the ones that landed. ${result.error}`;
     case 'orphaned':
@@ -671,7 +918,7 @@ export async function loadGallery(
  * header said "Grids the app author has published", which is false: creating the
  * IMAGES is cohort-gated (`assertViewerIsAppDeveloper`, civitai
  * `src/server/routers/blocks.router.ts:3632`) but creating the shared ENTRY is
- * not — `resolveSharedContext` (`src/server/routers/apps-shared.router.ts:152`)
+ * not — `resolveSharedContext` (`src/server/routers/apps-shared.router.ts:161`)
  * deliberately does not reuse that assert, because copying it "would FORBID all
  * general users". Its write path asks only for an approved block token, the
  * shared-write scope, a fail-closed kill-switch, an authenticated subject and a
@@ -805,22 +1052,35 @@ export function resolveEntryImages(
   entry: GalleryEntry,
   byId: ReadonlyMap<number, GatedImageLike>,
 ): GalleryEntryView {
-  const cells: GalleryCellView[] = entry.data.images.map((image) => {
-    const found = byId.get(image.imageId);
+  // One view per COORDINATE. A coordinate may carry several candidate ids (see
+  // `MAX_CELL_CANDIDATES`); the one that gets rendered is the first the HOST
+  // resolved, which is the half of the decision an attacker does not control.
+  // Listing an unresolvable id first therefore no longer forces "No longer
+  // available" over an image that is right there.
+  const byCell = new Map<string, GalleryImageRef[]>();
+  for (const image of entry.data.images) {
+    const key = `${image.row}:${image.col}`;
+    const at = byCell.get(key);
+    if (at == null) byCell.set(key, [image]);
+    else at.push(image);
+  }
+  const cells: GalleryCellView[] = [...byCell.values()].map((candidates) => {
+    const chosen = candidates.find((c) => byId.has(c.imageId)) ?? candidates[0];
+    const found = byId.get(chosen.imageId);
     if (found == null) {
-      return { kind: 'gone', imageId: image.imageId, row: image.row, col: image.col };
+      return { kind: 'gone', imageId: chosen.imageId, row: chosen.row, col: chosen.col };
     }
     if (found.status === 'visible') {
       return {
         kind: 'visible',
-        imageId: image.imageId,
-        row: image.row,
-        col: image.col,
+        imageId: chosen.imageId,
+        row: chosen.row,
+        col: chosen.col,
         url: found.url,
         nsfwLevel: found.nsfwLevel,
       };
     }
-    return { kind: 'hidden', imageId: image.imageId, row: image.row, col: image.col };
+    return { kind: 'hidden', imageId: chosen.imageId, row: chosen.row, col: chosen.col };
   });
   const rows = [...new Set(cells.map((cell) => cell.row))].sort((a, b) => a - b);
   const cols = [...new Set(cells.map((cell) => cell.col))].sort((a, b) => a - b);

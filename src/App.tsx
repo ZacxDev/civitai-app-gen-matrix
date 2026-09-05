@@ -103,7 +103,15 @@ import {
   publishMatrix,
   publishResultMessage,
   publishableCells,
-  runPublishSignature,
+  PUBLISHED_CELLS_STORAGE_KEY,
+  addPublishedCells,
+  cellPublishKey,
+  indexPublishedCells,
+  parsePublishedCells,
+  publishTargetKey,
+  publishedCellsBlob,
+  unpublishedCells,
+  type PublishedCellRecord,
   type GalleryEntry,
   type GalleryLoad,
 } from './gallery.js';
@@ -385,10 +393,13 @@ export function App() {
   const [publishTitle, setPublishTitle] = useState('');
   const [publishTitleTouched, setPublishTitleTouched] = useState(false);
   const [publishPhase, setPublishPhase] = useState<PublishPhase>({ kind: 'idle' });
-  // The signature of every matrix already published in this session. Keyed on
-  // the grid rather than a boolean so the control re-arms for a DIFFERENT matrix
-  // (a new run, or one reopened from history) but never for the same one.
-  const [publishedSignatures, setPublishedSignatures] = useState<Set<string>>(() => new Set());
+  // 🔴 THE PER-CELL PUBLISH LEDGER, READ FROM DURABLE PER-VIEWER STORAGE.
+  // This replaces a session-held signature of the whole publishable set, which
+  // re-armed the control both when the set GREW (retry a failed cell → the other
+  // three republish) and when the SESSION ended (a reload lost the Set while the
+  // cell ids came back intact). Both produced duplicate permanent public images.
+  // The durable answer is per cell — see `PUBLISHED_CELLS_STORAGE_KEY`.
+  const [publishedCells, setPublishedCells] = useState<PublishedCellRecord[]>([]);
   const [publishMessage, setPublishMessage] = useState<string | null>(null);
   const [publishProblem, setPublishProblem] = useState(false);
 
@@ -1001,17 +1012,21 @@ export function App() {
     if (!viewer) {
       setOwnKeys(new Set());
       setReportedKeys(new Set());
+      setPublishedCells([]);
       return;
     }
     let cancelled = false;
     void (async () => {
-      const [own, reported] = await Promise.all([
+      const [own, reported, cells] = await Promise.all([
         storage.get(PUBLISHED_KEYS_STORAGE_KEY).catch(() => null),
         storage.get(REPORTED_KEYS_STORAGE_KEY).catch(() => null),
+        storage.get(PUBLISHED_CELLS_STORAGE_KEY).catch(() => null),
       ]);
       if (cancelled) return;
       setOwnKeys(new Set(parseKeySet(own)));
       setReportedKeys(new Set(parseKeySet(reported)));
+      // 🔴 This is what makes the publish disarm survive a reload.
+      setPublishedCells(parsePublishedCells(cells));
     })();
     return () => {
       cancelled = true;
@@ -1432,8 +1447,20 @@ export function App() {
   // The cells of the open matrix that can be published: `done`, with a
   // workflowId the host can re-derive ownership from.
   const publishPlan = useMemo(() => publishableCells(state.cells), [state.cells]);
-  const publishSignature = useMemo(() => runPublishSignature(state.cells), [state.cells]);
-  const alreadyPublished = publishSignature.length > 0 && publishedSignatures.has(publishSignature);
+  const publishedIndex = useMemo(() => indexPublishedCells(publishedCells), [publishedCells]);
+  // What a click would actually publish: the cells NOT already in the gallery.
+  const publishRemaining = useMemo(
+    () => unpublishedCells(publishPlan, publishedIndex),
+    [publishPlan, publishedIndex],
+  );
+  const alreadyPublishedCount = publishPlan.length - publishRemaining.length;
+  const alreadyPublished = publishPlan.length > 0 && publishRemaining.length === 0;
+  // The row this matrix's earlier cells landed in, so a later publish EXTENDS it
+  // rather than minting a second entry for one grid.
+  const publishTarget = useMemo(
+    () => publishTargetKey(publishPlan, publishedIndex),
+    [publishPlan, publishedIndex],
+  );
   // The title offered until the author edits it. Derived from the run's own
   // shared prompt, so it describes the matrix on screen rather than the form.
   const suggestedPublishTitle = defaultGalleryTitle(sharedPromptFromCells(state.cells));
@@ -1458,12 +1485,18 @@ export function App() {
   const handlePublish = useCallback(() => {
     if (publishPhase.kind === 'busy') return;
     // Belt for the disabled button: a duplicate publish is unrecoverable.
-    if (alreadyPublished) return;
+    if (publishRemaining.length === 0) return;
     setPublishMessage(null);
     setPublishProblem(false);
-    setPublishPhase({ kind: 'busy', done: 0, total: publishPlan.length });
+    setPublishPhase({ kind: 'busy', done: 0, total: publishRemaining.length });
+    // The row to extend, resolved from the LOADED gallery so a withdrawn or
+    // moderated entry falls back to a fresh append rather than a NOT_FOUND.
+    const existing =
+      publishTarget != null && galleryLoad?.kind === 'ok'
+        ? galleryLoad.entries.find((e) => e.key === publishTarget)
+        : undefined;
     void publishMatrix(
-      publishPlan,
+      publishRemaining,
       {
         // Every user-visible string goes in the MODERATED fields. `data` carries
         // ids and grid coordinates only — see gallery.ts.
@@ -1472,8 +1505,20 @@ export function App() {
           ? { body: composeGalleryBody(sharedPromptFromCells(state.cells)) }
           : {}),
       },
-      { publish, append: (value) => shared.append(value) },
+      {
+        publish,
+        append: (value) => shared.append(value),
+        update: (key, value) => shared.update(key, value),
+      },
       (done, total) => setPublishPhase({ kind: 'busy', done, total }),
+      existing == null
+        ? null
+        : {
+            entryKey: existing.key,
+            title: existing.title,
+            ...(existing.body != null ? { body: existing.body } : {}),
+            data: existing.data,
+          },
     )
       .then((result) => {
         setPublishMessage(publishResultMessage(result));
@@ -1486,11 +1531,25 @@ export function App() {
             persistKeySet(PUBLISHED_KEYS_STORAGE_KEY, next);
             return new Set(next);
           });
-          // 🔴 Disarm the control for THIS matrix, and drop the title the viewer
-          // typed for it. Without both, a second click republished the identical
-          // grid under the identical title — a second set of permanent public
-          // images, with no un-publish.
-          setPublishedSignatures((prev) => new Set(prev).add(publishSignature));
+          // 🔴 Record EVERY cell that landed, durably. Disarming on a
+          // session-held signature of the whole set re-armed on a retry (the set
+          // grew) and on a reload (the Set was gone) — both republishing images
+          // that already existed, permanently and with no un-publish.
+          //
+          // The result carries the actual `(cell, imageId)` pairs, so the ledger
+          // records real image ids rather than an inferred prefix of the plan.
+          const landedCells = result.landed.map((item) => ({
+            cell: cellPublishKey(item.cell.id, item.cell.workflowId ?? ''),
+            imageId: item.imageId,
+            entryKey: result.key,
+          }));
+          setPublishedCells((prev) => {
+            const next = addPublishedCells(prev, landedCells);
+            storage.set(PUBLISHED_CELLS_STORAGE_KEY, publishedCellsBlob(next)).catch(
+              () => undefined,
+            );
+            return next;
+          });
           setPublishTitle('');
           setPublishTitleTouched(false);
           setGalleryNonce((n) => n + 1);
@@ -1509,13 +1568,14 @@ export function App() {
       .finally(() => setPublishPhase({ kind: 'idle' }));
   }, [
     publishPhase.kind,
-    alreadyPublished,
-    publishPlan,
-    publishSignature,
+    publishRemaining,
+    publishTarget,
+    galleryLoad,
     effectivePublishTitle,
     state.cells,
     publish,
     shared,
+    storage,
     persistKeySet,
   ]);
 
@@ -1696,7 +1756,8 @@ export function App() {
         {showGrid && state.phase === 'done' && publishPlan.length > 0 && (
           <PublishMatrixPanel
             c={c}
-            publishable={publishPlan.length}
+            publishable={publishRemaining.length}
+            alreadyPublishedCount={alreadyPublishedCount}
             title={effectivePublishTitle}
             setTitle={(value) => {
               setPublishTitleTouched(true);

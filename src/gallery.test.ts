@@ -20,7 +20,17 @@ import {
   provenanceLabel,
   isOwnEntry,
   clampRenderedText,
-  runPublishSignature,
+  PUBLISHED_CELLS_CAP,
+  MAX_CELL_CANDIDATES,
+  BODY_PROMPT_PREFIX,
+  addPublishedCells,
+  cellPublishKey,
+  indexPublishedCells,
+  mergeGalleryData,
+  parsePublishedCells,
+  publishTargetKey,
+  publishedCellsBlob,
+  unpublishedCells,
   GALLERY_BODY_MAX,
   GALLERY_TITLE_MAX,
   publishMatrix,
@@ -36,7 +46,7 @@ import {
   type SharedItemLike,
 } from './gallery.js';
 import { CHECKPOINTS, MODIFIERS } from './models.js';
-import { buildMatrix, type MatrixCell } from './matrix.js';
+import { PROMPT_MAX, buildMatrix, type MatrixCell } from './matrix.js';
 
 // ---------------------------------------------------------------------------
 // Fixtures.
@@ -286,13 +296,14 @@ describe('publishMatrix', () => {
   it('publishes each cell by workflowId + index and indexes the ids', async () => {
     const plan = planOf(cellsFor(1, 2));
     const publish = vi.fn<PublishDeps['publish']>(async () => [900]);
+    const update = vi.fn<PublishDeps['update']>(async () => {});
     const append = vi.fn<PublishDeps['append']>(async () => ({ key: 'k_new' }));
     const progress: [number, number][] = [];
 
     const result = await publishMatrix(
       plan,
       { title: 'T', body: 'Prompt: p' },
-      { publish, append },
+      { publish, append, update },
       (done, total) => progress.push([done, total]),
     );
 
@@ -318,8 +329,9 @@ describe('publishMatrix', () => {
 
   it('makes no host call at all for an empty plan', async () => {
     const publish = vi.fn<PublishDeps['publish']>(async () => [1]);
+    const update = vi.fn<PublishDeps['update']>(async () => {});
     const append = vi.fn<PublishDeps['append']>(async () => ({ key: 'k' }));
-    const result = await publishMatrix([], { title: 'T' }, { publish, append });
+    const result = await publishMatrix([], { title: 'T' }, { publish, append, update });
     expect(
       result,
       'gallery-empty-plan-guard: an empty plan is its own honest state — without the guard it falls through to the generic {kind:"failed"}, whose copy reads as a REJECTED request to someone whose only mistake was having no finished cells',
@@ -339,9 +351,10 @@ describe('publishMatrix', () => {
       if (call === 2) throw new Error('not an app developer');
       return [600 + call];
     });
+    const update = vi.fn<PublishDeps['update']>(async () => {});
     const append = vi.fn<PublishDeps['append']>(async () => ({ key: 'k_part' }));
 
-    const result = await publishMatrix(plan, { title: 'T' }, { publish, append });
+    const result = await publishMatrix(plan, { title: 'T' }, { publish, append, update });
 
     expect(
       publish.mock.calls.length,
@@ -356,9 +369,10 @@ describe('publishMatrix', () => {
     const publish = vi.fn<PublishDeps['publish']>(async () => {
       throw new Error('publishing is limited to app developers');
     });
+    const update = vi.fn<PublishDeps['update']>(async () => {});
     const append = vi.fn<PublishDeps['append']>(async () => ({ key: 'k' }));
 
-    const result = await publishMatrix(plan, { title: 'T' }, { publish, append });
+    const result = await publishMatrix(plan, { title: 'T' }, { publish, append, update });
 
     expect(
       append.mock.calls.length,
@@ -374,11 +388,12 @@ describe('publishMatrix', () => {
   it('says so out loud when the images landed but the entry did not', async () => {
     const plan = planOf(cellsFor(1, 2));
     const publish = vi.fn<PublishDeps['publish']>(async () => [808]);
+    const update = vi.fn<PublishDeps['update']>(async () => {});
     const append = vi.fn<PublishDeps['append']>(async () => {
       throw new Error('shared append failed');
     });
 
-    const result = await publishMatrix(plan, { title: 'T' }, { publish, append });
+    const result = await publishMatrix(plan, { title: 'T' }, { publish, append, update });
 
     expect(
       result.kind,
@@ -396,9 +411,10 @@ describe('publishMatrix', () => {
       call += 1;
       return call === 1 ? [] : [700 + call];
     });
+    const update = vi.fn<PublishDeps['update']>(async () => {});
     const append = vi.fn<PublishDeps['append']>(async () => ({ key: 'k_skip' }));
 
-    const result = await publishMatrix(plan, { title: 'T' }, { publish, append });
+    const result = await publishMatrix(plan, { title: 'T' }, { publish, append, update });
 
     // A resolve is not a failure, so every remaining cell is still attempted.
     expect(publish).toHaveBeenCalledTimes(3);
@@ -650,27 +666,201 @@ describe('isOwnEntry', () => {
 // F2 — a matrix already published must not re-arm the control.
 // ---------------------------------------------------------------------------
 
-describe('runPublishSignature', () => {
-  it('🔴 is stable for the SAME matrix and different for another', () => {
-    const a = cellsFor(1, 2);
-    const b = cellsFor(1, 2).map((cell, i) => ({ ...cell, workflowId: `other_${i}` }));
+describe('the per-cell publish ledger', () => {
+  const plan = () => publishableCells(cellsFor(1, 3));
+
+  it('🔴 a SUPERSET does not re-arm: only the genuinely new cell is publishable', () => {
+    // The shape a "Retry failed" run leaves behind. `RETRY_FAILED` preserves
+    // every done cell WITH its id and workflowId, so the publishable set GROWS —
+    // and an exact-set key misses, re-arming the button as "Publish 4 images"
+    // over three cells that are already public and cannot be un-published.
+    const full = plan();
+    const publishedFirstTwo = indexPublishedCells(
+      full.slice(0, 2).map((item) => ({
+        cell: cellPublishKey(item.cell.id, item.workflowId),
+        imageId: 400 + item.cell.col,
+        entryKey: 'k_entry',
+      })),
+    );
     expect(
-      runPublishSignature(a),
-      'gallery-republish-guard: the signature is what disarms the control for a matrix already published — if it were not stable across renders the button would re-arm and a second click would create a second set of permanent public images',
-    ).toBe(runPublishSignature(a));
-    expect(runPublishSignature(a)).not.toBe(runPublishSignature(b));
+      unpublishedCells(full, publishedFirstTwo).map((i) => i.cell.id),
+      'gallery-percell-ledger-guard: the question is per CELL, not per set — a set that GREW must publish only what is new, or a retry republishes every cell that was already public',
+    ).toEqual([full[2].cell.id]);
   });
 
-  it('re-arms for a matrix with nothing publishable', () => {
-    // An empty signature is never "already published" — that is what lets the
-    // control arm again for a genuinely new run.
-    expect(runPublishSignature([])).toBe('');
+  it('reports nothing left when every cell is in the ledger', () => {
+    const full = plan();
+    const all = indexPublishedCells(
+      full.map((item) => ({
+        cell: cellPublishKey(item.cell.id, item.workflowId),
+        imageId: 500,
+        entryKey: 'k_entry',
+      })),
+    );
+    expect(unpublishedCells(full, all)).toEqual([]);
   });
 
-  it('ignores cells that are not publishable', () => {
+  it('re-arms for a DIFFERENT matrix', () => {
+    const full = plan();
+    const other = publishableCells(
+      cellsFor(1, 3).map((cell, i) => ({ ...cell, workflowId: `re_${i}` })),
+    );
+    const ledger = indexPublishedCells(
+      full.map((item) => ({
+        cell: cellPublishKey(item.cell.id, item.workflowId),
+        imageId: 600,
+        entryKey: 'k_entry',
+      })),
+    );
+    // Same cell ids, different workflows — a re-run is legitimately publishable.
+    expect(unpublishedCells(other, ledger)).toHaveLength(3);
+  });
+
+  it('🔴 survives a round-trip through storage, which is what survives a RELOAD', () => {
+    const full = plan();
+    const rows = full.map((item) => ({
+      cell: cellPublishKey(item.cell.id, item.workflowId),
+      imageId: 700 + item.cell.col,
+      entryKey: 'k_entry',
+    }));
+    const readBack = parsePublishedCells(publishedCellsBlob(rows));
+    expect(
+      unpublishedCells(full, indexPublishedCells(readBack)),
+      'gallery-ledger-durable-guard: the disarm used to live in useState, so a remount against the same store lost it while the cell ids and workflow ids came back intact — and the next click republished every one of them',
+    ).toEqual([]);
+  });
+
+  it('reads a forged ledger defensively', () => {
+    expect(parsePublishedCells(null)).toEqual([]);
+    expect(parsePublishedCells({ cells: 'nope' })).toEqual([]);
+    // A record with no usable imageId or entryKey is not a publish record.
+    expect(
+      parsePublishedCells({
+        cells: [
+          { cell: 'a@1', imageId: 0, entryKey: 'k' },
+          { cell: 'b@2', imageId: 5, entryKey: '' },
+          { cell: '', imageId: 5, entryKey: 'k' },
+          { cell: 'c@3', imageId: 5, entryKey: 'k' },
+        ],
+      }).map((r) => r.cell),
+    ).toEqual(['c@3']);
+  });
+
+  it('adds newest-first, deduped by cell, bounded', () => {
+    const many = Array.from({ length: PUBLISHED_CELLS_CAP + 5 }, (_, i) => ({
+      cell: `c${i}`,
+      imageId: i + 1,
+      entryKey: 'k',
+    }));
+    const next = addPublishedCells(many, [{ cell: 'c0', imageId: 99, entryKey: 'k2' }]);
+    expect(next).toHaveLength(PUBLISHED_CELLS_CAP);
+    expect(next[0]).toEqual({ cell: 'c0', imageId: 99, entryKey: 'k2' });
+    expect(next.filter((r) => r.cell === 'c0')).toHaveLength(1);
+  });
+
+  it('resolves the entry to EXTEND, and declines when the prior cells disagree', () => {
+    const full = plan();
+    const same = indexPublishedCells(
+      full.slice(0, 2).map((item) => ({
+        cell: cellPublishKey(item.cell.id, item.workflowId),
+        imageId: 800,
+        entryKey: 'k_one',
+      })),
+    );
+    expect(publishTargetKey(full, same)).toBe('k_one');
+
+    const split = indexPublishedCells([
+      { cell: cellPublishKey(full[0].cell.id, full[0].workflowId), imageId: 1, entryKey: 'k_one' },
+      { cell: cellPublishKey(full[1].cell.id, full[1].workflowId), imageId: 2, entryKey: 'k_two' },
+    ]);
+    expect(
+      publishTargetKey(full, split),
+      'gallery-extend-target-guard: with the prior cells in two different rows there is no single row to extend, so a fresh entry is the honest fallback rather than picking one arbitrarily',
+    ).toBeNull();
+
+    expect(publishTargetKey(full, indexPublishedCells([]))).toBeNull();
+  });
+});
+
+describe('publishMatrix extending an existing entry', () => {
+  it('🔴 adds the new cell to the SAME row instead of minting a second one', async () => {
+    const full = publishableCells(cellsFor(1, 2));
+    const publish = vi.fn<PublishDeps['publish']>(async () => [910]);
+    const append = vi.fn<PublishDeps['append']>(async () => ({ key: 'k_new' }));
+    const update = vi.fn<PublishDeps['update']>(async () => {});
+    const existingData = buildGalleryData([{ cell: full[0].cell, imageId: 900 }]);
+
+    const result = await publishMatrix(
+      [full[1]],
+      { title: 'ignored', body: 'ignored' },
+      { publish, append, update },
+      undefined,
+      { entryKey: 'k_one', title: 'Original title', body: 'Prompt: p', data: existingData },
+    );
+
+    expect(
+      append.mock.calls.length,
+      'gallery-extend-guard: a second row for one matrix splits its votes and reports across two entries, neither of which shows the grid the viewer actually ran — `update` preserves the key, the vote total and the report total',
+    ).toBe(0);
+    expect(update).toHaveBeenCalledTimes(1);
+    expect(update.mock.calls[0][0]).toBe('k_one');
+    // The row's OWN moderated text is kept, not overwritten by the live form.
+    expect(update.mock.calls[0][1].title).toBe('Original title');
+    const merged = update.mock.calls[0][1].data as { images: { imageId: number }[] };
+    expect(merged.images.map((i) => i.imageId)).toEqual([900, 910]);
+    expect(result).toMatchObject({ kind: 'ok', key: 'k_one', extended: true });
+    expect(publishResultMessage(result)).toContain('Added 1 image to this matrix');
+  });
+
+  it('reports the images as orphaned when the update fails', async () => {
+    const full = publishableCells(cellsFor(1, 2));
+    const publish = vi.fn<PublishDeps['publish']>(async () => [911]);
+    const append = vi.fn<PublishDeps['append']>(async () => ({ key: 'k' }));
+    const update = vi.fn<PublishDeps['update']>(async () => {
+      throw new Error('NOT_FOUND');
+    });
+    const result = await publishMatrix(
+      [full[1]],
+      { title: 'T' },
+      { publish, append, update },
+      undefined,
+      { entryKey: 'k_gone', title: 'T', data: buildGalleryData([]) },
+    );
+    expect(result.kind).toBe('orphaned');
+    expect(publishResultMessage(result)).toContain('now public on Civitai');
+  });
+
+  it('returns the landed pairs so the caller records real image ids', async () => {
+    const full = publishableCells(cellsFor(1, 2));
+    let call = 0;
+    const publish = vi.fn<PublishDeps['publish']>(async () => [920 + ++call]);
+    const append = vi.fn<PublishDeps['append']>(async () => ({ key: 'k_l' }));
+    const update = vi.fn<PublishDeps['update']>(async () => {});
+    const result = await publishMatrix(full, { title: 'T' }, { publish, append, update });
+    expect(result.kind === 'ok' && result.landed.map((l) => l.imageId)).toEqual([921, 922]);
+    expect(result.kind === 'ok' && result.landed.map((l) => l.cell.id)).toEqual([
+      full[0].cell.id,
+      full[1].cell.id,
+    ]);
+  });
+});
+
+describe('mergeGalleryData', () => {
+  it('keeps the ORIGINAL id when a coordinate is republished', () => {
     const cells = cellsFor(1, 2);
-    const withFailure = [...cells, { ...cells[0], id: 'extra', status: 'failed' as const }];
-    expect(runPublishSignature(withFailure)).toBe(runPublishSignature(cells));
+    const existing = buildGalleryData([{ cell: cells[0], imageId: 950 }]);
+    const merged = mergeGalleryData(existing, [{ cell: cells[0], imageId: 951 }]);
+    // Same coordinate, new id — the original is what viewers may already have
+    // voted on and reported, so it stays and the duplicate is not appended.
+    expect(merged.images.map((i) => i.imageId)).toEqual([950, 951]);
+    expect(merged.rows).toHaveLength(1);
+  });
+
+  it('never exceeds the image cap', () => {
+    const cells = cellsFor(3, 4);
+    const existing = buildGalleryData(cells.map((cell, i) => ({ cell, imageId: 960 + i })));
+    const merged = mergeGalleryData(existing, [{ cell: cells[0], imageId: 9999 }]);
+    expect(merged.images.length).toBeLessThanOrEqual(MAX_GALLERY_IMAGES);
   });
 });
 
@@ -709,6 +899,44 @@ describe('loadGallery truncation', () => {
 // ---------------------------------------------------------------------------
 
 describe('rendered text bounds', () => {
+  it('🔴 never truncates the app’s OWN maximum legal body', () => {
+    // The regression this closes: a flat 600 cut an ordinary 700-character
+    // prompt — legal, under half the app's own PROMPT_MAX — for every viewer
+    // including the author, with no expand control. Before that fix the full
+    // body rendered.
+    const longestOwnPrompt = 'p'.repeat(PROMPT_MAX);
+    const body = composeGalleryBody(longestOwnPrompt);
+    expect(body).toBeDefined();
+    expect(
+      clampRenderedText(body as string, GALLERY_BODY_MAX),
+      'gallery-own-body-guard: the read bound must be DERIVED from the write bound the same app enforces — a bound chosen for "long enough for a card" truncates the app’s own content on the happy path',
+    ).toBe(body);
+    expect(GALLERY_BODY_MAX).toBe(BODY_PROMPT_PREFIX.length + PROMPT_MAX);
+  });
+
+  it('still bounds a body from somebody else’s client', () => {
+    const entry = toGalleryEntry(
+      sharedItem({ value: { ...sharedItem().value, body: 'B'.repeat(GALLERY_BODY_MAX + 500) } }),
+    );
+    expect(entry?.body?.length).toBe(GALLERY_BODY_MAX + 1);
+  });
+
+  it('🔴 slices by CODE POINT, never mid-surrogate-pair', () => {
+    // '🜛' is astral (2 UTF-16 code units). A code-unit slice at an odd boundary
+    // cuts it in half and renders a lone surrogate.
+    const emoji = '🜛';
+    const raw = `${'a'.repeat(9)}${emoji}${'b'.repeat(50)}`;
+    const cut = clampRenderedText(raw, 10);
+    expect(
+      cut,
+      'gallery-codepoint-guard: String.prototype.slice cuts between the halves of a surrogate pair, so a title whose boundary lands inside an astral emoji renders a lone surrogate',
+    ).toBe(`${'a'.repeat(9)}${emoji}…`);
+    // No unpaired surrogate survived the cut.
+    expect(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/.test(cut)).toBe(
+      false,
+    );
+  });
+
   it('🔴 clamps a title and body written by somebody else’s client', () => {
     const entry = toGalleryEntry(
       sharedItem({
@@ -733,25 +961,80 @@ describe('rendered text bounds', () => {
 // F6 — one image per cell, decided here rather than by the renderer.
 // ---------------------------------------------------------------------------
 
-describe('parseGalleryData cell dedupe', () => {
-  it('🔴 keeps only the FIRST image at a given (row, col)', () => {
-    const parsed = parseGalleryData({
-      v: GALLERY_DATA_VERSION,
-      rows: [],
-      cols: [],
-      images: [
+describe('several ids at one coordinate', () => {
+  const blob = (images: { imageId: number; row: number; col: number }[]) => ({
+    v: GALLERY_DATA_VERSION,
+    rows: [],
+    cols: [],
+    images,
+  });
+
+  it('🔴 renders the id the HOST resolved, whichever order the blob listed them', () => {
+    // The probe that refuted the previous "first wins" fix: a blob listing an
+    // unresolvable id FIRST. Dropping the second id made it worse — the whole
+    // entry read as `allGone` — because ordering is attacker-controlled on both
+    // sides. Which id the host can resolve is the half an attacker does not
+    // control, so that is what decides.
+    const parsed = parseGalleryData(
+      blob([
         { imageId: 5001, row: 0, col: 0 },
-        // A different id at the SAME coordinate: both pass the id check, and the
-        // renderer takes the first match — so a forged blob could pair an
-        // unresolvable id with a resolvable one and paint "No longer available"
-        // over an image that is right there.
         { imageId: 5002, row: 0, col: 0 },
-        { imageId: 5003, row: 0, col: 1 },
-      ],
-    });
+      ]),
+    );
+    expect(parsed?.images).toHaveLength(2);
+    const entry = { ...entryWith(parsed!.images), data: parsed! };
+    const view = resolveEntryImages(
+      entry,
+      indexGatedImages([
+        { imageId: 5002, status: 'visible', url: 'https://img/5002', nsfwLevel: 1 },
+      ]),
+    );
+    expect(view.cells).toHaveLength(1);
     expect(
-      parsed?.images.map((i) => i.imageId),
-      'gallery-cell-dedupe-guard: two DIFFERENT ids at one coordinate is the last place a hostile blob steers what a cell says',
-    ).toEqual([5001, 5003]);
+      view.cells[0],
+      'gallery-cell-resolution-guard: with the unresolvable id listed first, keeping only the first candidate painted "No longer available" over an image that was right there — and for a one-cell entry it made the whole row read as gone',
+    ).toMatchObject({ kind: 'visible', imageId: 5002 });
+    expect(view.allGone).toBe(false);
+  });
+
+  it('still resolves when the FIRST candidate is the resolvable one', () => {
+    const parsed = parseGalleryData(
+      blob([
+        { imageId: 5003, row: 0, col: 0 },
+        { imageId: 5004, row: 0, col: 0 },
+      ]),
+    );
+    const entry = { ...entryWith(parsed!.images), data: parsed! };
+    const view = resolveEntryImages(
+      entry,
+      indexGatedImages([
+        { imageId: 5003, status: 'visible', url: 'https://img/5003', nsfwLevel: 1 },
+      ]),
+    );
+    expect(view.cells[0]).toMatchObject({ kind: 'visible', imageId: 5003 });
+  });
+
+  it('reports the cell gone only when NO candidate resolves', () => {
+    const parsed = parseGalleryData(
+      blob([
+        { imageId: 5005, row: 0, col: 0 },
+        { imageId: 5006, row: 0, col: 0 },
+      ]),
+    );
+    const entry = { ...entryWith(parsed!.images), data: parsed! };
+    const view = resolveEntryImages(entry, indexGatedImages([]));
+    expect(view.cells).toHaveLength(1);
+    expect(view.allGone).toBe(true);
+  });
+
+  it('🔴 bounds candidates per cell so one coordinate cannot hide the grid', () => {
+    const many = Array.from({ length: 9 }, (_, i) => ({ imageId: 5100 + i, row: 0, col: 0 }));
+    const parsed = parseGalleryData(blob([...many, { imageId: 5200, row: 0, col: 1 }]));
+    expect(
+      parsed?.images.filter((i) => i.col === 0).length,
+      'gallery-candidate-cap-guard: without a per-cell cap one coordinate consumes the whole MAX_GALLERY_IMAGES budget and every other cell of the grid is dropped',
+    ).toBe(MAX_CELL_CANDIDATES);
+    // The other cell survived, which is the point.
+    expect(parsed?.images.some((i) => i.imageId === 5200)).toBe(true);
   });
 });

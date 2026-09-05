@@ -941,7 +941,16 @@ describe('gallery — publishing cannot be repeated (F2)', () => {
         'two clicks used to produce two rows, each backed by its own publish() call and its own set of permanent public images — and there is no un-publish',
       ).toBeDisabled(),
     );
-    expect(screen.getByTestId('gm-publish')).toHaveTextContent(/already published/i);
+    // 🔴 The LABEL is what `alreadyPublished` uniquely decides, so the message
+    // lives here too. Since round 3 the disabled state is OVER-DETERMINED — with
+    // every cell published, `publishable` is 0 and that alone disables the
+    // button — so a mutation of `alreadyPublished` survives `toBeDisabled()` and
+    // dies on this copy assertion instead. A guard asserted only through the
+    // disabled state would pass whether or not the thing it names still works.
+    expect(
+      screen.getByTestId('gm-publish'),
+      'two clicks used to produce two rows, each backed by its own publish() call and its own set of permanent public images',
+    ).toHaveTextContent(/already published/i);
     expect(screen.getByTestId('gm-publish-already')).toBeInTheDocument();
 
     // A second click attempt changes nothing.
@@ -955,5 +964,130 @@ describe('gallery — publishing cannot be repeated (F2)', () => {
       screen.getAllByTestId('gm-gallery-item'),
       'two clicks used to produce two rows, each backed by its own publish() call and its own set of permanent public images',
     ).toHaveLength(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Round-3: the publish disarm must survive a GROWING set and a RELOAD.
+// ---------------------------------------------------------------------------
+
+/** A 2x2 with three cells done and one failed — the shape a retry leaves. */
+function retryShapedManifest() {
+  const cells = buildMatrix(
+    'a lighthouse',
+    [CHECKPOINTS[0], CHECKPOINTS[1]],
+    [MODIFIERS[0], MODIFIERS[1]],
+  ).map(
+    (cell, i): MatrixCell => ({
+      ...cell,
+      status: i === 3 ? 'failed' : 'done',
+      workflowId: i === 3 ? null : `wf_r${i}`,
+      imageUrl: i === 3 ? null : `https://img.example/r${i}.jpeg`,
+      cost: i === 3 ? null : 8,
+      nsfwLevel: 1,
+      error: i === 3 ? 'boom' : null,
+    }),
+  );
+  return buildRunManifest({ phase: 'done', cells, perCellEstimate: 8 });
+}
+
+describe('gallery — a GROWING publishable set does not re-arm the control (F1-round3)', () => {
+  it('🔴 after a retry, only the NEW cell is offered — not all four again', async () => {
+    renderApp({
+      viewer,
+      consentGranted: true,
+      buzzBudget: 200,
+      generation: { costPerGen: 8, images: ['https://img.example/retried.jpeg'] },
+      storage: { seed: { [RUN_STORAGE_KEY]: retryShapedManifest() } },
+      publishImageIds: [9001],
+    });
+
+    // CONTROL: three done cells are publishable, and Retry is offered alongside
+    // — which is exactly what makes this reachable.
+    const button = await screen.findByTestId('gm-publish');
+    expect(button).toHaveTextContent('Publish 3 images');
+    expect(screen.getByTestId('gm-retry')).toBeInTheDocument();
+
+    await userEvent.click(button);
+    await waitFor(() =>
+      expect(screen.getByTestId('gm-publish-status')).toHaveTextContent(/Published 3 images/i),
+    );
+    // 🔴 Messaged, because this is the FIRST observable the ledger decides — the
+    // "1 more image" assertion below never runs if this one throws, and a test
+    // that goes red without naming what it guards is how a guard gets believed.
+    await waitFor(() =>
+      expect(
+        screen.getByTestId('gm-publish'),
+        'the set GREW, so an exact-set key misses and offers every cell again — three of which are already public and cannot be un-published',
+      ).toBeDisabled(),
+    );
+
+    // Retry the failed cell. `RETRY_FAILED` preserves every done cell WITH its id
+    // and workflowId, so the publishable set grows 3 -> 4.
+    await userEvent.click(screen.getByTestId('gm-retry'));
+
+    // PROBE: the control re-arms for the ONE new cell only. An exact-set key
+    // missed here and offered "Publish 4 images", republishing three cells that
+    // were already permanent public images.
+    await waitFor(
+      () =>
+        expect(
+          screen.getByTestId('gm-publish'),
+          'the set GREW, so an exact-set key misses and offers every cell again — three of which are already public and cannot be un-published',
+        ).toHaveTextContent('Publish 1 more image'),
+      { timeout: 4000 },
+    );
+    expect(screen.getByTestId('gm-publish-extending')).toHaveTextContent(
+      /3 cells of this matrix are already published/i,
+    );
+  });
+});
+
+describe('gallery — the publish disarm survives a RELOAD (F2-round3)', () => {
+  it('🔴 a remount against the same storage does not re-offer a published matrix', async () => {
+    // `<Harness>` cannot express a reload — it builds a fresh store on mount — so
+    // this uses the same `mountShared` helper the M1 persistence tests use: one
+    // host, one backing store, rendered twice.
+    const shared = mountShared({
+      viewer,
+      consentGranted: true,
+      storage: { seed: { [RUN_STORAGE_KEY]: oneCellRunManifest() } },
+      publishImageIds: [9001],
+    });
+    try {
+      const button = await screen.findByTestId('gm-publish');
+      expect(button).toHaveTextContent('Publish 1 image');
+      await userEvent.click(button);
+      await waitFor(() =>
+        expect(screen.getByTestId('gm-publish-status')).toHaveTextContent(/Published 1 image/i),
+      );
+
+      shared.remount();
+
+      // PROBE: the ledger was written to the viewer's durable per-viewer KV, so
+      // the second mount knows this cell is already published. The previous
+      // session-held Set was simply gone here, and clicking again emitted
+      // "Published 1 image to the gallery." a second time — a string that only
+      // appears for a landed publish() AND a successful append().
+      await waitFor(() =>
+        expect(
+          screen.getByTestId('gm-publish'),
+          'the disarm used to live in useState, so a reload re-armed it while the cell ids and workflow ids came back intact',
+        ).toBeDisabled(),
+      );
+      expect(screen.getByTestId('gm-publish')).toHaveTextContent(/already published/i);
+      // No second publish happened, so the status line is absent on this mount.
+      expect(screen.queryByTestId('gm-publish-status')).toBeNull();
+
+      // And the gallery still holds exactly ONE row for this matrix. (The panel
+      // lives on the build screen, so this navigates there first — which is what
+      // makes row-counting reachable through `mountShared` at all.)
+      await userEvent.click(screen.getByTestId('gm-newrun'));
+      await userEvent.click(await screen.findByTestId('gm-reset-confirm'));
+      await screen.findByTestId('gm-gallery-item');
+      expect(screen.getAllByTestId('gm-gallery-item')).toHaveLength(1);
+    } finally {
+      shared.cleanup();
+    }
   });
 });

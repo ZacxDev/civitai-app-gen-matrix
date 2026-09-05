@@ -290,6 +290,7 @@ describe('PublishMatrixPanel', () => {
     messageIsProblem: false,
     signedIn: true,
     alreadyPublished: false,
+    alreadyPublishedCount: 0,
     onPublish: vi.fn(),
   };
 
@@ -442,6 +443,7 @@ describe('PublishMatrixPanel — already published', () => {
     messageIsProblem: false,
     signedIn: true,
     alreadyPublished: false,
+    alreadyPublishedCount: 0,
     onPublish: vi.fn(),
   };
 
@@ -460,5 +462,91 @@ describe('PublishMatrixPanel — already published', () => {
     render(<PublishMatrixPanel {...base} />);
     expect(screen.getByTestId('gm-publish')).toBeEnabled();
     expect(screen.queryByTestId('gm-publish-already')).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Round-3 follow-ups.
+// ---------------------------------------------------------------------------
+
+describe('PublishMatrixPanel — extending a partly-published matrix', () => {
+  const base = {
+    c,
+    publishable: 1,
+    alreadyPublishedCount: 3,
+    title: 'T',
+    setTitle: vi.fn(),
+    phase: { kind: 'idle' } as const,
+    message: null,
+    messageIsProblem: false,
+    signedIn: true,
+    alreadyPublished: false,
+    onPublish: vi.fn(),
+  };
+
+  it('🔴 says it will publish only what is NEW, into the same entry', () => {
+    render(<PublishMatrixPanel {...base} />);
+    expect(
+      screen.getByTestId('gm-publish'),
+      'gallery-percell-ledger-guard: a retry grows the publishable set, and a control that offers "Publish 4 images" over three already-public cells republishes them permanently',
+    ).toHaveTextContent('Publish 1 more image');
+    expect(screen.getByTestId('gm-publish-extending')).toHaveTextContent(
+      /3 cells of this matrix are already published/i,
+    );
+    expect(screen.getByTestId('gm-publish-extending')).toHaveTextContent(/same gallery entry/i);
+  });
+
+  it('says nothing about extending on a matrix published for the first time', () => {
+    render(<PublishMatrixPanel {...base} alreadyPublishedCount={0} publishable={4} />);
+    expect(screen.getByTestId('gm-publish')).toHaveTextContent('Publish 4 images');
+    expect(screen.queryByTestId('gm-publish-extending')).toBeNull();
+  });
+});
+
+describe('the two cohort sentences read together', () => {
+  it('🔴 the gallery note says who can ADD a row, not just who can publish images', () => {
+    render(<GalleryPanel {...props()} />);
+    const note = screen.getByTestId('gm-gallery-provenance-note').textContent ?? '';
+    expect(
+      note,
+      'gallery-cohort-legibility-guard: side by side with the publish panel’s "limited to moderators and app-developer testers", a bare "published by Civitai members" reads as a contradiction — the two describe different mechanisms and must say so',
+    ).toMatch(/any signed-in civitai member can add an entry/i);
+    expect(note).toMatch(/creating new images through this app is limited/i);
+  });
+
+  it('the publish panel names the same split from its own side', () => {
+    render(
+      <PublishMatrixPanel
+        c={c}
+        publishable={2}
+        alreadyPublishedCount={0}
+        title="T"
+        setTitle={vi.fn()}
+        phase={{ kind: 'idle' }}
+        message={null}
+        messageIsProblem={false}
+        signedIn
+        alreadyPublished={false}
+        onPublish={vi.fn()}
+      />,
+    );
+    const note = screen.getByTestId('gm-publish-cohort-note').textContent ?? '';
+    // The sentence the server actually backs is untouched…
+    expect(note).toMatch(/limited to Civitai moderators and app-developer testers/i);
+    // …and the clarifier stops it colliding with the gallery header.
+    expect(note).toMatch(/adding an entry to the gallery is open to any signed-in/i);
+  });
+});
+
+describe('the image grid has its own overflow container', () => {
+  it('🔴 scrolls the table rather than widening the card', () => {
+    render(<GalleryPanel {...props()} />);
+    const scroller = screen.getByTestId('gm-gallery-grid-scroll');
+    expect(
+      scroller.style.overflowX,
+      'gallery-grid-overflow-guard: up to 12 columns at minWidth 90 is ~1080px of table, and text wrapping does nothing for it — the width comes from the cells’ own minimum',
+    ).toBe('auto');
+    expect(scroller.style.maxWidth).toBe('100%');
+    expect(scroller.contains(screen.getByTestId('gm-gallery-grid'))).toBe(true);
   });
 });

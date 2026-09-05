@@ -14,8 +14,16 @@ export type PublishPhase =
 
 export interface PublishMatrixPanelProps {
   c: Palette;
-  /** How many cells of the open matrix can be published. */
+  /**
+   * How many cells of the open matrix are NOT yet published by this viewer.
+   *
+   * The remainder, never the whole publishable set: a retry that adds a fourth
+   * cell to a matrix whose three others are already in the gallery publishes ONE
+   * image, and the button says so.
+   */
   publishable: number;
+  /** Cells of this matrix already published — drives the "N more" wording. */
+  alreadyPublishedCount: number;
   title: string;
   setTitle: (value: string) => void;
   phase: PublishPhase;
@@ -41,6 +49,7 @@ export interface PublishMatrixPanelProps {
 export function PublishMatrixPanel({
   c,
   publishable,
+  alreadyPublishedCount,
   title,
   setTitle,
   phase,
@@ -51,6 +60,9 @@ export function PublishMatrixPanel({
   onPublish,
 }: PublishMatrixPanelProps) {
   const busy = phase.kind === 'busy';
+  // Some cells of this matrix are already in the gallery and some are not — the
+  // shape a "Retry failed" run leaves behind.
+  const extending = alreadyPublishedCount > 0 && publishable > 0;
   const disabled = busy || publishable === 0 || !signedIn || alreadyPublished;
 
   return (
@@ -73,9 +85,9 @@ export function PublishMatrixPanel({
           able to tell that from the screen, not from the API docs. */}
       <p style={{ ...noteStyle(c), margin: 0 }} data-testid="gm-publish-explainer">
         This creates {publishable} real, public {publishable === 1 ? 'image' : 'images'} on Civitai
-        &mdash; one per finished cell &mdash; and adds this grid to the gallery every viewer can
-        browse. Civitai asks you to confirm each image, and published images cannot be removed
-        afterwards; only the gallery entry can.
+        &mdash; one per finished cell &mdash; and {extending ? 'adds them to this matrix’s existing gallery entry' : 'adds this grid to the gallery every viewer can browse'}. Civitai asks you to
+        confirm each image, and published images cannot be removed afterwards; only the gallery
+        entry can.
       </p>
 
       {/* 🔴 THE COHORT GATE, SAID BEFORE THE CLICK. Publishing is restricted
@@ -85,7 +97,9 @@ export function PublishMatrixPanel({
           offered as though it will work for everyone. */}
       <p style={{ ...noteStyle(c), margin: 0 }} data-testid="gm-publish-cohort-note">
         Publishing is limited to Civitai moderators and app-developer testers. If your account
-        isn&rsquo;t one of those, the request is declined and nothing is published.
+        isn&rsquo;t one of those, the request is declined and nothing is published. That limit is
+        on creating the images &mdash; adding an entry to the gallery is open to any signed-in
+        Civitai member.
       </p>
 
       <label style={{ display: 'grid', gap: 4, fontSize: 13, fontWeight: 600 }}>
@@ -119,14 +133,24 @@ export function PublishMatrixPanel({
           ? `Confirming image ${Math.min(phase.done + 1, phase.total)} of ${phase.total}…`
           : alreadyPublished
             ? 'Already published to the gallery'
-            : `Publish ${publishable} ${publishable === 1 ? 'image' : 'images'}`}
+            : extending
+              ? `Publish ${publishable} more ${publishable === 1 ? 'image' : 'images'}`
+              : `Publish ${publishable} ${publishable === 1 ? 'image' : 'images'}`}
       </button>
 
       {alreadyPublished && !busy && (
         <p style={{ ...noteStyle(c), margin: 0 }} data-testid="gm-publish-already">
-          This matrix is already in the gallery. Publishing it again would create a second set of
-          public images, which cannot be undone &mdash; start a new matrix to publish a different
-          grid.
+          Every finished cell of this matrix is already in the gallery. Publishing it again would
+          create a second set of public images, which cannot be undone &mdash; start a new matrix
+          to publish a different grid.
+        </p>
+      )}
+
+      {extending && !busy && (
+        <p style={{ ...noteStyle(c), margin: 0 }} data-testid="gm-publish-extending">
+          {alreadyPublishedCount} {alreadyPublishedCount === 1 ? 'cell' : 'cells'} of this matrix
+          {alreadyPublishedCount === 1 ? ' is' : ' are'} already published. Only the rest will be
+          added, to the same gallery entry &mdash; its votes and reports are kept.
         </p>
       )}
 
