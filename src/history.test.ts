@@ -428,4 +428,82 @@ describe('evictBeyondRetention', () => {
     const storage = stubStorage(seedRuns(HISTORY_RETENTION_CAP + 3), { listRejects: true });
     await expect(evictBeyondRetention(storage)).resolves.toEqual([]);
   });
+
+  it('🔴 never evicts the run the POINTER names, with the empty `protect` the app really passes', async () => {
+    // 🔴 THE ARGUMENT WAS THE DOCUMENTED GUARD AND IT WAS INERT. At the app's
+    // only eviction call site `protect` is `[currentRunKeyRef.current]`, and
+    // that ref is `null` there: it is assigned two awaits deep inside the
+    // mount-restore effect, and `handleReset` clears it immediately before
+    // bumping the nonce that re-triggers eviction. So this passes `[null]`
+    // VERBATIM — a test that handed the function the key it is meant to protect
+    // would be testing a call site that does not exist.
+    //
+    // The scenario is the reachable one: `migrateLegacyRun` keys a blob with an
+    // unusable `savedAt` at the EPOCH, which under the inversion is the
+    // lexically LAST key — the first row eviction reaches — while being the run
+    // the active-run pointer names.
+    const start = Date.UTC(2026, 0, 1);
+    const rows = seedRuns(HISTORY_RETENTION_CAP + 3, start);
+    const activeKey = historyKeyFor(0);
+    expect(activeKey, 'the epoch key must be the lexically last one').toBe(
+      `${HISTORY_PREFIX}9999999999999`,
+    );
+    rows[activeKey] = { version: 1, cells: [] };
+    rows[ACTIVE_RUN_POINTER_KEY] = { key: activeKey };
+    const storage = stubStorage(rows);
+
+    const deleted = await evictBeyondRetention(storage, HISTORY_RETENTION_CAP, [null]);
+
+    expect(deleted, 'the active run was evicted').not.toContain(activeKey);
+    expect(storage.rows[activeKey], 'the active run was deleted from storage').toBeTruthy();
+  });
+
+  it('🔴 stops instead of deleting EVERY run when the host ignores the cursor it issued', async () => {
+    // 🔴 `seen` IS A RUNNING COUNTER ACROSS PAGES. A host that returns a
+    // `nextCursor` it does not honour hands page 2 the same rows page 1 already
+    // counted — every one of them now sitting past the cap, so the whole page is
+    // deleted, newest run included. Measured against the stub below without the
+    // progress guard: deleted 150, survivors 0, newest run survived FALSE.
+    //
+    // The client cannot observe that contract (it is asserted only in prose at
+    // `invertedStamp`), and what it loses is irreversible paid work — so the
+    // client has to be able to notice the host is not advancing.
+    const start = Date.UTC(2026, 0, 1);
+    const total = 150;
+    const rows = seedRuns(total, start);
+    const newest = historyKeyFor(start + (total - 1) * 60_000);
+    const deleted: string[] = [];
+    const cursorIgnoringHost: HistoryStorage = {
+      async get() {
+        return null;
+      },
+      async set() {
+        return { ok: true };
+      },
+      async delete(key: string) {
+        deleted.push(key);
+        delete rows[key];
+        return { ok: true };
+      },
+      // Honours `prefix` and `limit`, ORDERS correctly, and returns a
+      // `nextCursor` — and silently ignores the cursor it is given. Every page
+      // is therefore the head of the remaining keyspace.
+      async list({ prefix = '', limit = 100 } = {}) {
+        const all = Object.keys(rows)
+          .filter((k) => k.startsWith(prefix))
+          .sort();
+        const page = all.slice(0, limit);
+        const last = page[page.length - 1];
+        const keys = page.map((key) => ({ key, updatedAt: new Date(keyTime(key)) }));
+        return last !== undefined && page.length < all.length ? { keys, nextCursor: last } : { keys };
+      },
+    };
+
+    const removed = await evictBeyondRetention(cursorIgnoringHost, HISTORY_RETENTION_CAP);
+
+    expect(removed, 'the newest run was evicted by a non-advancing host').not.toContain(newest);
+    expect(rows[newest], 'the newest run was deleted from storage').toBeTruthy();
+    // And the history is not emptied: at least the cap's worth of rows survive.
+    expect(Object.keys(rows).length).toBeGreaterThanOrEqual(HISTORY_RETENTION_CAP);
+  });
 });

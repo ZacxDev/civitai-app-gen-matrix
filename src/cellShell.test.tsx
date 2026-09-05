@@ -182,6 +182,38 @@ describe('every cell status renders one shell of identical height', () => {
     expect(rule![1].replace(/\s+/g, ' ').trim()).toBe('display: block;');
   });
 
+  it('🔴 and that rule is UNLAYERED, which is the only reason it outranks the library', () => {
+    // The sibling above pins the DECLARATION. This pins the CASCADE POSITION the
+    // declaration depends on, which is a different property and the one that
+    // actually decides the winner: the design system ships
+    // `[data-civitai-ui='tooltip'] { display: inline-flex }` inside
+    // `@layer civitai.components`, and UNLAYERED author CSS outranks every layer
+    // regardless of source order. Wrapping this stylesheet in a layer later —
+    // a plausible tidy-up — would put the two declarations in the same
+    // competition and hand it back to the library on specificity/order, i.e.
+    // restore the 106px `blocked` cell with the sibling test still GREEN.
+    //
+    // jsdom cannot evaluate the cascade at all (it fails to parse this file and
+    // returns `''` for every property — see above), so the checkable form is
+    // that the stylesheet declares no layer.
+    const appCss = readFileSync(join(process.cwd(), 'src/index.css'), 'utf8');
+    expect(appCss.length, 'the stylesheet must actually have been read').toBeGreaterThan(500);
+    // 🔴 STRIP COMMENTS FIRST. The rule's own doc comment says the words
+    // "@layer civitai.components", so a raw match over the file reports a layer
+    // that is not there and the guard is red on the pristine tree — a broken
+    // instrument, caught by running it before believing it.
+    const code = appCss.replace(/\/\*[\s\S]*?\*\//g, '');
+    expect(code, 'comment stripping must not eat the rule it guards').toContain(
+      `.${CELL_TOOLTIP_CLASS}`,
+    );
+    const layers = code.match(/@layer\b/g) ?? [];
+    expect(
+      layers,
+      `index.css must stay unlayered or .${CELL_TOOLTIP_CLASS} loses to ` +
+        `@layer civitai.components — found ${layers.length} @layer at-rule(s)`,
+    ).toEqual([]);
+  });
+
   it('renders a shell even for a missing cell, so a gap cannot shorten its row', () => {
     // Asserts PRESENCE only. The exact row template is the previous test's
     // property; repeating it here would mean one mutation to the template

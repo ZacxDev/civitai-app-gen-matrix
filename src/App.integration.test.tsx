@@ -476,6 +476,70 @@ describe('a matrix reopened from history is an archive, not a run you are in', (
       shared.cleanup();
     }
   });
+
+  it('🔴 stays terminal: reconcile cannot put it back on “Generating…”', async () => {
+    // 🔴 THE SEAM BETWEEN TWO INDIVIDUALLY-CORRECT HALVES.
+    // `archiveStateFromManifest` maps a `polling` cell to `timedout`;
+    // `isReconcileFinal` is `isTerminalCell(status) && status !== 'timedout'`,
+    // so reconcile treats EXACTLY the cells the archive form produced as
+    // non-final and re-activates them. Measured at unit level: archive statuses
+    // `done,timedout` reconcile to `done,polling` with `resumableIds`
+    // `["128078::cinematic"]`. Neither `persistence.test.ts` nor a component
+    // test can see it, because neither ever holds both states at once.
+    //
+    // The trigger is real and lives here too: `handleOpenHistory` does not reset
+    // `reconciledSigRef`, and the `doneCount` effect fires a refetch 400 ms
+    // after the archive loads — which is what changes the read-model identity
+    // and re-runs the reconcile effect. What the viewer would see: a matrix the
+    // app calls terminal and read-only back on "Generating…", with Stop and
+    // Re-check both withheld by `readOnly` — no way to stop it, no way to
+    // re-check it, and a poll loop discarding what it learns.
+    //
+    // `wf_1` is deliberately still `processing` in the read-model: that is the
+    // arm that reports the cell resumable. `wf_0` is `succeeded` so the archive
+    // has a done cell and the `doneCount` refetch actually fires.
+    const shared = mountShared({
+      viewer,
+      consentGranted: true,
+      storage: { seed: seedInterruptedRun() },
+      appWorkflows: {
+        workflows: [
+          {
+            workflowId: 'wf_0',
+            status: 'succeeded',
+            images: [{ url: 'https://img.example/0.jpeg', width: 1, height: 1, nsfwLevel: 1 }],
+            cost: 8,
+            createdAt: new Date().toISOString(),
+          },
+          {
+            workflowId: 'wf_1',
+            status: 'processing',
+            images: [],
+            cost: null,
+            createdAt: new Date().toISOString(),
+          },
+        ],
+      },
+    });
+    try {
+      await userEvent.click(await screen.findByTestId('gm-history-open'));
+      // The in-flight cell opens on the archive's terminal reading of it.
+      await waitFor(() => expect(screen.getByText('may still finish')).toBeInTheDocument(), {
+        timeout: 4000,
+      });
+      // Well past the 400 ms refetch that re-fires reconcile, so the write this
+      // test forbids has had every chance to land.
+      await new Promise((resolve) => setTimeout(resolve, 1200));
+
+      expect(
+        screen.queryByText('Generating…'),
+        'a reopened archive re-entered a live poll',
+      ).toBeNull();
+      expect(screen.getByText('may still finish')).toBeInTheDocument();
+    } finally {
+      shared.cleanup();
+    }
+  });
 });
 
 /**

@@ -846,6 +846,13 @@ export function App() {
       // deletes would simply reject. See `HISTORY_RETENTION_CAP` — the quota is
       // per APP, so one heavy viewer's unbounded rows turn persistence off for
       // everyone, silently.
+      // 🔴 `currentRunKeyRef.current` IS `null` HERE ON MOUNT, MEASURED — it is
+      // assigned two awaits deep in the restore effect above, and `handleReset`
+      // clears it just before bumping the nonce. It is passed anyway because
+      // mid-session it IS the key (minted by `beginRun`, before the 250 ms
+      // persist write has told storage about it), but the guard that actually
+      // protects the active run is `evictBeyondRetention`'s own pointer read —
+      // see its doc comment.
       if (viewer) {
         await evictBeyondRetention(storage, HISTORY_RETENTION_CAP, [currentRunKeyRef.current]);
       }
@@ -886,7 +893,24 @@ export function App() {
   // matrix cells (by workflowId) and resume polling anything still running
   // server-side. Only acts on cells that carry a workflowId, and never during a
   // fresh (unstarted) build — reconcile can't re-charge.
+  //
+  // 🔴 AN ARCHIVE IS INERT TO RECONCILE, AND THAT IS A SEAM, NOT A TIDY-UP.
+  // `archiveStateFromManifest` maps a `polling` cell to `timedout`, and
+  // `isReconcileFinal` is `isTerminalCell(status) && status !== 'timedout'` — so
+  // reconcile treats exactly the cells the archive form produced as NON-final
+  // and re-activates them. Measured at unit level: archive statuses
+  // `done,timedout` reconcile to `done,polling` with one resumable id. Both
+  // halves are individually correct; only their composition is wrong. The
+  // trigger exists too — `handleOpenHistory` does not reset `reconciledSigRef`,
+  // and the `doneCount` effect below fires a refetch 400 ms after the archive
+  // loads. The result a viewer would see: a "terminal, read-only" archive back
+  // on "Generating…", with no Stop and no Re-check (both withheld by
+  // `readOnly`), polling the network and discarding what it learns.
+  //
+  // The guard is FIRST, before the signature is consumed, so leaving the archive
+  // reconciles normally instead of skipping the page it never processed.
   useEffect(() => {
+    if (viewingHistory) return;
     if (appWorkflows.length === 0) return;
     if (!state.cells.some((c) => c.workflowId != null)) return;
     // Re-run only when the read-model actually changed (avoid a reconcile loop).
@@ -902,7 +926,7 @@ export function App() {
     // state.cells intentionally omitted: keyed on the read-model signature so a
     // reconcile-driven cell change doesn't immediately re-fire this effect.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [appWorkflows, resumePolling]);
+  }, [appWorkflows, resumePolling, viewingHistory]);
 
   // ---- M1 — persist the run as it progresses (signed-in only) ----
   // Written on every material state change so a reload mid-run recovers. anon /

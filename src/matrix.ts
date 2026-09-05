@@ -98,7 +98,12 @@ export function sharedPromptFromCell(cell: Pick<MatrixCell, 'prompt' | 'modifier
   // typed, offered with no hint it had been altered. Nothing downstream can
   // distinguish the two readings either, so this returns `null` (rendered as no
   // prompt line at all) rather than pick one. `sharedPromptFromCells` then falls
-  // through to a cell that CAN answer — a baseline column always can.
+  // through to a cell that CAN answer — in practice the baseline column, whose
+  // effective prompt IS the shared prompt. ⚠️ NOT A GUARANTEE, THOUGH:
+  // `BASELINE_MODIFIER` is deselectable, so a run of only suffix-bearing columns
+  // at the clamp has no cell that can answer and the `Prompt:` line is dropped
+  // entirely. That is still the honest outcome — no line beats a line the viewer
+  // never typed — but it is a refusal, not a fallback that always lands.
   if (effective.length >= PROMPT_MAX) return null;
   const tail = `, ${suffix}`;
   if (effective.endsWith(tail)) return effective.slice(0, -tail.length);
@@ -112,8 +117,10 @@ export function sharedPromptFromCell(cell: Pick<MatrixCell, 'prompt' | 'modifier
  *
  * Takes the first cell that yields an exact answer — cells of one run share a
  * prompt by construction, and a cell whose composition was truncated simply
- * cannot answer, so it is skipped in favour of one that can (a baseline column
- * always can). Returns `null` when no cell can answer.
+ * cannot answer, so it is skipped in favour of one that can (in practice the
+ * baseline column — but it is deselectable, so a run of only suffix-bearing
+ * columns at the clamp has no answering cell). Returns `null` when no cell can
+ * answer, and the header then shows no prompt line at all.
  */
 export function sharedPromptFromCells(
   cells: readonly Pick<MatrixCell, 'prompt' | 'modifier'>[],

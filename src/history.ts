@@ -214,17 +214,50 @@ const EVICT_PAGE_SIZE = 64;
 const EVICT_MAX_PAGES = 8;
 
 /**
+ * The key the active-run pointer names, or `null` when there is no active run
+ * (or the pointer cannot be read).
+ *
+ * Exported because it is the ONLY durable answer to "which run is the viewer
+ * in". React refs are session-local and, at mount, not yet assigned — see
+ * `evictBeyondRetention`.
+ */
+export async function readActiveRunKey(storage: HistoryStorage): Promise<string | null> {
+  try {
+    const pointer = await storage.get<{ key?: unknown }>(ACTIVE_RUN_POINTER_KEY);
+    return typeof pointer?.key === 'string' ? pointer.key : null;
+  } catch {
+    // A pointer we cannot read protects nothing, but it must not abort eviction
+    // either — an unapproved-scopes viewer's `list` is about to fail anyway.
+    return null;
+  }
+}
+
+/**
  * Delete every run past `cap`, oldest first. Returns the keys it removed.
  *
  * Best-effort in the same sense every other write here is — a viewer whose
  * scopes are not approved simply evicts nothing. See `HISTORY_RETENTION_CAP`
  * for why unbounded growth is a shared-fate failure rather than a personal one.
  *
- * 🔴 `protect` IS NOT DECORATION. Eviction walks a list the caller did not
- * build, and the one row that must never be deleted is the run currently on
- * screen. The key ordering already puts it first (it is the newest), but that is
- * a property of the key format — an argument the caller controls is the guard
- * that survives the key format changing again.
+ * 🔴 THE ACTIVE RUN IS PROTECTED BY READING THE POINTER — NOT BY `protect`.
+ * This doc comment previously claimed `protect` was "the guard that survives the
+ * key format changing again". It was not: measured at the app's only call site,
+ * the argument arrives as `[null]`. `currentRunKeyRef` is assigned two awaits
+ * deep inside the mount-restore effect, and the eviction effect reads it
+ * synchronously before either await resolves; the other trigger (`handleReset`)
+ * sets it to `null` immediately before bumping the nonce. So the active run was
+ * guarded ONLY by key ordering — exactly the property the argument was supposed
+ * to outlive — and a documented-but-inert guard is worse than none, because it
+ * stops the next person looking.
+ *
+ * The reachable case: `migrateLegacyRun` keys a blob with an unusable `savedAt`
+ * at the epoch, which under the inversion is `…:9999999999999` — the lexically
+ * LAST key, i.e. the FIRST evicted, while being the run the pointer names.
+ *
+ * `protect` survives as a genuine caller-controlled addition: mid-session the
+ * app knows the key it just minted before the 250 ms persist write has landed,
+ * and storage does not. It is a supplement to the pointer read, never the only
+ * guard.
  */
 export async function evictBeyondRetention(
   storage: HistoryStorage,
@@ -232,10 +265,15 @@ export async function evictBeyondRetention(
   protect: readonly (string | null | undefined)[] = [],
 ): Promise<string[]> {
   const keep = new Set(protect.filter((k): k is string => typeof k === 'string'));
+  const activeKey = await readActiveRunKey(storage);
+  if (activeKey !== null) keep.add(activeKey);
   const deleted: string[] = [];
   try {
     let cursor: string | undefined;
     let seen = 0;
+    // The greatest key already consumed. Pages arrive in ascending key order, so
+    // a page that does not start strictly above this one is not a NEW page.
+    let lastKey: string | undefined;
     for (let page = 0; page < EVICT_MAX_PAGES; page += 1) {
       const res = await storage.list({
         prefix: HISTORY_PREFIX,
@@ -244,6 +282,16 @@ export async function evictBeyondRetention(
       });
       const keys = res?.keys ?? [];
       if (keys.length === 0) break;
+      // 🔴 PROGRESS GUARD — WITHOUT IT A HOST THAT IGNORES ITS OWN CURSOR
+      // DELETES THE ENTIRE HISTORY. `seen` is a running counter ACROSS pages, so
+      // a page that repeats rows already counted has every one of them sitting
+      // past the cap and is deleted wholesale — including the newest run, which
+      // page 1 had just spared. Measured against a `list` that ignores `cursor`
+      // but still returns a `nextCursor`: deleted 150, survivors 0, newest run
+      // survived false. Correctness otherwise rests entirely on a host contract
+      // this client cannot observe (see `invertedStamp`), and the loss is
+      // irreversible paid work.
+      if (lastKey !== undefined && !(keys[0].key > lastKey)) break;
       for (const row of keys) {
         if (seen >= cap && !keep.has(row.key)) {
           await storage.delete(row.key).catch(() => undefined);
@@ -251,6 +299,7 @@ export async function evictBeyondRetention(
         }
         seen += 1;
       }
+      lastKey = keys[keys.length - 1].key;
       cursor = res.nextCursor;
       if (!cursor) break;
     }
