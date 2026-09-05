@@ -25,6 +25,16 @@ export interface PublishMatrixPanelProps {
   messageIsProblem: boolean;
   /** False for an anonymous viewer — `publish` rejects for them. */
   signedIn: boolean;
+  /**
+   * This exact matrix has already been published in this session.
+   *
+   * 🔴 THE CONTROL MUST NOT RE-ARM ON THE SAME GRID. Publishing creates real,
+   * permanent public images and there is no un-publish, so a second click on a
+   * matrix already published is unrecoverable duplication — measured: two clicks
+   * produced two gallery rows and two sets of images, with the button enabled
+   * and identically labelled in between.
+   */
+  alreadyPublished: boolean;
   onPublish: () => void;
 }
 
@@ -37,10 +47,11 @@ export function PublishMatrixPanel({
   message,
   messageIsProblem,
   signedIn,
+  alreadyPublished,
   onPublish,
 }: PublishMatrixPanelProps) {
   const busy = phase.kind === 'busy';
-  const disabled = busy || publishable === 0 || !signedIn;
+  const disabled = busy || publishable === 0 || !signedIn || alreadyPublished;
 
   return (
     <section
@@ -106,8 +117,18 @@ export function PublishMatrixPanel({
       >
         {busy
           ? `Confirming image ${Math.min(phase.done + 1, phase.total)} of ${phase.total}…`
-          : `Publish ${publishable} ${publishable === 1 ? 'image' : 'images'}`}
+          : alreadyPublished
+            ? 'Already published to the gallery'
+            : `Publish ${publishable} ${publishable === 1 ? 'image' : 'images'}`}
       </button>
+
+      {alreadyPublished && !busy && (
+        <p style={{ ...noteStyle(c), margin: 0 }} data-testid="gm-publish-already">
+          This matrix is already in the gallery. Publishing it again would create a second set of
+          public images, which cannot be undone &mdash; start a new matrix to publish a different
+          grid.
+        </p>
+      )}
 
       {!signedIn && (
         <p style={{ ...noteStyle(c), margin: 0 }} data-testid="gm-publish-anon">

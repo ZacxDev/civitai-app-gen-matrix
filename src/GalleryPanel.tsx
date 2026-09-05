@@ -14,6 +14,8 @@ import type { MaturityGate } from './persistence.js';
 import { noteStyle, secondaryBtn, type Palette } from './theme.js';
 import {
   columnLabel,
+  isOwnEntry,
+  provenanceLabel,
   resolveEntryImages,
   rowLabel,
   type GalleryEntry,
@@ -41,7 +43,16 @@ export interface GalleryPanelProps {
   maturityGate: MaturityGate;
   /** False for an anonymous viewer: vote/report/withdraw all reject for them. */
   signedIn: boolean;
-  /** Keys this viewer published — the only rows Withdraw may be offered on. */
+  /**
+   * This viewer's own user id, from the slot context — the half of the ownership
+   * comparison the app can prove. `null`/absent fails CLOSED (nothing is yours).
+   */
+  viewerUserId: number | null | undefined;
+  /**
+   * Rows this viewer's PRIVATE storage says they published. A supplement to the
+   * id comparison for the same-session case, never a substitute — see
+   * `isOwnEntry`.
+   */
   ownKeys: ReadonlySet<string>;
   /** Keys this viewer has already reported (settles `ReportButton` on load). */
   reportedKeys: ReadonlySet<string>;
@@ -60,9 +71,21 @@ export function GalleryPanel(props: GalleryPanelProps) {
   return (
     <section style={{ display: 'grid', gap: 8 }} data-testid="gm-gallery">
       <h2 style={{ fontSize: 14, margin: 0, fontWeight: 700 }}>Published matrices</h2>
-      <p style={{ ...noteStyle(c), margin: 0 }}>
-        Grids the app author has published. Each image is a real, public Civitai image, shown to
-        you under your own browsing settings.
+      {/* 🔴 THIS LINE USED TO SAY "Grids the app author has published", AND THAT
+          WAS FALSE. Creating the IMAGES is cohort-gated, but creating the shared
+          ENTRY is not: `resolveSharedContext` deliberately does not reuse
+          `assertViewerIsAppDeveloper`, so any authenticated viewer past
+          min-trust can append a row — including one pointing at image ids they
+          read out of somebody else's entry, which then renders REAL images under
+          the app's voice. The app has no way to learn the app-author's user id
+          (nothing in `BLOCK_INIT`, the slot context or the manifest carries it,
+          and this repo is public, so a hardcoded constant would put a person's
+          id in public source). So the claim is dropped rather than faked, and
+          each row carries the only provenance the app can prove — see
+          `provenanceLabel`. */}
+      <p style={{ ...noteStyle(c), margin: 0 }} data-testid="gm-gallery-provenance-note">
+        Matrices published to this app&rsquo;s gallery by Civitai members. Each image is a real,
+        public Civitai image, shown to you under your own browsing settings.
       </p>
 
       {load == null && (
@@ -115,6 +138,7 @@ function GalleryEntryCard({
   images,
   maturityGate,
   signedIn,
+  viewerUserId,
   ownKeys,
   reportedKeys,
   busyKeys,
@@ -123,7 +147,7 @@ function GalleryEntryCard({
   onReport,
   onWithdraw,
 }: GalleryPanelProps & { entry: GalleryEntry }) {
-  const isOwn = ownKeys.has(entry.key);
+  const isOwn = isOwnEntry(entry, { signedIn, viewerUserId }, ownKeys);
   const busy = busyKeys.has(entry.key);
   const actionError = actionErrors.get(entry.key);
   const view =
@@ -151,14 +175,25 @@ function GalleryEntryCard({
     >
       {/* Moderated text. The title and body are the ONLY strings here that came
           from a person; everything else is derived from ids. */}
-      <h3 style={{ fontSize: 14, margin: 0, fontWeight: 700 }} data-testid="gm-gallery-title">
+      <h3
+        style={{ fontSize: 14, margin: 0, fontWeight: 700, ...WRAP_ANYWHERE }}
+        data-testid="gm-gallery-title"
+      >
         {entry.title}
       </h3>
       {entry.body != null && (
-        <p style={{ ...noteStyle(c), margin: 0 }} data-testid="gm-gallery-body">
+        <p style={{ ...noteStyle(c), margin: 0, ...WRAP_ANYWHERE }} data-testid="gm-gallery-body">
           {entry.body}
         </p>
       )}
+
+      {/* 🔴 RENDERED ON EVERY ROW, INCLUDING SOMEBODY ELSE'S. A badge that
+          appears only on your own rows leaves every other row unlabelled, and an
+          unlabelled row in an app's gallery is read as the app's own — which is
+          the impersonation this replaced the header claim to close. */}
+      <p style={{ ...noteStyle(c), margin: 0 }} data-testid="gm-gallery-provenance">
+        {provenanceLabel(isOwn)}
+      </p>
 
       {/* The resources this matrix compared.
           🔴 TEMPORARY RENDERING — a shared `ResourceCard` is being added to
@@ -375,6 +410,19 @@ function WithdrawControl({
     </span>
   );
 }
+
+/**
+ * 🔴 Moderated text still comes off the wire as an ARBITRARY string. Length is
+ * bounded in `toGalleryEntry`; this bounds the other axis — a single unbroken
+ * token (a 300-character "word", a pasted URL) has no break opportunity, so
+ * without this it pushes the card wider than the iframe, and nothing else
+ * constrains the iframe's width.
+ */
+const WRAP_ANYWHERE: React.CSSProperties = {
+  overflowWrap: 'anywhere',
+  wordBreak: 'break-word',
+  minWidth: 0,
+};
 
 function chipStyle(c: Palette): React.CSSProperties {
   return {

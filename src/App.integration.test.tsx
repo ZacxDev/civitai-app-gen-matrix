@@ -876,3 +876,84 @@ describe('gallery — publishing', () => {
     expect(screen.queryByTestId('gm-publish-panel')).toBeNull();
   });
 });
+
+// ---------------------------------------------------------------------------
+// Audit follow-ups, driven end-to-end.
+// ---------------------------------------------------------------------------
+
+describe('gallery — provenance (F1)', () => {
+  it('🔴 a row appended by someone else cannot present as the app author’s', async () => {
+    renderApp({
+      viewer, // id 42
+      consentGranted: true,
+      shared: {
+        seed: [
+          {
+            // A different account entirely. Appending is NOT cohort-gated — any
+            // authenticated viewer past min-trust can add a row, including one
+            // carrying image ids read straight out of a genuine entry, which
+            // then renders REAL images.
+            authorUserId: 777,
+            value: {
+              title: 'Looks official',
+              data: galleryData([{ imageId: 9001, row: 0, col: 0 }]),
+            },
+          },
+        ],
+      },
+    });
+
+    expect(await screen.findByTestId('gm-gallery-provenance')).toHaveTextContent(
+      'Published by another Civitai member',
+    );
+    // The panel makes no app-authorship claim anywhere — that is what stopped a
+    // stranger's row inheriting the app's voice.
+    expect(screen.getByTestId('gm-gallery').textContent).not.toMatch(/app author/i);
+    // And it is not treated as the viewer's own.
+    expect(screen.queryByTestId('gm-gallery-withdraw')).toBeNull();
+  });
+});
+
+describe('gallery — publishing cannot be repeated (F2)', () => {
+  it('🔴 one publish, one gallery row — the control does not re-arm on the same matrix', async () => {
+    renderApp({
+      viewer,
+      consentGranted: true,
+      storage: { seed: { [RUN_STORAGE_KEY]: oneCellRunManifest() } },
+      publishImageIds: [9001],
+    });
+
+    const button = await screen.findByTestId('gm-publish');
+    // CONTROL: armed before the click, so the disabled state below is the
+    // publish's doing and not the panel's default.
+    expect(button).toBeEnabled();
+
+    await userEvent.click(button);
+    await waitFor(() =>
+      expect(screen.getByTestId('gm-publish-status')).toHaveTextContent(/Published 1 image/i),
+    );
+
+    // PROBE: the same matrix can no longer be published. There is no un-publish,
+    // so a second click would mean a second permanent set of public images.
+    await waitFor(() =>
+      expect(
+        screen.getByTestId('gm-publish'),
+        'two clicks used to produce two rows, each backed by its own publish() call and its own set of permanent public images — and there is no un-publish',
+      ).toBeDisabled(),
+    );
+    expect(screen.getByTestId('gm-publish')).toHaveTextContent(/already published/i);
+    expect(screen.getByTestId('gm-publish-already')).toBeInTheDocument();
+
+    // A second click attempt changes nothing.
+    await userEvent.click(screen.getByTestId('gm-publish'));
+
+    await userEvent.click(screen.getByTestId('gm-newrun'));
+    await userEvent.click(await screen.findByTestId('gm-reset-confirm'));
+
+    await screen.findByTestId('gm-gallery-item');
+    expect(
+      screen.getAllByTestId('gm-gallery-item'),
+      'two clicks used to produce two rows, each backed by its own publish() call and its own set of permanent public images',
+    ).toHaveLength(1);
+  });
+});

@@ -103,6 +103,7 @@ import {
   publishMatrix,
   publishResultMessage,
   publishableCells,
+  runPublishSignature,
   type GalleryEntry,
   type GalleryLoad,
 } from './gallery.js';
@@ -220,7 +221,7 @@ function useModalA11y(
 }
 
 export function App() {
-  const { ready, viewer, theme } = useBlockContext();
+  const { ready, viewer, theme, context } = useBlockContext();
   const token = useBlockToken();
   // The block's domain maturity ceiling (fail-closed SFW). Threaded into the
   // anon catalog read so a red-domain block's anon browse can show mature while
@@ -264,6 +265,18 @@ export function App() {
   const isDark = paintTheme(ready, theme) === 'dark';
   const c = palette(isDark);
   const anon = ready && !viewer;
+  // 🔴 THE SLOT CONTEXT, NOT `viewer.id`. `ViewerInfo.id`/`username` are
+  // `@deprecated` ("Init-time identity disclosure … scheduled for removal") and
+  // their supported replacement `useViewer()` is scope-gated on
+  // `user:read:self`. `PageSlotContext.viewerUserId` is neither: it is part of
+  // the context `PageBlockHost.buildContext()` already sends, carries no
+  // deprecation marker, and costs no scope. It is used for ONE thing — deciding
+  // whether a gallery row is this viewer's own — and it fails CLOSED when absent.
+  // This does NOT touch the sign-in gate above, which stays `ready && !viewer`.
+  const viewerUserId =
+    context != null && 'viewerUserId' in context && typeof context.viewerUserId === 'number'
+      ? context.viewerUserId
+      : null;
   const granted = hasBudgetedScope(token.scopes);
 
   const rootRef = useRef<HTMLDivElement>(null);
@@ -372,6 +385,10 @@ export function App() {
   const [publishTitle, setPublishTitle] = useState('');
   const [publishTitleTouched, setPublishTitleTouched] = useState(false);
   const [publishPhase, setPublishPhase] = useState<PublishPhase>({ kind: 'idle' });
+  // The signature of every matrix already published in this session. Keyed on
+  // the grid rather than a boolean so the control re-arms for a DIFFERENT matrix
+  // (a new run, or one reopened from history) but never for the same one.
+  const [publishedSignatures, setPublishedSignatures] = useState<Set<string>>(() => new Set());
   const [publishMessage, setPublishMessage] = useState<string | null>(null);
   const [publishProblem, setPublishProblem] = useState(false);
 
@@ -973,7 +990,19 @@ export function App() {
 
   // ---- Gallery — the viewer's own + reported keys, from PRIVATE storage ----
   useEffect(() => {
-    if (!ready || !viewer) return;
+    if (!ready) return;
+    // 🔴 CLEAR ON SIGN-OUT, DON'T JUST STOP READING. Early-returning without
+    // clearing left the previous viewer's keys in state: `Remove` stayed offered
+    // and ENABLED on rows the new (or anonymous) viewer does not own, and
+    // `withdraw` is author-scoped server-side, so pressing it is a guaranteed
+    // rejection — offering an error, which is the exact failure the id-free
+    // ownership design existed to avoid. Stale `reportedKeys` also suppressed
+    // Report for a viewer who never reported anything.
+    if (!viewer) {
+      setOwnKeys(new Set());
+      setReportedKeys(new Set());
+      return;
+    }
     let cancelled = false;
     void (async () => {
       const [own, reported] = await Promise.all([
@@ -1403,13 +1432,33 @@ export function App() {
   // The cells of the open matrix that can be published: `done`, with a
   // workflowId the host can re-derive ownership from.
   const publishPlan = useMemo(() => publishableCells(state.cells), [state.cells]);
+  const publishSignature = useMemo(() => runPublishSignature(state.cells), [state.cells]);
+  const alreadyPublished = publishSignature.length > 0 && publishedSignatures.has(publishSignature);
   // The title offered until the author edits it. Derived from the run's own
   // shared prompt, so it describes the matrix on screen rather than the form.
   const suggestedPublishTitle = defaultGalleryTitle(sharedPromptFromCells(state.cells));
   const effectivePublishTitle = publishTitleTouched ? publishTitle : suggestedPublishTitle;
 
+  // 🔴 THE SDK'S OWN DOC-COMMENT IS INCOMPLETE ABOUT WHY THIS REJECTS, AND AN
+  // AUDIT ALREADY GOT IT WRONG FROM THE CLIENT TYPES. `usePublishGenerationOutputs`
+  // enumerates its rejection causes as "anon viewer / missing scope / not-owned
+  // workflow / rate-limit / upload or scan failure" and OMITS the cohort gate
+  // entirely — and `assertViewerIsAppDeveloper` appears in the vendored `.d.ts`
+  // only on inline `customComfy` submission, so reading the client types alone
+  // yields the confident, wrong conclusion that publishing is open to everyone.
+  //
+  // The server is the authority, and it gates: civitai/civitai
+  // `src/server/routers/blocks.router.ts:3604` declares `publishGenerationOutputs`
+  // a `publicProcedure`, then `:3631` runs `assertAppBlocksEnabledForTokenUser`
+  // and `:3632` runs `assertViewerIsAppDeveloper(userId)` — BEFORE any image is
+  // created. So the cohort note in `PublishMatrixPanel` is true, and an ordinary
+  // viewer clicking Publish creates nothing.
+  //
+  // Do not re-derive "there is no cohort gate" from the client's declarations.
   const handlePublish = useCallback(() => {
     if (publishPhase.kind === 'busy') return;
+    // Belt for the disabled button: a duplicate publish is unrecoverable.
+    if (alreadyPublished) return;
     setPublishMessage(null);
     setPublishProblem(false);
     setPublishPhase({ kind: 'busy', done: 0, total: publishPlan.length });
@@ -1430,13 +1479,20 @@ export function App() {
         setPublishMessage(publishResultMessage(result));
         setPublishProblem(result.kind !== 'ok');
         if (result.kind === 'ok' || result.kind === 'partial') {
-          // Record the minted key as OURS, in the viewer's private storage. This
-          // is what makes Withdraw offerable without a `user:read:self` scope.
+          // Record the minted key as OURS, in the viewer's private storage — the
+          // same-session supplement to the host-stamped `authorUserId` check.
           setOwnKeys((prev) => {
             const next = addKeyToSet([...prev], result.key);
             persistKeySet(PUBLISHED_KEYS_STORAGE_KEY, next);
             return new Set(next);
           });
+          // 🔴 Disarm the control for THIS matrix, and drop the title the viewer
+          // typed for it. Without both, a second click republished the identical
+          // grid under the identical title — a second set of permanent public
+          // images, with no un-publish.
+          setPublishedSignatures((prev) => new Set(prev).add(publishSignature));
+          setPublishTitle('');
+          setPublishTitleTouched(false);
           setGalleryNonce((n) => n + 1);
         }
       })
@@ -1453,7 +1509,9 @@ export function App() {
       .finally(() => setPublishPhase({ kind: 'idle' }));
   }, [
     publishPhase.kind,
+    alreadyPublished,
     publishPlan,
+    publishSignature,
     effectivePublishTitle,
     state.cells,
     publish,
@@ -1559,6 +1617,7 @@ export function App() {
             images={galleryImages}
             maturityGate={maturityGate}
             signedIn={!anon}
+            viewerUserId={viewerUserId}
             ownKeys={ownKeys}
             reportedKeys={reportedKeys}
             busyKeys={galleryBusyKeys}
@@ -1647,6 +1706,7 @@ export function App() {
             message={publishMessage}
             messageIsProblem={publishProblem}
             signedIn={!anon}
+            alreadyPublished={alreadyPublished}
             onPublish={handlePublish}
           />
         )}

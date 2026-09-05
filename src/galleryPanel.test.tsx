@@ -18,6 +18,8 @@ const gate = { isLevelAllowed: (l: number) => l <= 1, isSfw: true };
 
 function entry(over: Partial<GalleryEntry> = {}): GalleryEntry {
   return {
+    // 🔴 91 ≠ the fixture viewer's 42, so the DEFAULT row in every test below is
+    // somebody else's. The dangerous default is the one that reads as the app's.
     key: 'k_a',
     authorUserId: 91,
     title: 'Lighthouse study',
@@ -54,6 +56,7 @@ function props(over: Partial<GalleryPanelProps> = {}): GalleryPanelProps {
     },
     maturityGate: gate,
     signedIn: true,
+    viewerUserId: 42,
     ownKeys: new Set(),
     reportedKeys: new Set(),
     busyKeys: new Set(),
@@ -286,6 +289,7 @@ describe('PublishMatrixPanel', () => {
     message: null,
     messageIsProblem: false,
     signedIn: true,
+    alreadyPublished: false,
     onPublish: vi.fn(),
   };
 
@@ -337,5 +341,124 @@ describe('PublishMatrixPanel', () => {
     const status = screen.getByTestId('gm-publish-status');
     expect(status).toHaveAttribute('role', 'status');
     expect(status).toHaveTextContent(/limited to app developers/i);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// F1 — provenance. The app cannot prove app-authorship, so it must not imply it.
+// ---------------------------------------------------------------------------
+
+describe('GalleryPanel — provenance', () => {
+  it('🔴 never claims a row came from the app author', () => {
+    render(<GalleryPanel {...props()} />);
+    expect(
+      screen.getByTestId('gm-gallery').textContent,
+      'gallery-provenance-guard: creating the shared ENTRY is not cohort-gated — any authenticated viewer past min-trust can append a row pointing at ids they read out of the gallery, so a header claiming app-authorship lends the app’s voice to a stranger',
+    ).not.toMatch(/app author/i);
+  });
+
+  it('labels a stranger’s row as a stranger’s, not as unlabelled', () => {
+    render(<GalleryPanel {...props()} />);
+    expect(
+      screen.getByTestId('gm-gallery-provenance'),
+      'gallery-provenance-badge-guard: a badge shown only on your OWN rows leaves every other row unlabelled, and an unlabelled row in an app’s gallery is read as the app’s own',
+    ).toHaveTextContent('Published by another Civitai member');
+  });
+
+  it('labels the viewer’s own row from the host-stamped authorUserId', () => {
+    render(
+      <GalleryPanel
+        {...props({ load: { kind: 'ok', entries: [entry({ authorUserId: 42 })], truncated: false } })}
+      />,
+    );
+    expect(screen.getByTestId('gm-gallery-provenance')).toHaveTextContent('Published by you');
+    expect(screen.getByTestId('gm-gallery-withdraw')).toBeInTheDocument();
+  });
+
+  it('🔴 fails CLOSED when the viewer id is unknown — nothing is yours', () => {
+    render(
+      <GalleryPanel
+        {...props({
+          viewerUserId: null,
+          load: { kind: 'ok', entries: [entry({ authorUserId: 42 })], truncated: false },
+        })}
+      />,
+    );
+    expect(
+      screen.queryByTestId('gm-gallery-withdraw'),
+      'gallery-own-failclosed-guard: with no id to compare, withdraw (author-scoped server-side) must be withheld — offering it wrongly guarantees an error, withholding it costs one refresh',
+    ).toBeNull();
+    expect(screen.getByTestId('gm-gallery-provenance')).toHaveTextContent('another Civitai member');
+  });
+
+  it('🔴 a signed-OUT viewer owns nothing, even with keys left in state', () => {
+    // F5: the own-keys effect used to early-return on sign-out WITHOUT clearing,
+    // leaving an enabled Remove on rows the current viewer does not own.
+    render(<GalleryPanel {...props({ signedIn: false, ownKeys: new Set(['k_a']) })} />);
+    expect(
+      screen.queryByTestId('gm-gallery-withdraw'),
+      'gallery-signedout-own-guard: withdraw is author-scoped server-side, so a stale own-key surviving a sign-out offers a control that can only reject',
+    ).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// F4 — text read off the wire is bounded on BOTH axes.
+// ---------------------------------------------------------------------------
+
+describe('GalleryPanel — hostile text cannot break the layout', () => {
+  it('🔴 wraps an unbroken token instead of pushing the card past the iframe', () => {
+    render(
+      <GalleryPanel
+        {...props({
+          load: {
+            kind: 'ok',
+            entries: [entry({ title: 'A'.repeat(300), body: 'B'.repeat(300) })],
+            truncated: false,
+          },
+        })}
+      />,
+    );
+    expect(
+      screen.getByTestId('gm-gallery-title').style.overflowWrap,
+      'gallery-wrap-guard: a single unbroken token has no break opportunity, so without an explicit wrap it widens the card past the iframe — and nothing constrains the iframe’s width',
+    ).toBe('anywhere');
+    expect(screen.getByTestId('gm-gallery-body').style.overflowWrap).toBe('anywhere');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// F2 — a published matrix cannot be published again.
+// ---------------------------------------------------------------------------
+
+describe('PublishMatrixPanel — already published', () => {
+  const base = {
+    c,
+    publishable: 4,
+    title: 'T',
+    setTitle: vi.fn(),
+    phase: { kind: 'idle' } as const,
+    message: null,
+    messageIsProblem: false,
+    signedIn: true,
+    alreadyPublished: false,
+    onPublish: vi.fn(),
+  };
+
+  it('🔴 disables and RELABELS once this matrix is in the gallery', () => {
+    render(<PublishMatrixPanel {...base} alreadyPublished />);
+    const button = screen.getByTestId('gm-publish');
+    expect(
+      button,
+      'gallery-republish-guard: publishing creates real, permanent public images with no un-publish, so the control must not return to enabled on a matrix already published',
+    ).toBeDisabled();
+    expect(button).toHaveTextContent(/already published/i);
+    expect(screen.getByTestId('gm-publish-already')).toHaveTextContent(/cannot be undone/i);
+  });
+
+  it('stays armed for a matrix that has not been published', () => {
+    render(<PublishMatrixPanel {...base} />);
+    expect(screen.getByTestId('gm-publish')).toBeEnabled();
+    expect(screen.queryByTestId('gm-publish-already')).toBeNull();
   });
 });

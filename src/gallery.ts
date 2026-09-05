@@ -77,6 +77,28 @@ export const MAX_GATED_IMAGE_IDS = GALLERY_LIST_CAP * MAX_GALLERY_IMAGES;
 export const GALLERY_TITLE_MAX = 120;
 
 /**
+ * Longest body rendered from a gallery row.
+ *
+ * 🔴 THE WRITE BOUND IS NOT A READ BOUND, and that gap was a real defect: this
+ * app clamps what IT writes, but `SHARED_APPEND` is open to any authenticated
+ * viewer past the min-trust gate (`resolveSharedContext` deliberately does NOT
+ * reuse `assertViewerIsAppDeveloper` — that would forbid all general users), so
+ * every row this app READS was written by somebody else's client under somebody
+ * else's limits. A 5,000-character title is a wall of text in every viewer's
+ * gallery. The app applies its own bound to what it renders.
+ */
+export const GALLERY_BODY_MAX = 600;
+
+/**
+ * Clamp text read back off the wire, marking the cut so the truncation is
+ * visible rather than silent.
+ */
+export function clampRenderedText(raw: string, max: number): string {
+  if (raw.length <= max) return raw;
+  return `${raw.slice(0, max)}…`;
+}
+
+/**
  * The viewer's OWN gallery keys, in their PRIVATE per-viewer storage.
  *
  * 🔴 THIS IS WHY THE APP NEEDS NO `user:read:self`. Two controls depend on
@@ -203,6 +225,7 @@ export function parseGalleryData(raw: unknown): GalleryData | null {
 
   const images: GalleryImageRef[] = [];
   const seenIds = new Set<number>();
+  const seenCells = new Set<string>();
   const rawImages = Array.isArray(raw.images) ? raw.images : [];
   for (const entry of rawImages) {
     if (images.length >= MAX_GALLERY_IMAGES) break;
@@ -213,7 +236,16 @@ export function parseGalleryData(raw: unknown): GalleryData | null {
     if (imageId == null || row == null || col == null) continue;
     // A repeated id would ask the host for it twice and paint it twice.
     if (seenIds.has(imageId)) continue;
+    // 🔴 AND A REPEATED CELL LETS A FORGED BLOB STEER WHAT A CELL SAYS. Two
+    // DIFFERENT ids at one `(row, col)` are both accepted by the id check above,
+    // and the renderer takes the FIRST match — so a blob pairing an unresolvable
+    // id with a resolvable one at the same coordinate paints "No longer
+    // available" over an image that is right there. One image per cell, first
+    // wins, decided HERE rather than by the renderer's lookup order.
+    const cell = `${row}:${col}`;
+    if (seenCells.has(cell)) continue;
     seenIds.add(imageId);
+    seenCells.add(cell);
     images.push({ imageId, row, col });
   }
   if (images.length === 0) return null;
@@ -350,6 +382,26 @@ export function publishableCells(cells: readonly MatrixCell[]): PublishableCell[
     out.push({ cell, workflowId });
   }
   return out.sort((a, b) => a.cell.row - b.cell.row || a.cell.col - b.cell.col);
+}
+
+/**
+ * A stable identity for the matrix currently on screen.
+ *
+ * 🔴 THIS IS WHAT STOPS A SECOND PUBLISH OF THE SAME GRID. A completed publish
+ * used to return the button to enabled with the same label and the same title
+ * still in the box, so a second click published the identical matrix again —
+ * measured: one click gave one gallery row, two clicks gave two, each backed by
+ * its own `publish()` call and its own set of REAL, PERMANENT public images.
+ * There is no un-publish, so an accidental double-click is not recoverable.
+ *
+ * Keyed on the cells' identity AND their workflow ids rather than on a boolean,
+ * because the control must RE-ARM for a different matrix: starting a new run or
+ * reopening one from history is a different grid and is legitimately publishable.
+ */
+export function runPublishSignature(cells: readonly MatrixCell[]): string {
+  return publishableCells(cells)
+    .map((item) => `${item.cell.id}@${item.workflowId}`)
+    .join('|');
 }
 
 /** The host calls `publishMatrix` needs. Structural, so tests need no SDK. */
@@ -547,12 +599,17 @@ export function toGalleryEntry(item: SharedItemLike): GalleryEntry | null {
   if (!isObj(value) || typeof value.title !== 'string') return null;
   const data = parseGalleryData(value.data);
   if (data == null) return null;
-  const body = typeof value.body === 'string' && value.body.trim().length > 0 ? value.body : null;
+  const rawBody =
+    typeof value.body === 'string' && value.body.trim().length > 0 ? value.body : null;
   return {
     key: item.key,
+    // 🔴 `-1` is deliberately an id no Civitai account can hold, so a row whose
+    // author the host did not stamp can never coincide with a real viewer's id
+    // and be labelled "Published by you". See `isOwnEntry`.
     authorUserId: typeof item.authorUserId === 'number' ? item.authorUserId : -1,
-    title: value.title,
-    body,
+    // Bounded on READ, not just on write — see `GALLERY_BODY_MAX`.
+    title: clampRenderedText(value.title, GALLERY_TITLE_MAX),
+    body: rawBody == null ? null : clampRenderedText(rawBody, GALLERY_BODY_MAX),
     count: typeof item.count === 'number' && Number.isFinite(item.count) ? item.count : 0,
     viewerVoted: item.viewerVoted === true,
     updatedAt: item.updatedAt instanceof Date ? item.updatedAt : new Date(0),
@@ -563,21 +620,33 @@ export function toGalleryEntry(item: SharedItemLike): GalleryEntry | null {
 /**
  * Read the gallery index, newest-first (the host's own `list` ordering).
  *
- * Over-fetches by one row so `truncated` is a fact rather than a guess — see
- * `GALLERY_LIST_CAP`. Entries whose `data` does not validate are DROPPED, not
- * rendered: a shared store is a cross-user surface, so a blob written by
- * something that is not this app must not reach the renderer.
+ * 🔴 `nextCursor` IS THE AUTHORITY ON TRUNCATION; THE OVER-FETCH IS A BACKSTOP.
+ * This used to derive `truncated` purely from `items.length > cap` after asking
+ * for `cap + 1`, which measures the HOST'S WILLINGNESS TO HONOUR `limit`, not
+ * the gallery's size: a host that caps `limit` at or below `cap` returns a full
+ * page, the length test reads `false`, the notice never renders, and viewers
+ * silently see a partial gallery — the exact silent omission the over-fetch was
+ * built to prevent, reached from the other side. `SharedListResult.nextCursor`
+ * is documented "absent on the last page", so its PRESENCE is the fact.
+ *
+ * Both signals are kept and OR-ed. They fail in opposite directions — a host
+ * that always sends a cursor over-warns, a host that clamps `limit` under-warns
+ * — so requiring either to fire is the only combination that cannot go silent.
+ *
+ * Entries whose `data` does not validate are DROPPED, not rendered: a shared
+ * store is a cross-user surface, so a blob written by something that is not this
+ * app must not reach the renderer.
  */
 export async function loadGallery(
   store: GalleryStore,
   cap: number = GALLERY_LIST_CAP,
 ): Promise<GalleryLoad> {
   let items: SharedItemLike[];
-  let overfetched: boolean;
+  let truncated: boolean;
   try {
     const res = await store.list({ limit: cap + 1 });
     const all = res?.items ?? [];
-    overfetched = all.length > cap;
+    truncated = res?.nextCursor != null || all.length > cap;
     items = all.slice(0, cap);
   } catch {
     // No `entries: []` fallback here on purpose — see `GalleryLoad`.
@@ -588,7 +657,73 @@ export async function loadGallery(
     const entry = toGalleryEntry(item);
     if (entry != null) entries.push(entry);
   }
-  return { kind: 'ok', entries, truncated: overfetched };
+  return { kind: 'ok', entries, truncated };
+}
+
+// ---------------------------------------------------------------------------
+// Provenance — what the app can actually PROVE about who published a row.
+// ---------------------------------------------------------------------------
+
+/**
+ * Is this row the VIEWER's own?
+ *
+ * 🔴 THE APP CANNOT PROVE APP-AUTHORSHIP, AND IT USED TO CLAIM IT. The gallery
+ * header said "Grids the app author has published", which is false: creating the
+ * IMAGES is cohort-gated (`assertViewerIsAppDeveloper`, civitai
+ * `src/server/routers/blocks.router.ts:3632`) but creating the shared ENTRY is
+ * not — `resolveSharedContext` (`src/server/routers/apps-shared.router.ts:152`)
+ * deliberately does not reuse that assert, because copying it "would FORBID all
+ * general users". Its write path asks only for an approved block token, the
+ * shared-write scope, a fail-closed kill-switch, an authenticated subject and a
+ * min-trust gate.
+ *
+ * So any authenticated viewer past min-trust can `append`. And because
+ * `getImages` resolves images THE APP published — not "images this viewer
+ * published" — a non-author can read a genuine entry's ids straight out of the
+ * gallery and append their own row carrying the same ids. It renders REAL
+ * images. Under a header asserting app-authorship that is impersonation, not a
+ * cosmetic provenance slip.
+ *
+ * `authorUserId` is stamped by the HOST, not by the writing client, so it is the
+ * one provenance fact here that cannot be forged. The viewer's own id comes from
+ * the slot context (`PageSlotContext.viewerUserId`) — free, and NOT the
+ * `@deprecated` `ViewerInfo.id`/`useViewer()` path, so no `user:read:self`.
+ *
+ * 🔴 FAIL-CLOSED ON AN UNKNOWN VIEWER. With no id to compare, nothing is "yours":
+ * Withdraw is author-scoped server-side, so offering it wrongly guarantees an
+ * error, while withholding it costs a viewer one refresh. `ownKeys` (the rows
+ * this viewer's own private storage says they published) is a supplement for the
+ * same-session case, never a substitute — and it is gated on `signedIn` so a
+ * sign-out cannot leave a stale key offering an enabled Remove.
+ */
+export function isOwnEntry(
+  entry: Pick<GalleryEntry, 'key' | 'authorUserId'>,
+  viewer: { signedIn: boolean; viewerUserId: number | null | undefined },
+  ownKeys: ReadonlySet<string>,
+): boolean {
+  if (!viewer.signedIn) return false;
+  // 🔴 FAIL-CLOSED COMES FROM STRICT EQUALITY, NOT FROM A TYPE CHECK. This line
+  // used to read `typeof id === 'number' && Number.isFinite(id) && … === id`.
+  // The mutation sweep showed that clause SURVIVED, and it was right to: with
+  // `authorUserId` already a number (`toGalleryEntry` guarantees it), `=== id`
+  // returns false for `null`, `undefined`, `NaN` and a numeric STRING alike —
+  // measured across all five — so the extra clause could never change the
+  // answer. An unreachable guard that reads as coverage is worse than none,
+  // because it stops the next person looking; it is deleted rather than kept
+  // and re-described.
+  if (entry.authorUserId === viewer.viewerUserId) return true;
+  return ownKeys.has(entry.key);
+}
+
+/**
+ * The provenance label for one row — rendered on EVERY row, deliberately.
+ *
+ * Showing a badge only on your own rows leaves every other row unlabelled, and
+ * an unlabelled row in a gallery is read as the app's own. Labelling both sides
+ * is what stops a stranger's entry from inheriting the app's voice.
+ */
+export function provenanceLabel(isOwn: boolean): string {
+  return isOwn ? 'Published by you' : 'Published by another Civitai member';
 }
 
 // ---------------------------------------------------------------------------

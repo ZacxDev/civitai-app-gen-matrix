@@ -17,6 +17,12 @@ import {
   normalizeGalleryTitle,
   parseGalleryData,
   parseKeySet,
+  provenanceLabel,
+  isOwnEntry,
+  clampRenderedText,
+  runPublishSignature,
+  GALLERY_BODY_MAX,
+  GALLERY_TITLE_MAX,
   publishMatrix,
   publishResultMessage,
   publishableCells,
@@ -579,5 +585,173 @@ describe('private key sets', () => {
 
   it('round-trips through the stored shape', () => {
     expect(parseKeySet(keySetBlob(['x', 'y']))).toEqual(['x', 'y']);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// F1 — provenance. `authorUserId` is host-stamped; everything else is a guess.
+// ---------------------------------------------------------------------------
+
+describe('isOwnEntry', () => {
+  const row = { key: 'k_x', authorUserId: 91 };
+  const none = new Set<string>();
+
+  it('matches on the host-stamped authorUserId', () => {
+    expect(isOwnEntry(row, { signedIn: true, viewerUserId: 91 }, none)).toBe(true);
+    expect(isOwnEntry(row, { signedIn: true, viewerUserId: 42 }, none)).toBe(false);
+  });
+
+  // 🔴 AN INVARIANT GUARD, NOT A REGRESSION TEST — labelled as one deliberately.
+  // Fail-closed on an unknown viewer id is a property of strict equality against
+  // a number, so there is no mutation of `isOwnEntry` that breaks it while
+  // leaving the function otherwise intact: the sweep proved exactly that by
+  // SURVIVING the removal of the belt-and-braces type check that used to sit
+  // here. It is kept because the property is load-bearing and someone may later
+  // widen `authorUserId`'s type; it is NOT counted as coverage.
+  it('[invariant guard] treats an unknown viewer id as owning nothing', () => {
+    expect(isOwnEntry(row, { signedIn: true, viewerUserId: null }, none)).toBe(false);
+    expect(isOwnEntry(row, { signedIn: true, viewerUserId: undefined }, none)).toBe(false);
+    expect(isOwnEntry(row, { signedIn: true, viewerUserId: Number.NaN }, none)).toBe(false);
+  });
+
+  it('🔴 owns nothing when signed out, even with a private key saying otherwise', () => {
+    expect(
+      isOwnEntry(row, { signedIn: false, viewerUserId: 91 }, new Set(['k_x'])),
+      'gallery-signedout-own-guard: a sign-out must not leave a stale own-key (or a stale id) offering an enabled Remove that can only reject',
+    ).toBe(false);
+  });
+
+  it('falls back to the private key set for a same-session row', () => {
+    expect(isOwnEntry(row, { signedIn: true, viewerUserId: null }, new Set(['k_x']))).toBe(true);
+  });
+
+  it('labels both sides, so no row is left unlabelled', () => {
+    // The messaged assertion goes FIRST: ordered the other way, a mutant that
+    // breaks BOTH branches trips the unmessaged one and the test goes red
+    // without ever naming what it guards.
+    expect(
+      provenanceLabel(false),
+      'gallery-provenance-badge-guard: a stranger’s row must be labelled as one — an unlabelled row in an app’s gallery reads as the app’s own',
+    ).toBe('Published by another Civitai member');
+    expect(provenanceLabel(true)).toBe('Published by you');
+  });
+
+  it('🔴 an unstamped author can never collide with a real viewer id', () => {
+    const entry = toGalleryEntry(sharedItem({ authorUserId: undefined as unknown as number }));
+    expect(
+      entry?.authorUserId,
+      'gallery-author-sentinel-guard: the fallback must be an id no Civitai account can hold, or a row the host never stamped could match a real viewer and be labelled "Published by you"',
+    ).toBe(-1);
+    expect(isOwnEntry({ key: 'k', authorUserId: -1 }, { signedIn: true, viewerUserId: 0 }, new Set())).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// F2 — a matrix already published must not re-arm the control.
+// ---------------------------------------------------------------------------
+
+describe('runPublishSignature', () => {
+  it('🔴 is stable for the SAME matrix and different for another', () => {
+    const a = cellsFor(1, 2);
+    const b = cellsFor(1, 2).map((cell, i) => ({ ...cell, workflowId: `other_${i}` }));
+    expect(
+      runPublishSignature(a),
+      'gallery-republish-guard: the signature is what disarms the control for a matrix already published — if it were not stable across renders the button would re-arm and a second click would create a second set of permanent public images',
+    ).toBe(runPublishSignature(a));
+    expect(runPublishSignature(a)).not.toBe(runPublishSignature(b));
+  });
+
+  it('re-arms for a matrix with nothing publishable', () => {
+    // An empty signature is never "already published" — that is what lets the
+    // control arm again for a genuinely new run.
+    expect(runPublishSignature([])).toBe('');
+  });
+
+  it('ignores cells that are not publishable', () => {
+    const cells = cellsFor(1, 2);
+    const withFailure = [...cells, { ...cells[0], id: 'extra', status: 'failed' as const }];
+    expect(runPublishSignature(withFailure)).toBe(runPublishSignature(cells));
+  });
+});
+
+// ---------------------------------------------------------------------------
+// F3 — nextCursor is the authority on truncation.
+// ---------------------------------------------------------------------------
+
+describe('loadGallery truncation', () => {
+  it('🔴 reports truncation from nextCursor even when the page is SHORT', async () => {
+    // The failure this closes: a host that clamps `limit` below `cap + 1` returns
+    // a full-but-short page, so the length test reads false and viewers silently
+    // see a partial gallery.
+    const load = await loadGallery({
+      list: async () => ({ items: [sharedItem({ key: 'k_only' })], nextCursor: 'more' }),
+    });
+    expect(
+      load.kind === 'ok' && load.truncated,
+      'gallery-truncation-guard: `items.length > cap` measures the HOST’S WILLINGNESS TO HONOUR `limit`, not the gallery’s size — nextCursor is documented "absent on the last page", so its presence is the fact',
+    ).toBe(true);
+  });
+
+  it('still reports truncation from the over-fetch when no cursor is sent', async () => {
+    const items = Array.from({ length: GALLERY_LIST_CAP + 1 }, (_, i) => sharedItem({ key: `k_${i}` }));
+    const load = await loadGallery({ list: async () => ({ items }) });
+    expect(load.kind === 'ok' && load.truncated).toBe(true);
+  });
+
+  it('reports no truncation when NEITHER signal fires', async () => {
+    const load = await loadGallery({ list: async () => ({ items: [sharedItem()] }) });
+    expect(load.kind === 'ok' && load.truncated).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// F4 — moderated text is bounded on READ, not only on write.
+// ---------------------------------------------------------------------------
+
+describe('rendered text bounds', () => {
+  it('🔴 clamps a title and body written by somebody else’s client', () => {
+    const entry = toGalleryEntry(
+      sharedItem({
+        value: { ...sharedItem().value, title: 'T'.repeat(5000), body: 'B'.repeat(5000) },
+      }),
+    );
+    expect(
+      entry?.title.length,
+      'gallery-read-bound-guard: this app clamps what IT writes, but SHARED_APPEND is open to any authenticated viewer past min-trust — so every row it READS was written under somebody else’s limits',
+    ).toBe(GALLERY_TITLE_MAX + 1); // + the ellipsis that marks the cut
+    expect(entry?.body?.length).toBe(GALLERY_BODY_MAX + 1);
+    expect(entry?.title.endsWith('…')).toBe(true);
+  });
+
+  it('leaves text within the bound untouched', () => {
+    expect(clampRenderedText('short', 100)).toBe('short');
+    expect(clampRenderedText('abcdef', 3)).toBe('abc…');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// F6 — one image per cell, decided here rather than by the renderer.
+// ---------------------------------------------------------------------------
+
+describe('parseGalleryData cell dedupe', () => {
+  it('🔴 keeps only the FIRST image at a given (row, col)', () => {
+    const parsed = parseGalleryData({
+      v: GALLERY_DATA_VERSION,
+      rows: [],
+      cols: [],
+      images: [
+        { imageId: 5001, row: 0, col: 0 },
+        // A different id at the SAME coordinate: both pass the id check, and the
+        // renderer takes the first match — so a forged blob could pair an
+        // unresolvable id with a resolvable one and paint "No longer available"
+        // over an image that is right there.
+        { imageId: 5002, row: 0, col: 0 },
+        { imageId: 5003, row: 0, col: 1 },
+      ],
+    });
+    expect(
+      parsed?.images.map((i) => i.imageId),
+      'gallery-cell-dedupe-guard: two DIFFERENT ids at one coordinate is the last place a hostile blob steers what a cell says',
+    ).toEqual([5001, 5003]);
   });
 });
