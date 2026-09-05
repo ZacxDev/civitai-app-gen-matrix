@@ -92,6 +92,7 @@ import {
   loadHistory,
   migrateLegacyRun,
   mintHistoryKey,
+  readActiveRunKey,
   type HistoryLoad,
 } from './history.js';
 
@@ -797,8 +798,10 @@ export function App() {
       //    the row stays in history, only the pointer goes.
       if (raw == null) {
         try {
-          const pointer = await storage.get<{ key?: unknown }>(ACTIVE_RUN_POINTER_KEY);
-          const key = typeof pointer?.key === 'string' ? pointer.key : null;
+          // `readActiveRunKey` is the single owner of "what does the pointer
+          // say" — open-coding the shape check here would let the two readings
+          // drift apart, and eviction depends on this one being right.
+          const key = await readActiveRunKey(storage);
           if (key) {
             activeKey = key;
             raw = await storage.get<unknown>(key);

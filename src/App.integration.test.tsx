@@ -10,7 +10,7 @@ import { App } from './App.js';
 import { CHECKPOINTS, MODIFIERS } from './models.js';
 import { buildMatrix, type MatrixCell } from './matrix.js';
 import { RUN_STORAGE_KEY, buildRunManifest } from './persistence.js';
-import { historyKeyFor } from './history.js';
+import { ACTIVE_RUN_POINTER_KEY, historyKeyFor } from './history.js';
 
 // The block bundles its allowed-parent-origins from env; in the test env the mock
 // host fires from window.location.origin, so allow it via the transport (main.tsx
@@ -266,6 +266,32 @@ describe('a restored matrix shows the prompt that produced IT', () => {
     expect(screen.getByTestId('gm-run-prompt').textContent).toContain(restoredPrompt);
   });
 
+  it('follows the ACTIVE-RUN POINTER on mount, with no legacy key to fall back on', async () => {
+    // 🔴 THE POINTER BRANCH HAD NO TEST AT ALL. Every other restore test seeds
+    // the legacy `gen-matrix:run:v1` key, so `migrateLegacyRun` returns the
+    // manifest and the mount effect never reaches the pointer at all. Measured:
+    // replacing the pointer read with a hardcoded `null` left all 472 tests
+    // green — the branch that decides what a RELOAD restores was uncovered,
+    // while the PR body claims the pointer is what makes that work.
+    //
+    // So: no legacy key here. The ONLY route to these images is history key →
+    // pointer → restore. And it must restore as the run you are IN, not as a
+    // read-only archive: Retry is present, which is the discriminator.
+    const key = historyKeyFor(Date.UTC(2026, 0, 3, 4, 5, 6));
+    renderApp({
+      viewer,
+      consentGranted: true,
+      storage: { seed: { ...seedDoneRun(key), [ACTIVE_RUN_POINTER_KEY]: { key } } },
+    });
+
+    await waitFor(() => expect(screen.getAllByTestId('gm-maturity-image')).toHaveLength(2), {
+      timeout: 4000,
+    });
+    expect(screen.getByTestId('gm-run-prompt').textContent).toContain(restoredPrompt);
+    // The build panel is gone — this is a restored run, not the empty screen.
+    expect(screen.queryByLabelText('Shared generation prompt')).toBeNull();
+  });
+
   it('migrates the legacy single-slot run into a LISTED, REOPENABLE history row', async () => {
     // 🔴 THIS TEST USED TO ASSERT NOTHING ABOUT MIGRATION. Its body was the M1
     // restore test verbatim — two images on screen, no build panel — which is
@@ -478,7 +504,22 @@ describe('a matrix reopened from history is an archive, not a run you are in', (
   });
 
   it('🔴 stays terminal: reconcile cannot put it back on “Generating…”', async () => {
-    // 🔴 THE SEAM BETWEEN TWO INDIVIDUALLY-CORRECT HALVES.
+    // ⚠️ THIS IS AN INVARIANT GUARD, NOT A REGRESSION TEST. Measured after the
+    // fact, against the true pre-fix tree (`src/App.tsx` at c111ca0b, rest of
+    // the tree at HEAD): this file runs 13/13 GREEN. So the end-to-end path
+    // does NOT reproduce as an integration failure, and round 2's original
+    // "could not reproduce" was right — the claim that this test is
+    // "deterministically red pre-fix" was wrong and is withdrawn.
+    //
+    // What it DOES pin is reachable and killable: deleting only
+    // `if (viewingHistory) return;` from the reconcile effect at HEAD turns
+    // this test red. The unit-level seam below is also real. What is missing
+    // is a fixture where the read-model SIGNATURE changes after the archive
+    // opens, which is what would drive the pre-fix code down the bad branch.
+    // Until someone builds that, treat this as a guard on the invariant, and
+    // do not count it as evidence that a user-visible defect existed.
+    //
+    // The seam it guards, at unit level:
     // `archiveStateFromManifest` maps a `polling` cell to `timedout`;
     // `isReconcileFinal` is `isTerminalCell(status) && status !== 'timedout'`,
     // so reconcile treats EXACTLY the cells the archive form produced as
@@ -487,11 +528,12 @@ describe('a matrix reopened from history is an archive, not a run you are in', (
     // `["128078::cinematic"]`. Neither `persistence.test.ts` nor a component
     // test can see it, because neither ever holds both states at once.
     //
-    // The trigger is real and lives here too: `handleOpenHistory` does not reset
-    // `reconciledSigRef`, and the `doneCount` effect fires a refetch 400 ms
-    // after the archive loads — which is what changes the read-model identity
-    // and re-runs the reconcile effect. What the viewer would see: a matrix the
-    // app calls terminal and read-only back on "Generating…", with Stop and
+    // The trigger `handleOpenHistory` does not reset `reconciledSigRef`, and
+    // the `doneCount` effect fires a refetch 400 ms after the archive loads.
+    // In THIS fixture the refetch returns the same rows, so the signature does
+    // not move and the reconcile effect does not re-run — which is exactly why
+    // the pre-fix tree passes. What the viewer would see if it DID move: a
+    // matrix the app calls terminal and read-only back on "Generating…", with Stop and
     // Re-check both withheld by `readOnly` — no way to stop it, no way to
     // re-check it, and a poll loop discarding what it learns.
     //
