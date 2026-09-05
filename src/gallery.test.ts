@@ -29,6 +29,8 @@ import {
   mergeGalleryData,
   parsePublishedCells,
   publishTargetKey,
+  isExtendableEntryKey,
+  ORPHANED_ENTRY_KEY,
   publishedCellsBlob,
   unpublishedCells,
   GALLERY_BODY_MAX,
@@ -46,7 +48,8 @@ import {
   type SharedItemLike,
 } from './gallery.js';
 import { CHECKPOINTS, MODIFIERS } from './models.js';
-import { PROMPT_MAX, buildMatrix, type MatrixCell } from './matrix.js';
+import { MAX_CELLS, PROMPT_MAX, buildMatrix, type MatrixCell } from './matrix.js';
+import { HISTORY_RETENTION_CAP } from './history.js';
 
 // ---------------------------------------------------------------------------
 // Fixtures.
@@ -110,7 +113,11 @@ function sharedItem(over: Partial<SharedItemLike> = {}): SharedItemLike {
 describe('parseGalleryData', () => {
   it('reads back what buildGalleryData wrote', () => {
     const cells = cellsFor(2, 2);
-    const landed = cells.map((cell, i) => ({ cell, imageId: 500 + i }));
+    const landed = cells.map((cell, i) => ({
+      cell,
+      workflowId: cell.workflowId ?? '',
+      imageId: 500 + i,
+    }));
     const parsed = parseGalleryData(buildGalleryData(landed));
     expect(parsed?.images.map((i) => i.imageId)).toEqual([500, 501, 502, 503]);
     expect(parsed?.rows).toHaveLength(2);
@@ -297,13 +304,14 @@ describe('publishMatrix', () => {
     const plan = planOf(cellsFor(1, 2));
     const publish = vi.fn<PublishDeps['publish']>(async () => [900]);
     const update = vi.fn<PublishDeps['update']>(async () => {});
+    const getEntry = vi.fn<PublishDeps['getEntry']>(async () => null);
     const append = vi.fn<PublishDeps['append']>(async () => ({ key: 'k_new' }));
     const progress: [number, number][] = [];
 
     const result = await publishMatrix(
       plan,
       { title: 'T', body: 'Prompt: p' },
-      { publish, append, update },
+      { publish, append, update, getEntry },
       (done, total) => progress.push([done, total]),
     );
 
@@ -330,8 +338,9 @@ describe('publishMatrix', () => {
   it('makes no host call at all for an empty plan', async () => {
     const publish = vi.fn<PublishDeps['publish']>(async () => [1]);
     const update = vi.fn<PublishDeps['update']>(async () => {});
+    const getEntry = vi.fn<PublishDeps['getEntry']>(async () => null);
     const append = vi.fn<PublishDeps['append']>(async () => ({ key: 'k' }));
-    const result = await publishMatrix([], { title: 'T' }, { publish, append, update });
+    const result = await publishMatrix([], { title: 'T' }, { publish, append, update, getEntry });
     expect(
       result,
       'gallery-empty-plan-guard: an empty plan is its own honest state — without the guard it falls through to the generic {kind:"failed"}, whose copy reads as a REJECTED request to someone whose only mistake was having no finished cells',
@@ -352,9 +361,10 @@ describe('publishMatrix', () => {
       return [600 + call];
     });
     const update = vi.fn<PublishDeps['update']>(async () => {});
+    const getEntry = vi.fn<PublishDeps['getEntry']>(async () => null);
     const append = vi.fn<PublishDeps['append']>(async () => ({ key: 'k_part' }));
 
-    const result = await publishMatrix(plan, { title: 'T' }, { publish, append, update });
+    const result = await publishMatrix(plan, { title: 'T' }, { publish, append, update, getEntry });
 
     expect(
       publish.mock.calls.length,
@@ -370,9 +380,10 @@ describe('publishMatrix', () => {
       throw new Error('publishing is limited to app developers');
     });
     const update = vi.fn<PublishDeps['update']>(async () => {});
+    const getEntry = vi.fn<PublishDeps['getEntry']>(async () => null);
     const append = vi.fn<PublishDeps['append']>(async () => ({ key: 'k' }));
 
-    const result = await publishMatrix(plan, { title: 'T' }, { publish, append, update });
+    const result = await publishMatrix(plan, { title: 'T' }, { publish, append, update, getEntry });
 
     expect(
       append.mock.calls.length,
@@ -389,11 +400,12 @@ describe('publishMatrix', () => {
     const plan = planOf(cellsFor(1, 2));
     const publish = vi.fn<PublishDeps['publish']>(async () => [808]);
     const update = vi.fn<PublishDeps['update']>(async () => {});
+    const getEntry = vi.fn<PublishDeps['getEntry']>(async () => null);
     const append = vi.fn<PublishDeps['append']>(async () => {
       throw new Error('shared append failed');
     });
 
-    const result = await publishMatrix(plan, { title: 'T' }, { publish, append, update });
+    const result = await publishMatrix(plan, { title: 'T' }, { publish, append, update, getEntry });
 
     expect(
       result.kind,
@@ -412,9 +424,10 @@ describe('publishMatrix', () => {
       return call === 1 ? [] : [700 + call];
     });
     const update = vi.fn<PublishDeps['update']>(async () => {});
+    const getEntry = vi.fn<PublishDeps['getEntry']>(async () => null);
     const append = vi.fn<PublishDeps['append']>(async () => ({ key: 'k_skip' }));
 
-    const result = await publishMatrix(plan, { title: 'T' }, { publish, append, update });
+    const result = await publishMatrix(plan, { title: 'T' }, { publish, append, update, getEntry });
 
     // A resolve is not a failure, so every remaining cell is still attempted.
     expect(publish).toHaveBeenCalledTimes(3);
@@ -788,15 +801,25 @@ describe('publishMatrix extending an existing entry', () => {
     const publish = vi.fn<PublishDeps['publish']>(async () => [910]);
     const append = vi.fn<PublishDeps['append']>(async () => ({ key: 'k_new' }));
     const update = vi.fn<PublishDeps['update']>(async () => {});
-    const existingData = buildGalleryData([{ cell: full[0].cell, imageId: 900 }]);
+    const getEntry = vi.fn<PublishDeps['getEntry']>(async () => null);
+    const existingData = buildGalleryData([{ cell: full[0].cell, workflowId: full[0].workflowId, imageId: 900 }]);
 
+    getEntry.mockResolvedValue({
+      title: 'Original title',
+      body: 'Prompt: p',
+      data: existingData,
+    });
     const result = await publishMatrix(
       [full[1]],
       { title: 'ignored', body: 'ignored' },
-      { publish, append, update },
+      { publish, append, update, getEntry },
       undefined,
-      { entryKey: 'k_one', title: 'Original title', body: 'Prompt: p', data: existingData },
+      'k_one',
     );
+
+    // 🔴 The merge base came from the AUTHORITATIVE single-row read, not from a
+    // list page the caller happened to be holding.
+    expect(getEntry).toHaveBeenCalledWith('k_one');
 
     expect(
       append.mock.calls.length,
@@ -819,12 +842,14 @@ describe('publishMatrix extending an existing entry', () => {
     const update = vi.fn<PublishDeps['update']>(async () => {
       throw new Error('NOT_FOUND');
     });
+    const getEntry = vi.fn<PublishDeps['getEntry']>(async () => null);
+    getEntry.mockResolvedValue({ title: 'T', data: buildGalleryData([{ cell: full[0].cell, workflowId: full[0].workflowId, imageId: 1 }]) });
     const result = await publishMatrix(
       [full[1]],
       { title: 'T' },
-      { publish, append, update },
+      { publish, append, update, getEntry },
       undefined,
-      { entryKey: 'k_gone', title: 'T', data: buildGalleryData([]) },
+      'k_gone',
     );
     expect(result.kind).toBe('orphaned');
     expect(publishResultMessage(result)).toContain('now public on Civitai');
@@ -836,8 +861,14 @@ describe('publishMatrix extending an existing entry', () => {
     const publish = vi.fn<PublishDeps['publish']>(async () => [920 + ++call]);
     const append = vi.fn<PublishDeps['append']>(async () => ({ key: 'k_l' }));
     const update = vi.fn<PublishDeps['update']>(async () => {});
-    const result = await publishMatrix(full, { title: 'T' }, { publish, append, update });
+    const getEntry = vi.fn<PublishDeps['getEntry']>(async () => null);
+    const result = await publishMatrix(full, { title: 'T' }, { publish, append, update, getEntry });
     expect(result.kind === 'ok' && result.landed.map((l) => l.imageId)).toEqual([921, 922]);
+    // 🟢-7: both halves of the ledger key travel with the result.
+    expect(
+      result.kind === 'ok' && result.landed.map((l) => l.workflowId),
+      'gallery-ledger-key-guard: the caller used to recover the workflow half as `cell.workflowId ?? \'\'`, which agreed with the reader only by coincidence — a drift would mint a key that never matches, i.e. a disarm that silently never fires',
+    ).toEqual([full[0].workflowId, full[1].workflowId]);
     expect(result.kind === 'ok' && result.landed.map((l) => l.cell.id)).toEqual([
       full[0].cell.id,
       full[1].cell.id,
@@ -848,8 +879,8 @@ describe('publishMatrix extending an existing entry', () => {
 describe('mergeGalleryData', () => {
   it('keeps the ORIGINAL id when a coordinate is republished', () => {
     const cells = cellsFor(1, 2);
-    const existing = buildGalleryData([{ cell: cells[0], imageId: 950 }]);
-    const merged = mergeGalleryData(existing, [{ cell: cells[0], imageId: 951 }]);
+    const existing = buildGalleryData([{ cell: cells[0], workflowId: 'w0', imageId: 950 }]);
+    const merged = mergeGalleryData(existing, [{ cell: cells[0], workflowId: 'w1', imageId: 951 }]);
     // Same coordinate, new id — the original is what viewers may already have
     // voted on and reported, so it stays and the duplicate is not appended.
     expect(merged.images.map((i) => i.imageId)).toEqual([950, 951]);
@@ -858,8 +889,10 @@ describe('mergeGalleryData', () => {
 
   it('never exceeds the image cap', () => {
     const cells = cellsFor(3, 4);
-    const existing = buildGalleryData(cells.map((cell, i) => ({ cell, imageId: 960 + i })));
-    const merged = mergeGalleryData(existing, [{ cell: cells[0], imageId: 9999 }]);
+    const existing = buildGalleryData(
+      cells.map((cell, i) => ({ cell, workflowId: `w${i}`, imageId: 960 + i })),
+    );
+    const merged = mergeGalleryData(existing, [{ cell: cells[0], workflowId: 'wx', imageId: 9999 }]);
     expect(merged.images.length).toBeLessThanOrEqual(MAX_GALLERY_IMAGES);
   });
 });
@@ -1036,5 +1069,204 @@ describe('several ids at one coordinate', () => {
     ).toBe(MAX_CELL_CANDIDATES);
     // The other cell survived, which is the point.
     expect(parsed?.images.some((i) => i.imageId === 5200)).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Round-4: the read-modify-write against shared state.
+// ---------------------------------------------------------------------------
+
+function extendDeps(over: Partial<Record<string, unknown>> = {}) {
+  const publish = vi.fn<PublishDeps['publish']>(async () => [990]);
+  const append = vi.fn<PublishDeps['append']>(async () => ({ key: 'k_appended' }));
+  const update = vi.fn<PublishDeps['update']>(async () => {});
+  const getEntry = vi.fn<PublishDeps['getEntry']>(async () => null);
+  return { publish, append, update, getEntry, ...over } as PublishDeps & {
+    publish: typeof publish;
+    append: typeof append;
+    update: typeof update;
+    getEntry: typeof getEntry;
+  };
+}
+
+describe('extending an entry re-reads it first', () => {
+  const plan = () => publishableCells(cellsFor(1, 2));
+
+  it('🔴 merges against the row as it is NOW, not a page the caller was holding', async () => {
+    // Two tabs. This one still believes the entry holds {1,2}; the authoritative
+    // read says {1,2,3} because the other tab published cell 3 a moment ago.
+    // Merging against the stale view writes {1,2,4} and drops cell 3's image —
+    // which stays a permanent public Civitai image with nothing pointing at it.
+    const cells = cellsFor(1, 2);
+    const fresh = {
+      v: GALLERY_DATA_VERSION,
+      rows: [],
+      cols: [],
+      images: [
+        { imageId: 1, row: 0, col: 0 },
+        { imageId: 2, row: 0, col: 1 },
+        { imageId: 3, row: 1, col: 0 },
+      ],
+    };
+    const deps = extendDeps();
+    deps.getEntry.mockResolvedValue({ title: 'T', data: fresh });
+
+    await publishMatrix([plan()[1]], { title: 'T' }, deps, undefined, 'k_live');
+
+    // Messaged BOTH sides: a mutant that takes the wrong branch entirely would
+    // otherwise crash on `calls[0]` and go red without naming the guard.
+    expect(
+      deps.update,
+      'gallery-fresh-merge-guard: `update` replaces the WHOLE value, so a stale merge base silently deletes whatever another tab added since — the append path structurally could not do that, and switching to update created the hazard',
+    ).toHaveBeenCalledTimes(1);
+    const written = deps.update.mock.calls[0][1].data as { images: { imageId: number }[] };
+    expect(
+      written.images.map((i) => i.imageId),
+      'gallery-fresh-merge-guard: `update` replaces the WHOLE value, so a stale merge base silently deletes whatever another tab added since — the append path structurally could not do that, and switching to update created the hazard',
+    ).toEqual([1, 2, 3, 990]);
+    expect(deps.append).not.toHaveBeenCalled();
+    void cells;
+  });
+
+  it('🔴 an OFF-PAGE row is still extended, because the key is what travels', async () => {
+    // The list page is capped at GALLERY_LIST_CAP; resolving the target from it
+    // meant a matrix whose row had scrolled past that page silently APPENDED a
+    // second row — and once the ledger held two keys for one matrix,
+    // `publishTargetKey` returned null for it forever after.
+    const deps = extendDeps();
+    deps.getEntry.mockResolvedValue({
+      title: 'Off page',
+      data: buildGalleryData([
+        { cell: cellsFor(1, 1)[0], workflowId: 'w_old', imageId: 77 },
+      ]),
+    });
+
+    const result = await publishMatrix([plan()[1]], { title: 'T' }, deps, undefined, 'k_offpage');
+
+    expect(
+      deps.append.mock.calls.length,
+      'gallery-offpage-target-guard: the target must be resolved by an authoritative single-row read, not by searching the 12-row list page — its own contract names exactly this case',
+    ).toBe(0);
+    expect(deps.update).toHaveBeenCalledTimes(1);
+    expect(result).toMatchObject({ kind: 'ok', key: 'k_offpage', extended: true });
+  });
+
+  it('appends a fresh entry when the row is genuinely GONE', async () => {
+    const deps = extendDeps();
+    deps.getEntry.mockResolvedValue(null); // withdrawn or moderated
+    const result = await publishMatrix([plan()[1]], { title: 'T' }, deps, undefined, 'k_withdrawn');
+    expect(deps.update).not.toHaveBeenCalled();
+    expect(deps.append).toHaveBeenCalledTimes(1);
+    expect(result).toMatchObject({ kind: 'ok', key: 'k_appended' });
+    expect(result.kind === 'ok' && result.extended).toBeUndefined();
+  });
+
+  it('🔴 does NOT append when the re-read merely FAILS — that is not "gone"', async () => {
+    const deps = extendDeps();
+    deps.getEntry.mockRejectedValue(new Error('SHARED_UNAVAILABLE'));
+    const result = await publishMatrix([plan()[1]], { title: 'T' }, deps, undefined, 'k_unknown');
+    expect(
+      deps.append.mock.calls.length,
+      'gallery-unknown-target-guard: `null` means the row is gone and a fresh entry is right; a REJECTION means we do not know, and appending on "do not know" is how one matrix ends up with two rows and a permanently split ledger',
+    ).toBe(0);
+    expect(result.kind).toBe('orphaned');
+  });
+
+  it('appends when the row exists but its payload is not a matrix this app wrote', async () => {
+    const deps = extendDeps();
+    deps.getEntry.mockResolvedValue({ title: 'T', data: { v: 99 } });
+    const result = await publishMatrix([plan()[1]], { title: 'T' }, deps, undefined, 'k_alien');
+    expect(deps.update).not.toHaveBeenCalled();
+    expect(result).toMatchObject({ kind: 'ok', key: 'k_appended' });
+  });
+});
+
+describe('an orphaned publish still reaches the ledger', () => {
+  it('🔴 carries the landed cells, because those images are permanent', async () => {
+    const deps = extendDeps();
+    deps.append.mockRejectedValue(new Error('SHARED_UNAVAILABLE'));
+    const result = await publishMatrix(publishableCells(cellsFor(1, 1)), { title: 'T' }, deps);
+    expect(result.kind).toBe('orphaned');
+    expect(
+      result.kind === 'orphaned' && result.landed.map((l) => l.imageId),
+      'gallery-orphan-ledger-guard: the ledger asks "did this cell already cost the viewer an irreversible act", never "did the operation succeed" — without the landed cells the control stayed armed over an image that already exists, and a second click made a second one',
+    ).toEqual([990]);
+  });
+
+  it('records an orphan against a key that can never be extended', () => {
+    const plan = publishableCells(cellsFor(1, 2));
+    const ledger = indexPublishedCells([
+      {
+        cell: cellPublishKey(plan[0].cell.id, plan[0].workflowId),
+        imageId: 1,
+        entryKey: ORPHANED_ENTRY_KEY,
+      },
+    ]);
+    // It DISARMS the cell…
+    expect(unpublishedCells(plan, ledger).map((i) => i.cell.id)).toEqual([plan[1].cell.id]);
+    // …but names no row, so it can never be handed to `update`.
+    expect(
+      publishTargetKey(plan, ledger),
+      'gallery-orphan-key-guard: an orphaned record proves the cell was published but names no entry — treating its sentinel as a row to extend would send `update` at a key no host ever minted',
+    ).toBeNull();
+    expect(isExtendableEntryKey(ORPHANED_ENTRY_KEY)).toBe(false);
+    expect(isExtendableEntryKey('shared_3')).toBe(true);
+  });
+});
+
+describe('the ledger cap is derived from what is REACHABLE', () => {
+  it('🔴 holds every record any reopenable run can consult', () => {
+    expect(
+      PUBLISHED_CELLS_CAP,
+      'gallery-ledger-cap-guard: a chosen cap silently decides when a run stops being protected — evicting records while that run is still reopenable from history re-arms the control over cells that are already permanent public images',
+    ).toBe(HISTORY_RETENTION_CAP * MAX_CELLS);
+    // Every run a viewer can still reopen fits, by construction.
+    const worstCase = HISTORY_RETENTION_CAP * MAX_CELLS;
+    const rows = Array.from({ length: worstCase }, (_, i) => ({
+      cell: `c${i}@w${i}`,
+      imageId: i + 1,
+      entryKey: `k${i}`,
+    }));
+    expect(addPublishedCells([], rows)).toHaveLength(worstCase);
+    expect(parsePublishedCells(publishedCellsBlob(rows))).toHaveLength(worstCase);
+  });
+
+  it('stays inside the host’s 64KB per-value storage limit at that cap', () => {
+    // A cap generous enough to cross it makes every `set` REJECT, losing the
+    // disarm entirely — worse than evicting an unreachable run.
+    const rows = Array.from({ length: PUBLISHED_CELLS_CAP }, (_, i) => ({
+      cell: `${1234567}::watercolor@workflow-${i}-abcdefgh`,
+      imageId: 900000 + i,
+      entryKey: `shared_${i}`,
+    }));
+    const bytes = JSON.stringify(publishedCellsBlob(rows)).length;
+    expect(bytes).toBeLessThan(64 * 1024);
+  });
+});
+
+describe('mergeGalleryData respects the reader’s own per-coordinate bound', () => {
+  it('🔴 never writes more candidates at a coordinate than parseGalleryData keeps', () => {
+    const cells = cellsFor(1, 1);
+    let data = buildGalleryData([{ cell: cells[0], workflowId: 'w0', imageId: 8000 }]);
+    for (let i = 1; i < 8; i += 1) {
+      data = mergeGalleryData(data, [{ cell: cells[0], workflowId: `w${i}`, imageId: 8000 + i }]);
+    }
+    const atCell = data.images.filter((im) => im.row === 0 && im.col === 0);
+    expect(
+      atCell.length,
+      'gallery-merge-bound-guard: the writer was unbounded while the reader keeps MAX_CELL_CANDIDATES, so a payload could carry ids no viewer can ever see, each consuming shared MAX_GALLERY_IMAGES budget',
+    ).toBe(MAX_CELL_CANDIDATES);
+    // And the id viewers may already have voted on is still the first candidate.
+    expect(atCell[0].imageId).toBe(8000);
+  });
+});
+
+describe('a blank title from another client', () => {
+  it('renders the fallback rather than an empty heading, and keeps the row', () => {
+    const entry = toGalleryEntry(
+      sharedItem({ value: { ...sharedItem().value, title: '   ' } }),
+    );
+    expect(entry).not.toBeNull();
+    expect(entry?.title).toBe('Untitled matrix');
   });
 });

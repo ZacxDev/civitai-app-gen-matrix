@@ -251,9 +251,18 @@ function GalleryEntryCard({
           embed — and text wrapping does nothing for it, because the width comes
           from the cells' own minimum, not from a long word. Scrolling the table
           keeps the overflow inside the card instead of widening the page. */}
+      {/* 🔴 AND IT IS FOCUSABLE AND LABELLED. An `overflow-x: auto` region that
+          nothing can focus cannot be scrolled from the keyboard at all (WCAG
+          2.1.1) — and it is reachable in exactly the case it was added for, a
+          grid wider than the card. `tabIndex={0}` gives it a tab stop so the
+          arrow keys reach it; `role="region"` + a name are what stop that tab
+          stop being an unexplained one for a screen-reader user. */}
       {view != null && !view.allGone && (
         <div
           style={{ overflowX: 'auto', maxWidth: '100%' }}
+          tabIndex={0}
+          role="region"
+          aria-label={`${entry.title} — matrix grid, scrollable`}
           data-testid="gm-gallery-grid-scroll"
         >
         <table style={{ borderCollapse: 'collapse' }} data-testid="gm-gallery-grid">

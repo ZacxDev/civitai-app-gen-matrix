@@ -550,3 +550,60 @@ describe('the image grid has its own overflow container', () => {
     expect(scroller.contains(screen.getByTestId('gm-gallery-grid'))).toBe(true);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Round-4 follow-ups.
+// ---------------------------------------------------------------------------
+
+describe('the scroll container is operable', () => {
+  it('🔴 is focusable and named, so a keyboard user can scroll it', () => {
+    render(<GalleryPanel {...props()} />);
+    const scroller = screen.getByTestId('gm-gallery-grid-scroll');
+    expect(
+      scroller.getAttribute('tabindex'),
+      'gallery-scroll-a11y-guard: an overflow-x region nothing can focus cannot be scrolled from the keyboard at all (WCAG 2.1.1), and it is reachable in exactly the case it was added for',
+    ).toBe('0');
+    expect(scroller).toHaveAttribute('role', 'region');
+    expect(scroller).toHaveAccessibleName(/matrix grid, scrollable/i);
+  });
+});
+
+describe('PublishMatrixPanel — copy cannot contradict its own state', () => {
+  const base = {
+    c,
+    publishable: 0,
+    alreadyPublishedCount: 4,
+    title: 'T',
+    setTitle: vi.fn(),
+    phase: { kind: 'idle' } as const,
+    message: null,
+    messageIsProblem: false,
+    signedIn: true,
+    alreadyPublished: true,
+    onPublish: vi.fn(),
+  };
+
+  it('🔴 does not offer to create "0 real, public images"', () => {
+    render(<PublishMatrixPanel {...base} />);
+    expect(
+      screen.queryByTestId('gm-publish-explainer'),
+      'gallery-zero-copy-guard: this state is new — until the per-cell ledger landed, publishable was always > 0 wherever the panel rendered — and a sentence that argues with the state beside it is how a reader stops trusting either',
+    ).toBeNull();
+    // The note that IS true still renders.
+    expect(screen.getByTestId('gm-publish-already')).toBeInTheDocument();
+  });
+
+  it('still explains the act when there is something to publish', () => {
+    render(<PublishMatrixPanel {...base} publishable={2} alreadyPublished={false} />);
+    expect(screen.getByTestId('gm-publish-explainer')).toHaveTextContent(/2 real, public images/);
+  });
+
+  it('does not promise the existing entry will still be there', () => {
+    render(
+      <PublishMatrixPanel {...base} publishable={1} alreadyPublished={false} alreadyPublishedCount={3} />,
+    );
+    expect(screen.getByTestId('gm-publish-extending')).toHaveTextContent(
+      /where it still exists|or to a new one if it has been removed/i,
+    );
+  });
+});

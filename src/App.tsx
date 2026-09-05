@@ -104,6 +104,7 @@ import {
   publishResultMessage,
   publishableCells,
   PUBLISHED_CELLS_STORAGE_KEY,
+  ORPHANED_ENTRY_KEY,
   addPublishedCells,
   cellPublishKey,
   indexPublishedCells,
@@ -1489,12 +1490,12 @@ export function App() {
     setPublishMessage(null);
     setPublishProblem(false);
     setPublishPhase({ kind: 'busy', done: 0, total: publishRemaining.length });
-    // The row to extend, resolved from the LOADED gallery so a withdrawn or
-    // moderated entry falls back to a fresh append rather than a NOT_FOUND.
-    const existing =
-      publishTarget != null && galleryLoad?.kind === 'ok'
-        ? galleryLoad.entries.find((e) => e.key === publishTarget)
-        : undefined;
+    // 🔴 THE KEY, NOT A SNAPSHOT. `publishMatrix` re-reads the row through
+    // `shared.get` immediately before merging — see `PublishDeps.getEntry`.
+    // Resolving it here from the loaded 12-row page silently appended a second
+    // row whenever the matrix's entry was off-page, or the gallery read had
+    // failed, or it had not resolved yet; and even when found, the snapshot
+    // could be stale enough to drop another tab's image out of the entry.
     void publishMatrix(
       publishRemaining,
       {
@@ -1509,39 +1510,62 @@ export function App() {
         publish,
         append: (value) => shared.append(value),
         update: (key, value) => shared.update(key, value),
+        // The authoritative single-row read. Its own contract covers exactly this
+        // case — an item past the first page — and it returns `null` for a
+        // withdrawn or moderated row, which is the one case where appending a
+        // fresh entry is right.
+        getEntry: async (key) => {
+          const item = await shared.get(key);
+          return item == null
+            ? null
+            : {
+                title: item.value.title,
+                ...(item.value.body !== undefined ? { body: item.value.body } : {}),
+                data: item.value.data,
+              };
+        },
       },
       (done, total) => setPublishPhase({ kind: 'busy', done, total }),
-      existing == null
-        ? null
-        : {
-            entryKey: existing.key,
-            title: existing.title,
-            ...(existing.body != null ? { body: existing.body } : {}),
-            data: existing.data,
-          },
+      publishTarget,
     )
       .then((result) => {
         setPublishMessage(publishResultMessage(result));
         setPublishProblem(result.kind !== 'ok');
-        if (result.kind === 'ok' || result.kind === 'partial') {
+        // 🔴 `orphaned` IS INCLUDED, AND THAT IS THE POINT. Its images were
+        // created — they are permanent public Civitai rows — even though the
+        // entry write failed. Recording only the successes left the control
+        // enabled over a cell that had already cost the viewer an irreversible
+        // act, so a second click made a second permanent image of it. The
+        // ledger's question is "did this already cost something irreversible",
+        // never "did the operation succeed".
+        if (result.kind === 'ok' || result.kind === 'partial' || result.kind === 'orphaned') {
           // Record the minted key as OURS, in the viewer's private storage — the
           // same-session supplement to the host-stamped `authorUserId` check.
-          setOwnKeys((prev) => {
-            const next = addKeyToSet([...prev], result.key);
-            persistKeySet(PUBLISHED_KEYS_STORAGE_KEY, next);
-            return new Set(next);
-          });
+          // An orphaned result has no entry, so there is nothing to own.
+          if (result.kind !== 'orphaned') {
+            const ownedKey = result.key;
+            setOwnKeys((prev) => {
+              const next = addKeyToSet([...prev], ownedKey);
+              persistKeySet(PUBLISHED_KEYS_STORAGE_KEY, next);
+              return new Set(next);
+            });
+          }
           // 🔴 Record EVERY cell that landed, durably. Disarming on a
           // session-held signature of the whole set re-armed on a retry (the set
           // grew) and on a reload (the Set was gone) — both republishing images
           // that already existed, permanently and with no un-publish.
           //
-          // The result carries the actual `(cell, imageId)` pairs, so the ledger
-          // records real image ids rather than an inferred prefix of the plan.
+          // The result carries the actual `(cell, workflowId, imageId)` triples,
+          // so both halves of the ledger key come from the same object the
+          // publish used — no `?? ''` fallback that could mint a key which never
+          // matches. An orphaned result has no entry key; `''` is rejected by
+          // `parsePublishedCells`, so it is recorded against a sentinel that says
+          // what it is and can never resolve as a target to extend.
+          const entryKey = result.kind === 'orphaned' ? ORPHANED_ENTRY_KEY : result.key;
           const landedCells = result.landed.map((item) => ({
-            cell: cellPublishKey(item.cell.id, item.cell.workflowId ?? ''),
+            cell: cellPublishKey(item.cell.id, item.workflowId),
             imageId: item.imageId,
-            entryKey: result.key,
+            entryKey,
           }));
           setPublishedCells((prev) => {
             const next = addPublishedCells(prev, landedCells);

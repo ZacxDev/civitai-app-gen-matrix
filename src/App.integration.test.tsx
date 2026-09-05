@@ -1091,3 +1091,142 @@ describe('gallery — the publish disarm survives a RELOAD (F2-round3)', () => {
     }
   });
 });
+
+// ---------------------------------------------------------------------------
+// Round-4: an irreversible act must reach the ledger even when the entry write
+// fails, and the extend target must not come from the loaded list page.
+// ---------------------------------------------------------------------------
+
+/** A 4-cell matrix, every cell done — three of them already in the gallery. */
+function fourDoneManifest() {
+  const cells = buildMatrix(
+    'a lighthouse',
+    [CHECKPOINTS[0], CHECKPOINTS[1]],
+    [MODIFIERS[0], MODIFIERS[1]],
+  ).map(
+    (cell, i): MatrixCell => ({
+      ...cell,
+      status: 'done',
+      workflowId: `wf_d${i}`,
+      imageUrl: `https://img.example/d${i}.jpeg`,
+      cost: 8,
+      nsfwLevel: 1,
+    }),
+  );
+  return { manifest: buildRunManifest({ phase: 'done', cells, perCellEstimate: 8 }), cells };
+}
+
+describe('gallery — an orphaned publish still disarms the cell (F3-round4)', () => {
+  it('🔴 the image is permanent, so a failed entry write must not re-offer the cell', async () => {
+    const { manifest, cells } = fourDoneManifest();
+    // Cells 0-2 are already published into `shared_1`; cell 3 is not.
+    const ledger = {
+      cells: cells.slice(0, 3).map((cell, i) => ({
+        cell: `${cell.id}@${cell.workflowId}`,
+        imageId: 100 + i,
+        entryKey: 'shared_1',
+      })),
+    };
+
+    renderApp({
+      viewer,
+      consentGranted: true,
+      storage: {
+        seed: {
+          [RUN_STORAGE_KEY]: manifest,
+          'gen-matrix:gallery:cells:v1': ledger,
+        },
+      },
+      shared: {
+        seed: [
+          {
+            value: {
+              title: 'Existing row',
+              data: galleryData([{ imageId: 100, row: 0, col: 0 }]),
+            },
+          },
+        ],
+        // The next SHARED mutation/read fails — so the authoritative re-read of
+        // the row rejects AFTER the image has already been created.
+        failNext: 1,
+      },
+      publishImageIds: [9001],
+    });
+
+    // CONTROL: exactly one cell is offered, into the existing entry.
+    const button = await screen.findByTestId('gm-publish');
+    expect(button).toHaveTextContent('Publish 1 more image');
+
+    await userEvent.click(button);
+
+    // The image WAS created; the entry write was not.
+    await waitFor(() =>
+      expect(screen.getByTestId('gm-publish-status')).toHaveTextContent(/now public on Civitai/i),
+    );
+
+    // PROBE: the cell is nonetheless disarmed. Recording only successes left the
+    // button reading "Publish 1 more image" over a cell that had already cost an
+    // irreversible act, so a second click made a SECOND permanent public image.
+    await waitFor(() =>
+      expect(
+        screen.getByTestId('gm-publish'),
+        'the ledger asks "did this cell already cost the viewer an irreversible act", never "did the operation succeed"',
+      ).toBeDisabled(),
+    );
+    expect(screen.getByTestId('gm-publish')).toHaveTextContent(/already published/i);
+  });
+});
+
+describe('gallery — the extend target survives an unloaded gallery (F1-round4)', () => {
+  it('🔴 extends the existing row even when the gallery list itself failed to help', async () => {
+    const { manifest, cells } = fourDoneManifest();
+    const ledger = {
+      cells: cells.slice(0, 3).map((cell, i) => ({
+        cell: `${cell.id}@${cell.workflowId}`,
+        imageId: 200 + i,
+        entryKey: 'shared_1',
+      })),
+    };
+
+    renderApp({
+      viewer,
+      consentGranted: true,
+      storage: {
+        seed: {
+          [RUN_STORAGE_KEY]: manifest,
+          'gen-matrix:gallery:cells:v1': ledger,
+        },
+      },
+      shared: {
+        seed: [
+          {
+            value: {
+              title: 'Existing row',
+              data: galleryData([{ imageId: 200, row: 0, col: 0 }]),
+            },
+          },
+        ],
+      },
+      publishImageIds: [9002],
+    });
+
+    await userEvent.click(await screen.findByTestId('gm-publish'));
+
+    // "Added … to this matrix's gallery entry" is the `extended` wording, and it
+    // only appears when `update` was taken. Resolving the target from the loaded
+    // list page produced "Published 1 image to the gallery." — a SECOND row —
+    // whenever that page did not happen to contain the row.
+    await waitFor(() =>
+      expect(
+        screen.getByTestId('gm-publish-status'),
+        'the target must be resolved by an authoritative single-row read, not by searching a 12-row page that may not contain it',
+      ).toHaveTextContent(/Added 1 image to this matrix/i),
+    );
+
+    // Still exactly one row for this matrix.
+    await userEvent.click(screen.getByTestId('gm-newrun'));
+    await userEvent.click(await screen.findByTestId('gm-reset-confirm'));
+    await screen.findByTestId('gm-gallery-item');
+    expect(screen.getAllByTestId('gm-gallery-item')).toHaveLength(1);
+  });
+});

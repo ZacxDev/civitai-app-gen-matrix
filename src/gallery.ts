@@ -41,6 +41,7 @@
 // that it is deliberately NOT the same value as an empty gallery.
 
 import { MAX_CELLS, PROMPT_MAX, type MatrixCell } from './matrix.js';
+import { HISTORY_RETENTION_CAP } from './history.js';
 import { CHECKPOINTS, MODIFIERS } from './models.js';
 
 /**
@@ -234,10 +235,17 @@ export function buildGalleryData(landed: readonly PublishedCell[]): GalleryData 
 /**
  * Fold newly-landed cells into an existing entry's payload.
  *
- * The prior images keep their coordinates, so extending a matrix never moves a
- * cell that was already published; a coordinate republished (which the per-cell
- * ledger normally prevents) keeps the ORIGINAL id, because that is the one
- * viewers may already have voted on and reported.
+ * The prior images keep their coordinates and their ORDER, so extending a matrix
+ * never moves a cell that was already published and never demotes the id that
+ * `resolveEntryImages` would pick first.
+ *
+ * 🔴 A REPUBLISHED COORDINATE KEEPS THE ORIGINAL ID **AND APPENDS THE NEW ONE**
+ * AS AN ADDITIONAL CANDIDATE — bounded by `MAX_CELL_CANDIDATES`, the same bound
+ * the READER applies. The comment here used to say only "keeps the ORIGINAL id",
+ * which the code contradicted: it appended too, unbounded, so a written payload
+ * could carry more ids at one coordinate than `parseGalleryData` will ever keep,
+ * each one consuming shared `MAX_GALLERY_IMAGES` budget for something no viewer
+ * can ever see. Writer and reader now agree, and so does the sentence.
  */
 export function mergeGalleryData(
   existing: GalleryData,
@@ -250,9 +258,18 @@ export function mergeGalleryData(
   for (const r of fresh.rows) if (!rows.has(r.row)) rows.set(r.row, r);
   for (const col of fresh.cols) if (!cols.has(col.col)) cols.set(col.col, col);
   const images = [...existing.images];
+  const perCell = new Map<string, number>();
+  for (const image of images) {
+    const at = `${image.row}:${image.col}`;
+    perCell.set(at, (perCell.get(at) ?? 0) + 1);
+  }
   for (const image of fresh.images) {
     if (seenIds.has(image.imageId)) continue;
     if (images.length >= MAX_GALLERY_IMAGES) break;
+    const at = `${image.row}:${image.col}`;
+    // Writer bounded to the reader's own per-coordinate limit — see the note above.
+    if ((perCell.get(at) ?? 0) >= MAX_CELL_CANDIDATES) continue;
+    perCell.set(at, (perCell.get(at) ?? 0) + 1);
     seenIds.add(image.imageId);
     images.push(image);
   }
@@ -425,9 +442,21 @@ export interface PublishableCell {
   workflowId: string;
 }
 
-/** A cell whose output the host turned into a real `Image` row. */
+/**
+ * A cell whose output the host turned into a real `Image` row.
+ *
+ * 🔴 CARRIES `workflowId` EXPLICITLY. The caller writes the ledger key from this
+ * and `unpublishedCells` reads it from `PublishableCell.workflowId`; when the
+ * caller had to recover it as `cell.workflowId ?? ''` the two halves agreed only
+ * because `publishableCells` happens to copy the field through and
+ * `publishMatrix` passes the same object. If that ever stopped holding, `?? ''`
+ * would mint a key that never matches — a disarm that silently never fires,
+ * failing open on the irreversible side. Carrying the value removes the inference
+ * that made a drift possible.
+ */
 export interface PublishedCell {
   cell: MatrixCell;
+  workflowId: string;
   imageId: number;
 }
 
@@ -483,8 +512,53 @@ export function cellPublishKey(cellId: string, workflowId: string): string {
  */
 export const PUBLISHED_CELLS_STORAGE_KEY = 'gen-matrix:gallery:cells:v1';
 
-/** How many per-cell publish records are retained (newest first). */
-export const PUBLISHED_CELLS_CAP = 200;
+/**
+ * How many per-cell publish records are retained (newest first).
+ *
+ * 🔴 DERIVED, NOT CHOSEN — for the same reason `GALLERY_BODY_MAX` is. A picked
+ * number silently decides when a run stops being protected, and the failure is
+ * the worst one this feature has: evicting a run's records while that run is
+ * still REOPENABLE from history re-arms the control over cells that are already
+ * permanent public images, and a click then duplicates every one of them.
+ *
+ * So the cap is set by what is reachable: a viewer can reopen at most
+ * `HISTORY_RETENTION_CAP` runs, and a run holds at most `MAX_CELLS` publishable
+ * cells. Every record that can still be consulted therefore fits, by
+ * construction, and nothing evictable is reachable.
+ *
+ * ⚠️ THE AUDIT'S PREMISE FOR THIS — "each retry mints a new workflowId and
+ * therefore a new ledger record" — DOES NOT HOLD, and it is worth writing down
+ * because it is the obvious reading. `RETRY_FAILED` (`matrix.ts`) re-queues only
+ * `failed`/`insufficient` cells and CLEARS their `workflowId`; a `done` cell is
+ * never retried. `publishableCells` admits only `done` cells with a workflowId,
+ * so a cell's workflowId can only change while it is UNPUBLISHABLE — no ledger
+ * record for the previous workflow can exist. Records accumulate per published
+ * RUN, not per retry, which is exactly what the derivation above bounds.
+ *
+ * Byte budget, because the ceiling that actually bites is the host's: one record
+ * serialises to well under 100 bytes, so the whole ledger is ~30 KB at this cap
+ * — comfortably inside `useAppStorage`'s 64 KB per-value limit. A cap generous
+ * enough to cross that limit would make every `set` REJECT, losing the disarm
+ * entirely, which is worse than evicting an unreachable run.
+ */
+export const PUBLISHED_CELLS_CAP = HISTORY_RETENTION_CAP * MAX_CELLS;
+
+/**
+ * The `entryKey` recorded for a cell whose image was published but whose gallery
+ * entry write FAILED.
+ *
+ * 🔴 A NAMED SENTINEL, NOT `''`. The record has to exist — the image is
+ * permanent, so the cell must never be offered again — but there is no row for
+ * it, and `publishTargetKey` must never hand this to `update`. It is a value no
+ * host-minted key can collide with, and `isExtendableEntryKey` is the single
+ * place that decides what may be extended.
+ */
+export const ORPHANED_ENTRY_KEY = 'gen-matrix:orphaned';
+
+/** Can this recorded entry key be handed to `update` as a row to extend? */
+export function isExtendableEntryKey(key: string): boolean {
+  return key.length > 0 && key !== ORPHANED_ENTRY_KEY;
+}
 
 export interface PublishedCellRecord {
   /** `cellPublishKey(cellId, workflowId)`. */
@@ -581,7 +655,9 @@ export function publishTargetKey(
   const keys = new Set<string>();
   for (const item of plan) {
     const record = published.get(cellPublishKey(item.cell.id, item.workflowId));
-    if (record != null) keys.add(record.entryKey);
+    // An orphaned record proves the cell was published — which is what keeps it
+    // out of `unpublishedCells` — but names no row, so it can never be a target.
+    if (record != null && isExtendableEntryKey(record.entryKey)) keys.add(record.entryKey);
   }
   return keys.size === 1 ? [...keys][0] : null;
 }
@@ -592,16 +668,31 @@ export interface PublishDeps {
   append(value: { title: string; body?: string; data?: unknown }): Promise<{ key: string }>;
   /** Author-scoped in-place update — preserves the key, votes and reports. */
   update(key: string, value: { title: string; body?: string; data?: unknown }): Promise<void>;
-}
-
-/** An existing gallery row to EXTEND rather than duplicate. */
-export interface PublishTarget {
-  entryKey: string;
-  /** The row's own moderated text — kept, not overwritten with the current form. */
-  title: string;
-  body?: string;
-  /** The images already in the row, so the merge preserves them. */
-  data: GalleryData;
+  /**
+   * Authoritative single-row read.
+   *
+   * 🔴 THE MERGE BASE MUST COME FROM HERE, NOT FROM THE LIST PAGE. `update`
+   * replaces the WHOLE value, so extending an entry is a read-modify-write
+   * against state other viewers and other tabs also write. Taking the base from
+   * `list()`'s 12-row page was wrong twice over: a row past that page (or one
+   * from a read that failed, or had not resolved) simply was not found, so the
+   * publish silently APPENDED a second row for the same matrix — and once the
+   * ledger held two entry keys for one matrix, `publishTargetKey` returned
+   * `null` for it forever after, fanning every later publish across yet another
+   * row. Worse, a base that was merely STALE dropped whatever another tab had
+   * added since: tab A adds cell 3, tab B merges against its old {1,2} and
+   * writes {1,2,4}, and cell 3's image survives as a permanent public image with
+   * nothing pointing at it. The `append` path could not do that; the switch to
+   * `update` created the hazard.
+   *
+   * Resolves `null` for a withdrawn or moderated row — which is the one case
+   * where appending a fresh entry IS right.
+   */
+  getEntry(key: string): Promise<{
+    title: string;
+    body?: string;
+    data?: unknown;
+  } | null>;
 }
 
 /** What one publish attempt ended as. */
@@ -643,7 +734,13 @@ export type PublishResult =
    * has no Withdraw to press. There is no un-publish, so this state exists to be
    * SAID OUT LOUD rather than folded into a generic failure.
    */
-  | { kind: 'orphaned'; published: number; total: number; error: string };
+  | {
+      kind: 'orphaned';
+      published: number;
+      total: number;
+      error: string;
+      landed: PublishedCell[];
+    };
 
 function errorText(err: unknown, fallback: string): string {
   if (err instanceof Error && err.message.length > 0) return err.message;
@@ -673,7 +770,12 @@ export async function publishMatrix(
   meta: { title: string; body?: string },
   deps: PublishDeps,
   onProgress?: (done: number, total: number) => void,
-  target?: PublishTarget | null,
+  /**
+   * The gallery row to EXTEND, as a KEY — deliberately not a snapshot of it.
+   * The row is re-read through `deps.getEntry` immediately before the merge, so
+   * the base is as fresh as one round-trip allows.
+   */
+  targetKey?: string | null,
 ): Promise<PublishResult> {
   // 🔴 An empty plan is its OWN state, and the guard is what makes it one.
   // Measured by removing it: the loop simply never runs, so nothing is
@@ -701,7 +803,7 @@ export async function publishMatrix(
     // A resolve carrying no usable id published nothing for this cell. Skip it
     // and carry on — unlike a rejection, the host did not fail.
     if (imageId == null) continue;
-    landed.push({ cell: item.cell, imageId });
+    landed.push({ cell: item.cell, workflowId: item.workflowId, imageId });
   }
   onProgress?.(landed.length, plan.length);
 
@@ -710,18 +812,28 @@ export async function publishMatrix(
   }
 
   let key: string;
-  const extended = target != null;
+  let extended = false;
   try {
-    if (target != null) {
+    // 🔴 RE-READ THE ROW NOW, as late as possible and never from the list page —
+    // see `PublishDeps.getEntry`. A rejection here is NOT the same as a `null`:
+    // `null` means the row is genuinely gone, so a fresh entry is right, while a
+    // rejection means we do not know, and appending on "do not know" is how a
+    // matrix ends up with two rows and a permanently split ledger. On a
+    // rejection the images are reported orphaned instead, which the ledger
+    // records, so nothing republishes them.
+    const fresh = targetKey == null ? null : await deps.getEntry(targetKey);
+    const freshData = fresh == null ? null : parseGalleryData(fresh.data);
+    if (fresh != null && freshData != null && targetKey != null) {
       // Extend the matrix's existing row. Its OWN title/body are re-sent, not the
       // current form's — the author already chose them, and `update` replaces the
       // whole value.
-      await deps.update(target.entryKey, {
-        title: target.title,
-        ...(target.body !== undefined ? { body: target.body } : {}),
-        data: mergeGalleryData(target.data, landed),
+      await deps.update(targetKey, {
+        title: fresh.title,
+        ...(fresh.body !== undefined ? { body: fresh.body } : {}),
+        data: mergeGalleryData(freshData, landed),
       });
-      key = target.entryKey;
+      key = targetKey;
+      extended = true;
     } else {
       const appended = await deps.append({
         title: meta.title,
@@ -735,9 +847,17 @@ export async function publishMatrix(
       kind: 'orphaned',
       published: landed.length,
       total: plan.length,
+      // 🔴 THE LANDED CELLS TRAVEL WITH THE FAILURE. These images EXIST — they
+      // are permanent public Civitai rows — so the caller must be able to record
+      // them in its ledger even though the entry write failed. Without this the
+      // control stayed enabled reading "Publish 1 more image" over a cell that
+      // had already cost the viewer an irreversible act, and a second click made
+      // a second permanent image of it. The ledger's question is "did this cell
+      // already cost something irreversible", never "did the operation succeed".
+      landed: [...landed],
       error: errorText(
         err,
-        extended
+        targetKey != null
           ? 'the existing gallery entry could not be updated'
           : 'the gallery entry could not be saved',
       ),
@@ -855,7 +975,18 @@ export function toGalleryEntry(item: SharedItemLike): GalleryEntry | null {
     // and be labelled "Published by you". See `isOwnEntry`.
     authorUserId: typeof item.authorUserId === 'number' ? item.authorUserId : -1,
     // Bounded on READ, not just on write — see `GALLERY_BODY_MAX`.
-    title: clampRenderedText(value.title, GALLERY_TITLE_MAX),
+    // An all-whitespace title renders an empty heading. The row is NOT dropped
+    // for it — that would hide a real matrix over a cosmetic defect — it takes
+    // the same fallback the write path uses.
+    //
+    // 🔴 NOT `normalizeGalleryTitle`, which also CLAMPS: routing through it
+    // stripped the ellipsis this path appends, so an over-long title read back
+    // as silently cut instead of visibly cut. Caught by the read-bound test the
+    // moment it was tried — the blank case is the only thing borrowed here.
+    title: clampRenderedText(
+      value.title.trim().length === 0 ? 'Untitled matrix' : value.title,
+      GALLERY_TITLE_MAX,
+    ),
     body: rawBody == null ? null : clampRenderedText(rawBody, GALLERY_BODY_MAX),
     count: typeof item.count === 'number' && Number.isFinite(item.count) ? item.count : 0,
     viewerVoted: item.viewerVoted === true,

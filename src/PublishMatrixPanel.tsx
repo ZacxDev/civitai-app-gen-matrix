@@ -83,12 +83,24 @@ export function PublishMatrixPanel({
           REAL, PUBLIC Civitai image row per cell. There is no un-publish — the
           gallery entry can be withdrawn, the images cannot. A viewer must be
           able to tell that from the screen, not from the API docs. */}
-      <p style={{ ...noteStyle(c), margin: 0 }} data-testid="gm-publish-explainer">
-        This creates {publishable} real, public {publishable === 1 ? 'image' : 'images'} on Civitai
-        &mdash; one per finished cell &mdash; and {extending ? 'adds them to this matrix’s existing gallery entry' : 'adds this grid to the gallery every viewer can browse'}. Civitai asks you to
-        confirm each image, and published images cannot be removed afterwards; only the gallery
-        entry can.
-      </p>
+      {/* 🔴 WITHHELD WHEN THERE IS NOTHING LEFT TO PUBLISH. This state is new:
+          until the per-cell ledger landed, `publishable` was always > 0 wherever
+          this panel rendered, so the sentence could not contradict itself. Now
+          it can — "This creates 0 real, public images on Civitai" — and while
+          the button is disabled and the note below is correct, a sentence that
+          argues with the state next to it is how a reader stops trusting either.
+          The `gm-publish-already` note says what is true instead. */}
+      {!alreadyPublished && (
+        <p style={{ ...noteStyle(c), margin: 0 }} data-testid="gm-publish-explainer">
+          This creates {publishable} real, public {publishable === 1 ? 'image' : 'images'} on
+          Civitai &mdash; one per finished cell &mdash; and{' '}
+          {extending
+            ? 'adds them to this matrix’s existing gallery entry'
+            : 'adds this grid to the gallery every viewer can browse'}
+          . Civitai asks you to confirm each image, and published images cannot be removed
+          afterwards; only the gallery entry can.
+        </p>
+      )}
 
       {/* 🔴 THE COHORT GATE, SAID BEFORE THE CLICK. Publishing is restricted
           server-side to moderators and the app-dev-testers cohort, so for almost
@@ -150,7 +162,8 @@ export function PublishMatrixPanel({
         <p style={{ ...noteStyle(c), margin: 0 }} data-testid="gm-publish-extending">
           {alreadyPublishedCount} {alreadyPublishedCount === 1 ? 'cell' : 'cells'} of this matrix
           {alreadyPublishedCount === 1 ? ' is' : ' are'} already published. Only the rest will be
-          added, to the same gallery entry &mdash; its votes and reports are kept.
+          added &mdash; to the same gallery entry where it still exists, keeping its votes and
+          reports, or to a new one if it has been removed.
         </p>
       )}
 
