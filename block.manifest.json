@@ -12,12 +12,16 @@
   "scopes": [
     "ai:write:budgeted",
     "apps:storage:read",
-    "apps:storage:write"
+    "apps:storage:write",
+    "apps:storage:shared:read",
+    "apps:storage:shared:write"
   ],
   "scopeJustifications": {
     "ai:write:budgeted": "Spends the viewer's Buzz to generate each matrix cell's image, capped by page.buzzBudgetPerGen and confirmed behind an explicit per-run estimate + Confirm step.",
     "apps:storage:read": "Reads back the viewer's own past matrices — the grid, its per-cell images and what each cell cost — so a reload reopens a paid run instead of losing it. Private to that viewer; the block never reads another viewer's rows.",
-    "apps:storage:write": "Saves each matrix the viewer generates under their own private per-app storage, so a run they already paid for survives a reload and stays in their history."
+    "apps:storage:write": "Saves each matrix the viewer generates under their own private per-app storage, so a run they already paid for survives a reload and stays in their history.",
+    "apps:storage:shared:read": "Reads the app-scoped gallery of published matrices so every viewer — signed in or not — can browse the grids the app author has published, their vote totals, and whether this viewer has already voted. Read-only; the entries hold image ids and grid coordinates, and the images themselves are re-fetched per viewer through the platform's own maturity clamp.",
+    "apps:storage:shared:write": "Publishes a finished matrix into that gallery (an author-curated act the platform already restricts to app developers), and lets any signed-in viewer up-vote an entry, report one to moderators, or withdraw an entry they published themselves."
   },
   "page": {
     "path": "/",

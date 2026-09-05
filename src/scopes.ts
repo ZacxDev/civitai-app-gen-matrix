@@ -38,6 +38,28 @@ export const STORAGE_READ_SCOPE = BLOCK_SCOPES.APPS_STORAGE_READ;
 export const STORAGE_WRITE_SCOPE = BLOCK_SCOPES.APPS_STORAGE_WRITE;
 
 /**
+ * Reads the app-scoped SHARED store — the published-matrix gallery every viewer
+ * browses (`useSharedStorage().list/get/getCount(s)`).
+ *
+ * 🔴 A DIFFERENT TRUST BOUNDARY FROM `apps:storage:read`, which is why it is a
+ * separate scope rather than an extension of it: the private store returns rows
+ * this viewer wrote, the shared store returns rows OTHER people wrote. Reading
+ * is the half every viewer needs; writing is gated separately below.
+ */
+export const SHARED_READ_SCOPE = BLOCK_SCOPES.APPS_STORAGE_SHARED_READ;
+
+/**
+ * Writes to the shared store — publishing a matrix, voting on one, reporting
+ * one, and withdrawing the viewer's own entry
+ * (`useSharedStorage().append/update/vote/unvote/report/withdraw`).
+ *
+ * Voting and reporting sit behind this same scope, so a viewer who can browse
+ * the gallery but has not been granted shared-write can still read it — the
+ * failure surfaces on the control they pressed, not as a blank page.
+ */
+export const SHARED_WRITE_SCOPE = BLOCK_SCOPES.APPS_STORAGE_SHARED_WRITE;
+
+/**
  * Every scope the manifest declares, in manifest order.
  *
  * Order is part of the contract the lockstep test asserts, so an edit that
@@ -47,6 +69,8 @@ export const DECLARED_SCOPES = [
   BUDGETED_SCOPE,
   STORAGE_READ_SCOPE,
   STORAGE_WRITE_SCOPE,
+  SHARED_READ_SCOPE,
+  SHARED_WRITE_SCOPE,
 ] as const;
 
 export type DeclaredScope = (typeof DECLARED_SCOPES)[number];

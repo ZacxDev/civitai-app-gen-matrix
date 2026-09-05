@@ -11,6 +11,7 @@ import { CHECKPOINTS, MODIFIERS } from './models.js';
 import { buildMatrix, type MatrixCell } from './matrix.js';
 import { RUN_STORAGE_KEY, buildRunManifest } from './persistence.js';
 import { ACTIVE_RUN_POINTER_KEY, historyKeyFor } from './history.js';
+import { GALLERY_DATA_VERSION } from './gallery.js';
 
 // The block bundles its allowed-parent-origins from env; in the test env the mock
 // host fires from window.location.origin, so allow it via the transport (main.tsx
@@ -616,5 +617,262 @@ describe('the configure screen shows the grid OR the explainer, never both', () 
 
     await waitFor(() => expect(screen.queryByTestId('gm-shape-preview')).toBeNull());
     expect(screen.getByText(/Example: 2 models/)).toBeInTheDocument();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The published-matrix GALLERY, end-to-end through the mock host.
+//
+// These cross the seams no unit test can: `App` is what decides which host
+// surface is called with what, and it is the only place the three
+// (publish → shared index → gated read) meet. A gallery module that parses
+// correctly and a panel that renders correctly can still be wired to each other
+// wrongly, and neither file's tests can see it.
+// ---------------------------------------------------------------------------
+
+/** A published entry as it sits in the shared store, in the `data` shape. */
+function galleryData(images: { imageId: number; row: number; col: number }[]) {
+  return {
+    v: GALLERY_DATA_VERSION,
+    rows: [{ row: 0, versionId: CHECKPOINTS[0].versionId }],
+    cols: [
+      { col: 0, key: MODIFIERS[0].key, loraVersionId: null },
+      { col: 1, key: MODIFIERS[1].key, loraVersionId: null },
+    ],
+    images,
+  };
+}
+
+/** A completed ONE-cell run seeded into the legacy slot, so it restores on mount. */
+function oneCellRunManifest() {
+  const cells = buildMatrix('a lighthouse', [CHECKPOINTS[0]], [MODIFIERS[0]]).map(
+    (cell): MatrixCell => ({
+      ...cell,
+      status: 'done',
+      workflowId: 'wf_pub_1',
+      imageUrl: 'https://img.example/pub.jpeg',
+      cost: 8,
+      nsfwLevel: 1,
+    }),
+  );
+  return buildRunManifest({ phase: 'done', cells, perCellEstimate: 8 });
+}
+
+describe('gallery — browsing published matrices', () => {
+  it('lists a published matrix and renders its images under the viewer clamp', async () => {
+    renderApp({
+      viewer,
+      consentGranted: true,
+      shared: {
+        seed: [
+          {
+            value: {
+              title: 'Lighthouse study',
+              body: 'Prompt: a lighthouse at dusk',
+              data: galleryData([
+                { imageId: 9001, row: 0, col: 0 },
+                { imageId: 9002, row: 0, col: 1 },
+              ]),
+            },
+          },
+        ],
+      },
+      // The mock's default projection: 9001 visible (with a url), 9002 hidden.
+    });
+
+    expect(await screen.findByTestId('gm-gallery-title')).toHaveTextContent('Lighthouse study');
+    expect(screen.getByTestId('gm-gallery-body')).toHaveTextContent('a lighthouse at dusk');
+    // The visible one paints through the app's own maturity gate; the hidden one
+    // never gets a url from the host, so it can only be a placeholder.
+    await waitFor(() => expect(screen.getAllByTestId('gm-maturity-image')).toHaveLength(1));
+    expect(screen.getByTestId('gm-gallery-cell-hidden')).toBeInTheDocument();
+  });
+
+  it('🔴 an id the host omits becomes a `gone` cell, not a shifted grid', async () => {
+    renderApp({
+      viewer,
+      consentGranted: true,
+      shared: {
+        seed: [
+          {
+            value: {
+              title: 'Two cells',
+              data: galleryData([
+                { imageId: 4101, row: 0, col: 0 },
+                { imageId: 4102, row: 0, col: 1 },
+              ]),
+            },
+          },
+        ],
+      },
+      // The host resolved only the SECOND id. Zipping by index would paint 4102
+      // into the first cell and leave the second blank — a wrong answer that
+      // looks entirely correct on screen.
+      gatedImages: [
+        { imageId: 4102, status: 'visible', nsfwLevel: 1, contentRating: 'pg', url: 'https://img/4102', width: 8, height: 8 },
+      ],
+    });
+
+    expect(await screen.findByTestId('gm-gallery-cell-gone')).toBeInTheDocument();
+    await waitFor(() => expect(screen.getAllByTestId('gm-maturity-image')).toHaveLength(1));
+    expect(screen.getByAltText(/Cinematic/)).toBeInTheDocument();
+  });
+
+  it('renders a matrix whose images have ALL gone as an honest statement', async () => {
+    renderApp({
+      viewer,
+      consentGranted: true,
+      shared: {
+        seed: [{ value: { title: 'Removed', data: galleryData([{ imageId: 7777, row: 0, col: 0 }]) } }],
+      },
+      gatedImages: [],
+    });
+
+    expect(await screen.findByTestId('gm-gallery-all-gone')).toBeInTheDocument();
+    expect(screen.queryByTestId('gm-gallery-grid')).toBeNull();
+  });
+
+  it('🔴 a failed gated-image read is NOT rendered as images that are gone', async () => {
+    renderApp({
+      viewer,
+      consentGranted: true,
+      shared: {
+        seed: [{ value: { title: 'Unreadable', data: galleryData([{ imageId: 9001, row: 0, col: 0 }]) } }],
+      },
+      gatedImagesError: 'gated images unavailable',
+    });
+
+    expect(await screen.findByTestId('gm-gallery-images-error')).toBeInTheDocument();
+    expect(screen.queryByTestId('gm-gallery-all-gone')).toBeNull();
+    // The entry itself still lists — the index read succeeded, only the images failed.
+    expect(screen.getByTestId('gm-gallery-title')).toHaveTextContent('Unreadable');
+  });
+
+  it('shows an empty gallery to a viewer when nothing has been published', async () => {
+    renderApp({ viewer, consentGranted: true });
+    expect(await screen.findByTestId('gm-gallery-empty')).toBeInTheDocument();
+    expect(screen.queryByTestId('gm-gallery-error')).toBeNull();
+  });
+
+  it('lets an ANONYMOUS viewer browse, but offers them no vote, report or publish', async () => {
+    renderApp({
+      viewer: null,
+      shared: {
+        seed: [{ value: { title: 'Public grid', data: galleryData([{ imageId: 9001, row: 0, col: 0 }]) } }],
+      },
+    });
+
+    expect(await screen.findByTestId('gm-gallery-title')).toHaveTextContent('Public grid');
+    expect(screen.getByTestId('gm-gallery-vote')).toBeDisabled();
+    // `report()` rejects for an anonymous viewer, so the control is withheld
+    // rather than offered as an error.
+    expect(screen.queryByTestId(/-report$/)).toBeNull();
+    expect(screen.queryByTestId('gm-publish-panel')).toBeNull();
+  });
+});
+
+describe('gallery — voting', () => {
+  it('🔴 hydrates from viewerVoted, so one click on an already-voted entry UNVOTES', async () => {
+    renderApp({
+      viewer,
+      consentGranted: true,
+      shared: {
+        seed: [
+          {
+            value: { title: 'Already voted', data: galleryData([{ imageId: 9001, row: 0, col: 0 }]) },
+            // The viewer (id 42) has an active up-vote on this row.
+            voters: [42],
+          },
+        ],
+      },
+    });
+
+    const button = await screen.findByTestId('gm-gallery-vote');
+    // Guessing "not voted" here is what makes the first click a no-op re-vote and
+    // forces the viewer to click twice to remove it.
+    expect(button).toHaveAttribute('aria-pressed', 'true');
+    expect(button).toHaveTextContent('1');
+
+    await userEvent.click(button);
+
+    await waitFor(() =>
+      expect(screen.getByTestId('gm-gallery-vote')).toHaveAttribute('aria-pressed', 'false'),
+    );
+    expect(screen.getByTestId('gm-gallery-vote')).toHaveTextContent('0');
+  });
+
+  it('surfaces a rejected vote on the entry instead of silently doing nothing', async () => {
+    renderApp({
+      viewer,
+      consentGranted: true,
+      shared: {
+        seed: [{ value: { title: 'Vote fails', data: galleryData([{ imageId: 9001, row: 0, col: 0 }]) } }],
+        failNext: 1,
+      },
+    });
+
+    await userEvent.click(await screen.findByTestId('gm-gallery-vote'));
+    expect(await screen.findByTestId('gm-gallery-action-error')).toHaveTextContent(
+      /SHARED_UNAVAILABLE/,
+    );
+    // The button did not flip to "voted" on a request that failed.
+    expect(screen.getByTestId('gm-gallery-vote')).toHaveAttribute('aria-pressed', 'false');
+  });
+});
+
+describe('gallery — publishing', () => {
+  it('🔴 a publish refused by the app-developer gate says so, and creates NO entry', async () => {
+    renderApp({
+      viewer,
+      consentGranted: true,
+      storage: { seed: { [RUN_STORAGE_KEY]: oneCellRunManifest() } },
+      publishError: 'FORBIDDEN: publishing app outputs is limited to app developers',
+    });
+
+    await userEvent.click(await screen.findByTestId('gm-publish'));
+
+    const status = await screen.findByTestId('gm-publish-status');
+    await waitFor(() =>
+      expect(status).toHaveTextContent(/limited to app developers/i),
+    );
+    // Not a silent no-op, and not a claim that anything was published.
+    expect(status).toHaveTextContent(/Nothing was published/i);
+  });
+
+  it('publishes a finished matrix and lists it, with Remove offered to its author', async () => {
+    renderApp({
+      viewer,
+      consentGranted: true,
+      storage: { seed: { [RUN_STORAGE_KEY]: oneCellRunManifest() } },
+      publishImageIds: [9001],
+    });
+
+    const publishButton = await screen.findByTestId('gm-publish');
+    expect(publishButton).toHaveTextContent('Publish 1 image');
+    await userEvent.click(publishButton);
+
+    await waitFor(() =>
+      expect(screen.getByTestId('gm-publish-status')).toHaveTextContent(
+        /Published 1 image to the gallery/i,
+      ),
+    );
+
+    // Back to the build screen, where the gallery lives, to read it back.
+    await userEvent.click(screen.getByTestId('gm-newrun'));
+    await userEvent.click(await screen.findByTestId('gm-reset-confirm'));
+
+    // The title defaulted to the run's own shared prompt — moderated text, in
+    // `title`, never in `data`.
+    expect(await screen.findByTestId('gm-gallery-title')).toHaveTextContent('a lighthouse');
+    // The author sees Remove (recorded in their PRIVATE storage), not Report.
+    expect(screen.getByTestId('gm-gallery-withdraw')).toBeInTheDocument();
+    expect(screen.queryByTestId(/-report$/)).toBeNull();
+  });
+
+  it('offers no publish control on a matrix with nothing publishable', async () => {
+    renderApp({ viewer, consentGranted: true });
+    // The build screen has no finished matrix at all.
+    await screen.findByLabelText('Shared generation prompt');
+    expect(screen.queryByTestId('gm-publish-panel')).toBeNull();
   });
 });

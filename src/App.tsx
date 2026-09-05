@@ -9,9 +9,12 @@ import {
   useDomainMaturity,
   useBuzzPurchase,
   useBuzzWorkflow,
+  useGatedImages,
+  usePublishGenerationOutputs,
   useRequestConsent,
   useRequestSignIn,
   useResourcePicker,
+  useSharedStorage,
 } from '@civitai/blocks-react';
 import { Slider, Tooltip, useToast } from '@civitai/components-react';
 import type { BlockWorkflowSnapshot } from '@civitai/app-sdk/blocks';
@@ -70,7 +73,7 @@ import { ResourceBrowser } from './ResourceBrowser.js';
 import { CatalogCache, defaultKvStore } from './catalog-cache.js';
 import { DEFAULT_LIMIT, fetchCatalog, type CatalogQuery } from './catalog-api.js';
 import { loraBaseModelFilter } from './ecosystem.js';
-import { palette, type Palette } from './theme.js';
+import { noteStyle, palette, primaryBtn, secondaryBtn, type Palette } from './theme.js';
 import { paintTheme } from './bootTheme.js';
 import { MaturityImage } from './MaturityImage.js';
 import {
@@ -83,6 +86,26 @@ import {
   type AppWorkflowLike,
   type MaturityGate,
 } from './persistence.js';
+import { GalleryPanel, type GalleryImages } from './GalleryPanel.js';
+import { PublishMatrixPanel, type PublishPhase } from './PublishMatrixPanel.js';
+import {
+  PUBLISHED_KEYS_STORAGE_KEY,
+  REPORTED_KEYS_STORAGE_KEY,
+  addKeyToSet,
+  collectImageIds,
+  composeGalleryBody,
+  defaultGalleryTitle,
+  indexGatedImages,
+  keySetBlob,
+  loadGallery,
+  normalizeGalleryTitle,
+  parseKeySet,
+  publishMatrix,
+  publishResultMessage,
+  publishableCells,
+  type GalleryEntry,
+  type GalleryLoad,
+} from './gallery.js';
 import {
   ACTIVE_RUN_POINTER_KEY,
   HISTORY_LIST_CAP,
@@ -215,6 +238,13 @@ export function App() {
   // per-app-tag-scoped list we reconcile against for status/image/nsfwLevel/cost.
   const storage = useAppStorage();
   const { workflows: appWorkflows, refetch: refetchWorkflows } = useAppWorkflows();
+  // The gallery's three host surfaces. `shared` is the app-scoped index every
+  // viewer reads; `publish` turns this viewer's own workflow outputs into real
+  // public Image rows; `getImages` reads those ids back under the REQUESTING
+  // viewer's own maturity clamp (see gallery.ts for why ids, not urls).
+  const shared = useSharedStorage();
+  const { publish } = usePublishGenerationOutputs();
+  const { getImages } = useGatedImages();
   const toast = useToast();
 
   // G1 — the domain ceiling the result-image gate consults (stable identity for
@@ -325,6 +355,25 @@ export function App() {
   const startedThisSessionRef = useRef(false);
   // Ticks once a second while running so the elapsed label advances.
   const [nowTick, setNowTick] = useState(() => Date.now());
+
+  // ---- The published-matrix gallery ----
+  // `null` renders "loading", never "empty" — before the read resolves we know
+  // neither that the gallery has entries nor that it has none.
+  const [galleryLoad, setGalleryLoad] = useState<GalleryLoad | null>(null);
+  const [galleryImages, setGalleryImages] = useState<GalleryImages | null>(null);
+  const [galleryNonce, setGalleryNonce] = useState(0);
+  // The viewer's OWN gallery keys and the ones they have reported, both read
+  // from their PRIVATE per-viewer storage. This is what lets the app answer
+  // "is this row mine" without a `user:read:self` scope — see gallery.ts.
+  const [ownKeys, setOwnKeys] = useState<Set<string>>(() => new Set());
+  const [reportedKeys, setReportedKeys] = useState<Set<string>>(() => new Set());
+  const [galleryBusyKeys, setGalleryBusyKeys] = useState<Set<string>>(() => new Set());
+  const [galleryErrors, setGalleryErrors] = useState<Map<string, string>>(() => new Map());
+  const [publishTitle, setPublishTitle] = useState('');
+  const [publishTitleTouched, setPublishTitleTouched] = useState(false);
+  const [publishPhase, setPublishPhase] = useState<PublishPhase>({ kind: 'idle' });
+  const [publishMessage, setPublishMessage] = useState<string | null>(null);
+  const [publishProblem, setPublishProblem] = useState(false);
 
   // Auto-resume intent across the consent round-trip.
   const consentPendingRef = useRef(false);
@@ -872,6 +921,74 @@ export function App() {
     };
   }, [ready, viewer, storage, historyNonce]);
 
+  // ---- Gallery — read the shared index ----
+  // Runs for anon too: reading the gallery is NOT behind the publish cohort gate
+  // and `list` has an anonymous read path, so a signed-out viewer browses it.
+  // 🔴 A REJECTION MUST NOT BECOME AN EMPTY LIST. `loadGallery` already maps one
+  // to `{kind:'error'}`; the `.catch` is the belt for anything thrown before it.
+  // Until a version carrying the shared scopes is APPROVED this is the branch
+  // every viewer lands in, so it is the one that has to be honest.
+  useEffect(() => {
+    if (!ready) return;
+    let cancelled = false;
+    setGalleryLoad(null);
+    setGalleryImages(null);
+    void (async () => {
+      const load = await loadGallery(shared).catch(() => ({ kind: 'error' }) as GalleryLoad);
+      if (!cancelled) setGalleryLoad(load);
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [ready, shared, galleryNonce]);
+
+  // ---- Gallery — read the images, per viewer, through the host's clamp ----
+  // ONE call for every listed entry's ids, then distributed BY ID. The host
+  // OMITS ids it cannot resolve, so the reply may be shorter than the request
+  // and its order means nothing — `indexGatedImages` is what makes that safe.
+  const galleryEntryIds = galleryLoad?.kind === 'ok' ? collectImageIds(galleryLoad.entries) : null;
+  // A stable signature so the effect fires on a real change of ids, not on the
+  // new array identity `collectImageIds` returns every render.
+  const galleryIdSig = galleryEntryIds?.join(',') ?? '';
+  useEffect(() => {
+    if (galleryEntryIds == null) return;
+    if (galleryEntryIds.length === 0) {
+      setGalleryImages({ kind: 'ok', byId: new Map() });
+      return;
+    }
+    let cancelled = false;
+    setGalleryImages(null);
+    void getImages(galleryEntryIds)
+      .then((images) => {
+        if (!cancelled) setGalleryImages({ kind: 'ok', byId: indexGatedImages(images) });
+      })
+      .catch(() => {
+        if (!cancelled) setGalleryImages({ kind: 'error' });
+      });
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [galleryIdSig, getImages]);
+
+  // ---- Gallery — the viewer's own + reported keys, from PRIVATE storage ----
+  useEffect(() => {
+    if (!ready || !viewer) return;
+    let cancelled = false;
+    void (async () => {
+      const [own, reported] = await Promise.all([
+        storage.get(PUBLISHED_KEYS_STORAGE_KEY).catch(() => null),
+        storage.get(REPORTED_KEYS_STORAGE_KEY).catch(() => null),
+      ]);
+      if (cancelled) return;
+      setOwnKeys(new Set(parseKeySet(own)));
+      setReportedKeys(new Set(parseKeySet(reported)));
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [ready, viewer, storage]);
+
   // ---- Release A — stamp the run's finish, once, in the session that ran it ----
   // 🔴 GATED ON `startedThisSessionRef`. Stamping any run that merely LOOKS done
   // would give a matrix restored from storage a finish time of "now", so a run
@@ -1168,6 +1285,182 @@ export function App() {
     );
   }, [openPurchaseModal, billable, state.perCellEstimate]);
 
+  // ---- Gallery actions ----
+
+  /** Mark one entry's request in flight (or not), keyed by entry. */
+  const setEntryBusy = useCallback((key: string, busy: boolean) => {
+    setGalleryBusyKeys((prev) => {
+      const next = new Set(prev);
+      if (busy) next.add(key);
+      else next.delete(key);
+      return next;
+    });
+  }, []);
+
+  const setEntryError = useCallback((key: string, message: string | null) => {
+    setGalleryErrors((prev) => {
+      const next = new Map(prev);
+      if (message == null) next.delete(key);
+      else next.set(key, message);
+      return next;
+    });
+  }, []);
+
+  /** Replace one loaded entry in place, leaving the rest of the list alone. */
+  const patchEntry = useCallback((key: string, patch: Partial<GalleryEntry>) => {
+    setGalleryLoad((prev) => {
+      if (prev == null || prev.kind !== 'ok') return prev;
+      return {
+        ...prev,
+        entries: prev.entries.map((entry) => (entry.key === key ? { ...entry, ...patch } : entry)),
+      };
+    });
+  }, []);
+
+  /** Write one of the viewer's private key sets. Best-effort, like every write. */
+  const persistKeySet = useCallback(
+    (storageKey: string, keys: readonly string[]) => {
+      storage.set(storageKey, keySetBlob(keys)).catch(() => undefined);
+    },
+    [storage],
+  );
+
+  // 🔴 THE VOTE STATE COMES FROM `viewerVoted`, AND THE NEW STATE COMES FROM THE
+  // ACTION — never from a local guess. Guessing "not voted" on load is what
+  // produces the "click twice to unvote" bug; guessing the post-click state is
+  // the same error one step later, and it survives a failed request.
+  const handleToggleVote = useCallback(
+    (entry: GalleryEntry) => {
+      if (galleryBusyKeys.has(entry.key)) return;
+      const wasVoted = entry.viewerVoted;
+      setEntryBusy(entry.key, true);
+      setEntryError(entry.key, null);
+      const request = wasVoted ? shared.unvote(entry.key) : shared.vote(entry.key);
+      void request
+        .then((count) => {
+          patchEntry(entry.key, { count, viewerVoted: !wasVoted });
+        })
+        .catch((err: unknown) => {
+          setEntryError(
+            entry.key,
+            err instanceof Error && err.message.length > 0
+              ? err.message
+              : 'Your vote could not be saved.',
+          );
+        })
+        .finally(() => setEntryBusy(entry.key, false));
+    },
+    [shared, galleryBusyKeys, setEntryBusy, setEntryError, patchEntry],
+  );
+
+  // 🔴 RE-THROWS. `ReportButton`'s contract is that a rejected `onReport` keeps
+  // the control armed rather than settling — swallowing the error here would
+  // render "Reported for review" for a report that was never filed.
+  const handleReportEntry = useCallback(
+    async (entry: GalleryEntry) => {
+      await shared.report(entry.key);
+      setReportedKeys((prev) => {
+        const next = addKeyToSet([...prev], entry.key);
+        persistKeySet(REPORTED_KEYS_STORAGE_KEY, next);
+        return new Set(next);
+      });
+    },
+    [shared, persistKeySet],
+  );
+
+  const handleWithdrawEntry = useCallback(
+    (entry: GalleryEntry) => {
+      if (galleryBusyKeys.has(entry.key)) return;
+      setEntryBusy(entry.key, true);
+      setEntryError(entry.key, null);
+      void shared
+        .withdraw(entry.key)
+        .then(() => {
+          setGalleryLoad((prev) =>
+            prev == null || prev.kind !== 'ok'
+              ? prev
+              : { ...prev, entries: prev.entries.filter((e) => e.key !== entry.key) },
+          );
+          setOwnKeys((prev) => {
+            const next = [...prev].filter((k) => k !== entry.key);
+            persistKeySet(PUBLISHED_KEYS_STORAGE_KEY, next);
+            return new Set(next);
+          });
+        })
+        .catch((err: unknown) => {
+          setEntryError(
+            entry.key,
+            err instanceof Error && err.message.length > 0
+              ? err.message
+              : 'This entry could not be removed.',
+          );
+        })
+        .finally(() => setEntryBusy(entry.key, false));
+    },
+    [shared, galleryBusyKeys, setEntryBusy, setEntryError, persistKeySet],
+  );
+
+  // The cells of the open matrix that can be published: `done`, with a
+  // workflowId the host can re-derive ownership from.
+  const publishPlan = useMemo(() => publishableCells(state.cells), [state.cells]);
+  // The title offered until the author edits it. Derived from the run's own
+  // shared prompt, so it describes the matrix on screen rather than the form.
+  const suggestedPublishTitle = defaultGalleryTitle(sharedPromptFromCells(state.cells));
+  const effectivePublishTitle = publishTitleTouched ? publishTitle : suggestedPublishTitle;
+
+  const handlePublish = useCallback(() => {
+    if (publishPhase.kind === 'busy') return;
+    setPublishMessage(null);
+    setPublishProblem(false);
+    setPublishPhase({ kind: 'busy', done: 0, total: publishPlan.length });
+    void publishMatrix(
+      publishPlan,
+      {
+        // Every user-visible string goes in the MODERATED fields. `data` carries
+        // ids and grid coordinates only — see gallery.ts.
+        title: normalizeGalleryTitle(effectivePublishTitle),
+        ...(composeGalleryBody(sharedPromptFromCells(state.cells)) !== undefined
+          ? { body: composeGalleryBody(sharedPromptFromCells(state.cells)) }
+          : {}),
+      },
+      { publish, append: (value) => shared.append(value) },
+      (done, total) => setPublishPhase({ kind: 'busy', done, total }),
+    )
+      .then((result) => {
+        setPublishMessage(publishResultMessage(result));
+        setPublishProblem(result.kind !== 'ok');
+        if (result.kind === 'ok' || result.kind === 'partial') {
+          // Record the minted key as OURS, in the viewer's private storage. This
+          // is what makes Withdraw offerable without a `user:read:self` scope.
+          setOwnKeys((prev) => {
+            const next = addKeyToSet([...prev], result.key);
+            persistKeySet(PUBLISHED_KEYS_STORAGE_KEY, next);
+            return new Set(next);
+          });
+          setGalleryNonce((n) => n + 1);
+        }
+      })
+      .catch((err: unknown) => {
+        // `publishMatrix` maps every host failure to a result, so reaching here
+        // means something unexpected threw — still say so rather than sit silent.
+        setPublishMessage(
+          err instanceof Error && err.message.length > 0
+            ? `Nothing was published. ${err.message}`
+            : 'Nothing was published.',
+        );
+        setPublishProblem(true);
+      })
+      .finally(() => setPublishPhase({ kind: 'idle' }));
+  }, [
+    publishPhase.kind,
+    publishPlan,
+    effectivePublishTitle,
+    state.cells,
+    publish,
+    shared,
+    persistKeySet,
+  ]);
+
   // ---- Render ----
   if (!ready) {
     return (
@@ -1256,6 +1549,26 @@ export function App() {
           <HistoryPanel c={c} load={history} now={nowTick} onOpen={handleOpenHistory} />
         )}
 
+        {/* Browsing the gallery is NOT behind the publish cohort gate, and not
+            behind sign-in either — an anonymous viewer reads it, and simply
+            cannot vote, report or withdraw. */}
+        {inBuild && (
+          <GalleryPanel
+            c={c}
+            load={galleryLoad}
+            images={galleryImages}
+            maturityGate={maturityGate}
+            signedIn={!anon}
+            ownKeys={ownKeys}
+            reportedKeys={reportedKeys}
+            busyKeys={galleryBusyKeys}
+            actionErrors={galleryErrors}
+            onToggleVote={handleToggleVote}
+            onReport={handleReportEntry}
+            onWithdraw={handleWithdrawEntry}
+          />
+        )}
+
         {inBuild && browse && cacheRef.current && (
           <ResourceBrowser
             c={c}
@@ -1315,6 +1628,26 @@ export function App() {
                 prompt: cell.prompt,
               })
             }
+          />
+        )}
+
+        {/* Offered on a FINISHED matrix with something to publish — including one
+            reopened from history, which is equally publishable: publishing does
+            not re-run anything, so `readOnly` does not apply. */}
+        {showGrid && state.phase === 'done' && publishPlan.length > 0 && (
+          <PublishMatrixPanel
+            c={c}
+            publishable={publishPlan.length}
+            title={effectivePublishTitle}
+            setTitle={(value) => {
+              setPublishTitleTouched(true);
+              setPublishTitle(value);
+            }}
+            phase={publishPhase}
+            message={publishMessage}
+            messageIsProblem={publishProblem}
+            signedIn={!anon}
+            onPublish={handlePublish}
           />
         )}
 
@@ -2933,36 +3266,6 @@ function backdropStyle(): React.CSSProperties {
     zIndex: 60,
     boxSizing: 'border-box',
   };
-}
-
-function primaryBtn(c: Palette, disabled = false): React.CSSProperties {
-  return {
-    padding: '12px 18px',
-    border: 'none',
-    borderRadius: 8,
-    background: disabled ? c.border : c.accent,
-    color: disabled ? c.muted : c.accentFg,
-    fontWeight: 700,
-    fontSize: 15,
-    cursor: disabled ? 'not-allowed' : 'pointer',
-  };
-}
-
-function secondaryBtn(c: Palette): React.CSSProperties {
-  return {
-    padding: '12px 18px',
-    border: `1px solid ${c.border}`,
-    borderRadius: 8,
-    background: 'transparent',
-    color: c.fg,
-    fontWeight: 600,
-    fontSize: 15,
-    cursor: 'pointer',
-  };
-}
-
-function noteStyle(c: Palette): React.CSSProperties {
-  return { fontSize: 13, color: c.muted, margin: 0, lineHeight: 1.5 };
 }
 
 // A dashed "add" chip for the resource-picker affordance — visually distinct
