@@ -16,6 +16,7 @@
 //   faithful, money-safe rebuild.
 
 import {
+  ALL_CELL_STATUSES,
   type CellStatus,
   type MatrixCell,
   type MatrixState,
@@ -40,6 +41,25 @@ export interface RunManifest {
   savedAt: string;
   perCellEstimate: number | null;
   cells: MatrixCell[];
+  /**
+   * Wall-clock stamps for the run's elapsed time (Release A, change 5).
+   *
+   * 🔴 OPTIONAL ON PURPOSE, AND THE VERSION IS DELIBERATELY NOT BUMPED.
+   * `isValidManifest` rejects anything whose `version` is not
+   * `RUN_MANIFEST_VERSION`, so bumping it would make every manifest already in a
+   * viewer's storage — including the run of someone mid-generation when this
+   * ships — fail to restore. Adding fields that may be absent is the change that
+   * costs nobody their run; the reader treats absent as "unknown", which is
+   * exactly what it is for a run that started before the app recorded it.
+   */
+  startedAt?: number | null;
+  finishedAt?: number | null;
+}
+
+/** The two stamps `runElapsedMs` consumes. Absent/`null` = unknown. */
+export interface RunTiming {
+  startedAt?: number | null;
+  finishedAt?: number | null;
 }
 
 /**
@@ -74,12 +94,34 @@ export function isPersistableRun(state: MatrixState): boolean {
 }
 
 /** Serialize the live matrix state to a persistable manifest. */
-export function buildRunManifest(state: MatrixState, now: () => number = Date.now): RunManifest {
+export function buildRunManifest(
+  state: MatrixState,
+  now: () => number = Date.now,
+  timing: RunTiming = {},
+): RunManifest {
   return {
     version: RUN_MANIFEST_VERSION,
     savedAt: new Date(now()).toISOString(),
     perCellEstimate: state.perCellEstimate,
     cells: state.cells,
+    startedAt: timing.startedAt ?? null,
+    finishedAt: timing.finishedAt ?? null,
+  };
+}
+
+/**
+ * Read the run timing back out of a persisted manifest.
+ *
+ * Separate from `restoreStateFromManifest` because timing is NOT part of
+ * `MatrixState` — the reducer is pure and takes no clock, so the stamps live
+ * beside it in the component. Anything non-finite (absent, null, forged) reads
+ * back as `null`, which `runElapsedMs` renders as "no elapsed time shown".
+ */
+export function runTimingFromManifest(manifest: unknown): RunTiming {
+  if (!isObj(manifest)) return { startedAt: null, finishedAt: null };
+  return {
+    startedAt: finite(manifest.startedAt) ? manifest.startedAt : null,
+    finishedAt: finite(manifest.finishedAt) ? manifest.finishedAt : null,
   };
 }
 
@@ -173,25 +215,61 @@ export function restoreStateFromManifest(manifest: unknown): MatrixState | null 
   return { phase, cells, perCellEstimate };
 }
 
+/**
+ * Rebuild a manifest as an ARCHIVE — a finished matrix you are looking at, not a
+ * run you are in.
+ *
+ * 🔴 REOPENING FROM HISTORY IS VIEWING, NOT RESUMING, AND CONFLATING THE TWO
+ * WEDGED THE APP. `restoreStateFromManifest` deliberately reports `running` when
+ * any cell is still re-pollable, because on mount that IS the state: the active
+ * run was interrupted and should carry on. Handing the same value to a matrix
+ * picked out of a list produces a screen that is running and cannot be left —
+ * every cell frozen on "Generating…", an elapsed clock measured from a start
+ * weeks ago (a measured `5927h 42m`, ticking up once a second), "New matrix"
+ * withheld because it is gated on `phase === 'done'`, and Stop the only control
+ * on screen, which marks paid cells `canceled` / "no charge".
+ *
+ * So an archive is forced terminal:
+ *  - `phase: 'done'` — the run is over as far as this screen is concerned, which
+ *    restores "New matrix" and withdraws Stop.
+ *  - a still-`polling` cell becomes `timedout`, the app's existing honest
+ *    "submitted, may still finish, never re-charged" state. It is NOT flipped to
+ *    `canceled`: that would say "no charge" about a cell that was submitted and
+ *    may well have been billed.
+ *
+ * Nothing here is written back — see `handleOpenHistory`, which does not point
+ * the active-run pointer at an archive and does not persist it.
+ */
+export function archiveStateFromManifest(manifest: unknown): MatrixState | null {
+  const restored = restoreStateFromManifest(manifest);
+  if (!restored) return null;
+  return {
+    ...restored,
+    phase: 'done',
+    cells: restored.cells.map((cell) =>
+      cell.status === 'polling' ? { ...cell, status: 'timedout' as const } : cell,
+    ),
+  };
+}
+
 function isValidManifest(manifest: unknown): manifest is RunManifest {
   if (typeof manifest !== 'object' || manifest === null) return false;
   const m = manifest as Partial<RunManifest>;
   return m.version === RUN_MANIFEST_VERSION && Array.isArray(m.cells);
 }
 
-/** Every valid `CellStatus` — the allow-list a persisted status is clamped to. */
-const VALID_CELL_STATUSES: ReadonlySet<CellStatus> = new Set<CellStatus>([
-  'idle',
-  'estimating',
-  'submitting',
-  'polling',
-  'done',
-  'failed',
-  'insufficient',
-  'blocked',
-  'canceled',
-  'timedout',
-]);
+/**
+ * Every valid `CellStatus` — the allow-list a persisted status is clamped to.
+ *
+ * 🔴 DERIVED FROM `ALL_CELL_STATUSES`, NOT RE-TYPED. This used to be a second
+ * hand-written copy of the union's members. Two lists of the same thing drift in
+ * one direction: a new status added to the type and to the renderer, forgotten
+ * here, would be treated as FORGED by every restore and silently clamped to
+ * `canceled` — a paid cell reading "no charge". `ALL_CELL_STATUSES` is
+ * compiler-enforced against the union, so deriving from it removes the second
+ * list rather than keeping it in sync by hand.
+ */
+const VALID_CELL_STATUSES: ReadonlySet<CellStatus> = new Set<CellStatus>(ALL_CELL_STATUSES);
 
 const isObj = (v: unknown): v is Record<string, unknown> =>
   typeof v === 'object' && v !== null;

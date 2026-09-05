@@ -1,4 +1,4 @@
-import { render, screen, within } from '@testing-library/react';
+import { render, screen } from '@testing-library/react';
 import { describe, expect, it } from 'vitest';
 
 import { BuildPanel, MatrixShapePreview } from './App.js';
@@ -24,20 +24,52 @@ const mods: ModifierOption[] = [
 
 describe('MatrixShapePreview draws the grid that is about to be generated', () => {
   it('renders one row per model and one column per style', () => {
-    render(<MatrixShapePreview c={c} checkpoints={ckpts} modifiers={mods} />);
-    const table = screen.getByRole('table');
+    const { container } = render(<MatrixShapePreview c={c} checkpoints={ckpts} modifiers={mods} />);
+    // 🔴 QUERIED THROUGH THE DOM, NOT BY ROLE, AND THAT IS THE POINT OF THE
+    // CHANGE THIS FILE NOW GUARDS. The table is deliberately `aria-hidden`, so
+    // `getByRole('table')` no longer sees it — the shape is still drawn, it is
+    // simply no longer announced. Asserting the DRAWING here and the ABSENCE
+    // from the a11y tree in its own test below keeps the two claims separate.
+    const table = container.querySelector('table');
+    expect(table).not.toBeNull();
 
-    // Column headers: the corner cell is aria-hidden, so only the styles are
-    // exposed as column headers.
-    const colHeaders = within(table).getAllByRole('columnheader');
+    const colHeaders = [...table!.querySelectorAll('thead th[scope="col"]')];
     expect(colHeaders.map((h) => h.textContent)).toEqual(['Baseline', 'Cinematic', 'Anime']);
 
-    const rowHeaders = within(table).getAllByRole('rowheader');
+    const rowHeaders = [...table!.querySelectorAll('tbody th[scope="row"]')];
     expect(rowHeaders.map((h) => h.textContent)).toEqual(['SD XL', 'Pony']);
 
     // 2 models x 3 styles. Asserted as the PRODUCT, because a mutant that
     // renders one axis for both would still produce a plausible-looking table.
-    expect(within(table).getAllByRole('cell')).toHaveLength(6);
+    expect(table!.querySelectorAll('tbody td')).toHaveLength(6);
+  });
+
+  it('keeps the whole preview table out of the accessibility tree', () => {
+    // 🔴 THE REGRESSION THIS PINS: an evidence capture of the live app reported
+    // gen-matrix's primary surface as an EMPTY STATE. The detector picked this
+    // table — the first grid-shaped thing on the configure screen — found no
+    // items in it, and downgraded the verdict from `no-collection` to `empty`.
+    // The cells are empty by design; they are placeholders for a shape.
+    //
+    // Correct on its own merits regardless of any detector: the boxes carry no
+    // information, the axis names are announced by the chip rows above, and the
+    // caption states the shape in words. Traversing an empty grid is pure noise.
+    const { container } = render(<MatrixShapePreview c={c} checkpoints={ckpts} modifiers={mods} />);
+
+    const table = container.querySelector('table');
+    expect(table).not.toBeNull();
+    expect(table).toHaveAttribute('aria-hidden');
+
+    // The accessible equivalent survives: the caption is NOT inside the table,
+    // so it is still exposed. A "fix" that hid the caption too would strip the
+    // information rather than relocate it.
+    expect(screen.getByText(/2 models × 3 styles/)).toBeInTheDocument();
+
+    // And nothing inside the table is reachable by role any more — the check
+    // that the attribute is actually doing its job, rather than merely present.
+    expect(screen.queryByRole('table')).toBeNull();
+    expect(screen.queryAllByRole('cell')).toHaveLength(0);
+    expect(screen.queryAllByRole('columnheader')).toHaveLength(0);
   });
 
   it('describes the shape in words that match the table it drew', () => {
@@ -54,12 +86,15 @@ describe('MatrixShapePreview draws the grid that is about to be generated', () =
     expect(text).not.toMatch(/1 models|1 styles/);
   });
 
-  it('keeps the empty placeholder boxes out of the accessibility tree', () => {
-    render(<MatrixShapePreview c={c} checkpoints={ckpts} modifiers={mods} />);
-    const cells = within(screen.getByRole('table')).getAllByRole('cell');
+  it('keeps the empty placeholder boxes empty', () => {
+    const { container } = render(<MatrixShapePreview c={c} checkpoints={ckpts} modifiers={mods} />);
+    const cells = [...container.querySelectorAll('tbody td')];
+    expect(cells).toHaveLength(6);
 
-    // Every cell holds one aria-hidden box and no text: the axis headers already
-    // name each cell, so announcing six empty boxes would be noise.
+    // Every cell holds one placeholder box and no text. The box stays
+    // individually aria-hidden as well as the table: the two are independent
+    // (a later change could unhide the table), and an empty box should never be
+    // announced either way.
     for (const cell of cells) {
       expect(cell.textContent).toBe('');
       expect(cell.querySelector('[aria-hidden]')).not.toBeNull();

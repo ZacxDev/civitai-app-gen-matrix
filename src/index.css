@@ -45,6 +45,28 @@ body,
   animation-delay: var(--gm-stagger, 0ms);
 }
 
+/* --- A cell's tooltip wrapper must not shrink-wrap the cell -----------------
+ * 🔴 THIS ONE DECLARATION IS WHAT KEEPS EVERY CELL THE SAME HEIGHT.
+ * `CellShell` makes a cell's height a function of its WIDTH (the media row is
+ * an `aspect-ratio: 1 / 1` square), which only holds while the square receives
+ * the grid column's full width. The design-system Tooltip wraps its trigger in
+ * `[data-civitai-ui='tooltip'] { display: inline-flex }` — an inline-level box,
+ * so it shrink-wraps to its content rather than stretching. Measured in
+ * Chromium at a 136px column: the `blocked` cell's wrapper was 86px wide and
+ * the cell 106px tall, against 156px for every other status.
+ *
+ * `display: block` restores the fill. It is deliberately UNLAYERED: the library
+ * ships every rule inside `@layer civitai.components`, and unlayered author CSS
+ * outranks any layer regardless of injection order, so this cannot lose a
+ * source-order race with the runtime-injected component styles.
+ * `position: relative` is untouched, so the bubble still anchors here.
+ *
+ * Applied via `CELL_TOOLTIP_CLASS` in App.tsx — see that constant for why this
+ * is a shared class rather than a patch at the one site that visibly broke. */
+.gm-cell-tooltip {
+  display: block;
+}
+
 /* --- Image fade-in once decoded (D4.1) -------------------------------------
  * Applied to the <img> on its onLoad, so the decoded image (not the empty
  * element) animates in. opacity + scale only. */

@@ -64,6 +64,74 @@ export function composeCellPrompt(sharedPrompt: string, modifier: ModifierOption
   return clampPrompt(joined);
 }
 
+/**
+ * Recover the SHARED prompt from one cell — the inverse of `composeCellPrompt`.
+ *
+ * 🔴 THERE IS NO SINGLE "THE PROMPT" ON A RUN, WHICH IS WHY THIS EXISTS. Each
+ * cell's prompt is `shared + ", " + the style's suffix`, so reading any one
+ * cell's prompt back to the viewer as "your prompt" would show them a string
+ * they never typed. This strips the suffix the cell's OWN modifier contributed,
+ * using data persisted with the cell.
+ *
+ * Returns `null` when the original cannot be recovered exactly — notably when
+ * `clampPrompt` truncated the composed string, so the suffix is no longer intact
+ * at the end. A null must be rendered as "no prompt shown", never as an empty
+ * prompt: a confident blank is a claim that they ran an empty prompt.
+ */
+export function sharedPromptFromCell(cell: Pick<MatrixCell, 'prompt' | 'modifier'>): string | null {
+  const effective = cell.prompt;
+  if (typeof effective !== 'string') return null;
+  const suffix = cell.modifier?.promptSuffix?.trim() ?? '';
+  // Baseline column: the effective prompt IS the shared prompt, verbatim.
+  if (suffix.length === 0) return effective;
+  // Shared prompt was empty → compose emitted the bare suffix.
+  if (effective === suffix) return '';
+  // 🔴 AT THE CLAMP, THE ANSWER IS GENUINELY AMBIGUOUS — SAY SO.
+  // `clampPrompt` truncates to `PROMPT_MAX`, so an effective prompt sitting
+  // exactly on that bound has two readings that BOTH round-trip through
+  // `composeCellPrompt` to the same string: the shared prompt was `effective`
+  // minus the tail (composed to exactly the cap, nothing lost), or the shared
+  // prompt WAS `effective` and its own trailing text merely looks like the
+  // suffix, the appended one having been clamped away. Measured: a 1495-char
+  // prompt ending `, oil` with the suffix `oil` came back shortened by those
+  // five characters and was presented as "Prompt:" — a string the viewer never
+  // typed, offered with no hint it had been altered. Nothing downstream can
+  // distinguish the two readings either, so this returns `null` (rendered as no
+  // prompt line at all) rather than pick one. `sharedPromptFromCells` then falls
+  // through to a cell that CAN answer — in practice the baseline column, whose
+  // effective prompt IS the shared prompt. ⚠️ NOT A GUARANTEE, THOUGH:
+  // `BASELINE_MODIFIER` is deselectable, so a run of only suffix-bearing columns
+  // at the clamp has no cell that can answer and the `Prompt:` line is dropped
+  // entirely. That is still the honest outcome — no line beats a line the viewer
+  // never typed — but it is a refusal, not a fallback that always lands.
+  if (effective.length >= PROMPT_MAX) return null;
+  const tail = `, ${suffix}`;
+  if (effective.endsWith(tail)) return effective.slice(0, -tail.length);
+  // Truncated by the length clamp, or otherwise not the string compose would
+  // have produced. Say so rather than guess.
+  return null;
+}
+
+/**
+ * The shared prompt for a whole run, recovered from its cells.
+ *
+ * Takes the first cell that yields an exact answer — cells of one run share a
+ * prompt by construction, and a cell whose composition was truncated simply
+ * cannot answer, so it is skipped in favour of one that can (in practice the
+ * baseline column — but it is deselectable, so a run of only suffix-bearing
+ * columns at the clamp has no answering cell). Returns `null` when no cell can
+ * answer, and the header then shows no prompt line at all.
+ */
+export function sharedPromptFromCells(
+  cells: readonly Pick<MatrixCell, 'prompt' | 'modifier'>[],
+): string | null {
+  for (const cell of cells) {
+    const shared = sharedPromptFromCell(cell);
+    if (shared != null) return shared;
+  }
+  return null;
+}
+
 /** Default LoRA strength when a modifier omits one. Mirrors the server default. */
 export const DEFAULT_LORA_STRENGTH = 1;
 /** Server strength bounds for an additionalResources entry. */
@@ -208,6 +276,32 @@ export type CellStatus =
   | 'blocked' // the SERVER rejected the pairing as incompatible (pre-spend, costs 0)
   | 'canceled' // the user stopped the run before this cell started (idle → canceled, no spend)
   | 'timedout'; // polling gave up after the cap; the gen is STILL running server-side (may finish + bill) — terminal-ish, NOT retryable (no re-charge)
+
+/**
+ * Every `CellStatus`, as a runtime value.
+ *
+ * 🔴 THE `Record<CellStatus, true>` IS THE WHOLE MECHANISM — do not replace it
+ * with a plain array. A hand-written array of status strings is a SECOND list
+ * that has to be remembered; adding an 11th status to the union above would
+ * leave it stale and silent, and every test that "enumerates every status" would
+ * quietly enumerate ten of eleven while still reading as exhaustive. Keying an
+ * object by the union makes TypeScript refuse to compile until the new status is
+ * added here too, so the enumeration cannot fall behind the type.
+ */
+const CELL_STATUS_MEMBERS: Record<CellStatus, true> = {
+  idle: true,
+  estimating: true,
+  submitting: true,
+  polling: true,
+  done: true,
+  failed: true,
+  insufficient: true,
+  blocked: true,
+  canceled: true,
+  timedout: true,
+};
+
+export const ALL_CELL_STATUSES = Object.keys(CELL_STATUS_MEMBERS) as readonly CellStatus[];
 
 export interface MatrixCell {
   /** Stable, deduped id = `${checkpoint.versionId}::${modifier.key}`. */
@@ -477,6 +571,113 @@ export function suggestedTopUpAmount(
 export function formatCost(cost: number | null | undefined): string {
   if (cost == null || !Number.isFinite(cost)) return '—';
   return Math.round(cost).toLocaleString();
+}
+
+// ---------------------------------------------------------------------------
+// Run ELAPSED TIME (Release A, change 5).
+//
+// The results header reported cost and nothing else, so a run that is merely
+// slow and a run that is WEDGED looked identical: both sat there saying "3 of 6
+// · spent 24 Buzz" indefinitely. Elapsed time is the cheapest signal that
+// separates them, and it costs no extra request — it is arithmetic over two
+// timestamps the run already records.
+// ---------------------------------------------------------------------------
+
+/**
+ * Elapsed milliseconds for a run, or `null` when it cannot be known.
+ *
+ * 🔴 `null` IS A REQUIRED OUTCOME, NOT A DEGENERATE ONE. A run restored from a
+ * manifest written before this change carries no `startedAt`, and the tempting
+ * repair — treating the restore itself as the start — invents a number: a matrix
+ * generated last week reopens claiming it has been running for four seconds.
+ * A missing elapsed time tells the viewer nothing; a fabricated one tells them
+ * something false, so the absent case must stay absent all the way to the UI.
+ *
+ * A negative span (a clock that moved backwards between the two stamps, or a
+ * forged manifest) is also `null` — "-3 s" is not a runtime.
+ */
+export function runElapsedMs(
+  startedAt: number | null | undefined,
+  finishedAt: number | null | undefined,
+  nowMs: number,
+): number | null {
+  if (startedAt == null || !Number.isFinite(startedAt)) return null;
+  const end = finishedAt != null && Number.isFinite(finishedAt) ? finishedAt : nowMs;
+  if (!Number.isFinite(end)) return null;
+  const ms = end - startedAt;
+  if (ms < 0) return null;
+  return ms;
+}
+
+/**
+ * Format an elapsed span compactly: `8s`, `1m 05s`, `2h 04m`.
+ *
+ * Seconds are zero-padded inside a minutes label so the string does not jitter
+ * in width while a run ticks — `1m 5s` → `1m 05s`.
+ */
+export function formatElapsed(ms: number | null): string | null {
+  if (ms == null || !Number.isFinite(ms) || ms < 0) return null;
+  const totalSeconds = Math.floor(ms / 1000);
+  if (totalSeconds < 60) return `${totalSeconds}s`;
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  if (minutes < 60) return `${minutes}m ${String(seconds).padStart(2, '0')}s`;
+  const hours = Math.floor(minutes / 60);
+  return `${hours}h ${String(minutes % 60).padStart(2, '0')}m`;
+}
+
+/**
+ * The elapsed label the results header shows, or `null` to show nothing.
+ * Composition of the two above — one call site, so the omit-vs-fabricate rule
+ * cannot be re-decided differently somewhere else.
+ */
+export function elapsedLabel(
+  startedAt: number | null | undefined,
+  finishedAt: number | null | undefined,
+  nowMs: number,
+): string | null {
+  return formatElapsed(runElapsedMs(startedAt, finishedAt, nowMs));
+}
+
+/**
+ * The elapsed label for a run in a given phase — the ONLY form the UI calls.
+ *
+ * 🔴 A DURATION MEASURED TO *NOW* IS ONLY HONEST FOR A RUN THIS SESSION WATCHED
+ * START. `runElapsedMs` treats a missing `finishedAt` as "still going" and
+ * measures to now. That is right for a live run and a fabrication for every
+ * other case, and there are TWO of them, not one:
+ *
+ *  - the run is over but never recorded its end (`running === false`). Reopen a
+ *    matrix from last Tuesday and the header claims it took six days.
+ *  - the run is RESTORED and still reports `running`. Any run interrupted
+ *    mid-flight persists with a re-pollable cell, so `restoreStateFromManifest`
+ *    rebuilds it as `running` and the clock measures from a start weeks in the
+ *    past. Measured on a reopened matrix: `5927h 42m` — about 247 days — ticking
+ *    up once a second. The earlier `!running && finishedAt == null` guard could
+ *    not see this at all, because the phase it keys on is exactly the one this
+ *    case reports.
+ *
+ * So a duration is rendered only when it is either RECORDED (`finishedAt` is
+ * present, so the arithmetic uses two stamps we own) or WITNESSED (this session
+ * started the run, so "now" is a stamp we own too). Anything else is unknown,
+ * and unknown renders as nothing at all — the same rule `runElapsedMs` applies
+ * to a missing start.
+ *
+ * `startedThisSession` defaults to FALSE so a caller that forgets it omits the
+ * label rather than fabricating one.
+ */
+export function runElapsedLabel(
+  timing: { startedAt?: number | null; finishedAt?: number | null },
+  running: boolean,
+  nowMs: number,
+  opts: { startedThisSession?: boolean } = {},
+): string | null {
+  if (timing.startedAt == null) return null;
+  // A recorded end is exact whatever the phase says.
+  if (timing.finishedAt != null) return elapsedLabel(timing.startedAt, timing.finishedAt, nowMs);
+  if (!running) return null;
+  if (!opts.startedThisSession) return null;
+  return elapsedLabel(timing.startedAt, timing.finishedAt, nowMs);
 }
 
 // ---------------------------------------------------------------------------

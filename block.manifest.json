@@ -10,10 +10,14 @@
   "repository": "https://github.com/ZacxDev/civitai-app-gen-matrix",
   "type": "block",
   "scopes": [
-    "ai:write:budgeted"
+    "ai:write:budgeted",
+    "apps:storage:read",
+    "apps:storage:write"
   ],
   "scopeJustifications": {
-    "ai:write:budgeted": "Spends the viewer's Buzz to generate each matrix cell's image, capped by page.buzzBudgetPerGen and confirmed behind an explicit per-run estimate + Confirm step."
+    "ai:write:budgeted": "Spends the viewer's Buzz to generate each matrix cell's image, capped by page.buzzBudgetPerGen and confirmed behind an explicit per-run estimate + Confirm step.",
+    "apps:storage:read": "Reads back the viewer's own past matrices — the grid, its per-cell images and what each cell cost — so a reload reopens a paid run instead of losing it. Private to that viewer; the block never reads another viewer's rows.",
+    "apps:storage:write": "Saves each matrix the viewer generates under their own private per-app storage, so a run they already paid for survives a reload and stays in their history."
   },
   "page": {
     "path": "/",
