@@ -1358,8 +1358,14 @@ describe('gallery — the extend target is resolved AUTHORITATIVELY (F1-round5)'
   });
 });
 
-describe('gallery — an orphaned publish keeps the viewer’s typed title (F4-round5)', () => {
-  it('🔴 does not silently revert the title while cells are still armed', async () => {
+describe('gallery — an orphaned publish still reaches the ledger', () => {
+  // 🔴 RENAMED. It used to be called "keeps the viewer's typed title", and it
+  // never re-read the title box — typing into it was decorative and the test
+  // passed identically without it. Names are what a later round greps, and this
+  // one was being counted as coverage for a property it did not test. The
+  // property has real coverage now, in the PARTIAL-land test above, which is the
+  // only shape where the rule bites.
+  it('disarms the cell when the attempt covered everything that was armed', async () => {
     const { manifest, cells } = fourDoneManifest();
     // Only cell 0 is published, so three cells stay armed after the attempt.
     const ledger = {
@@ -1412,5 +1418,150 @@ describe('gallery — an orphaned publish keeps the viewer’s typed title (F4-r
     // tier that can construct it.
     await waitFor(() => expect(screen.getByTestId('gm-publish')).toBeDisabled());
     expect(screen.getByTestId('gm-publish')).toHaveTextContent(/already published/i);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Round-6: a PARTIAL land — the state the title-retention rule exists for.
+//
+// 🔴 I PREVIOUSLY RECORDED THIS AS "STRUCTURALLY UNREACHABLE THROUGH
+// createMockHost". That was overstated, and a limit stated too strongly stops
+// the next person trying. `publishImageIds` and `publishError` are both
+// documented "Live-tunable via MockHost.setScenario", and the publish loop
+// reports progress BEFORE issuing each cell's request — so flipping the
+// scenario once cell 2 is in flight makes cell 3 fail while cells 1 and 2 have
+// landed. That is a partial land, and it is deterministic: cell 3 is issued only
+// after cell 2's reply resolves, and the progress render that gates the flip
+// happens before that reply.
+// ---------------------------------------------------------------------------
+
+/** A 3-cell run, every cell done, so all three are publishable. */
+function threeDoneManifest() {
+  const cells = buildMatrix('a lighthouse', [CHECKPOINTS[0]], [
+    MODIFIERS[0],
+    MODIFIERS[1],
+    MODIFIERS[2],
+  ]).map(
+    (cell, i): MatrixCell => ({
+      ...cell,
+      status: 'done',
+      workflowId: `wf_p${i}`,
+      imageUrl: `https://img.example/p${i}.jpeg`,
+      cost: 8,
+      nsfwLevel: 1,
+    }),
+  );
+  return buildRunManifest({ phase: 'done', cells, perCellEstimate: 8 });
+}
+
+/** Mount against a host the test keeps a handle on, so it can retune mid-run. */
+function mountTunable(options: Record<string, unknown>) {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const host = createMockHost(options as any);
+  resetTransport();
+  getTransport({ allowedParentOrigins: [window.location.origin] });
+  const uninstall = host.install();
+  const view = render(
+    <ToastProvider>
+      <App />
+    </ToastProvider>,
+  );
+  return {
+    host,
+    cleanup: () => {
+      view.unmount();
+      uninstall();
+    },
+  };
+}
+
+describe('gallery — a PARTIAL land keeps the viewer’s typed title (F4-round6)', () => {
+  it('🔴 publishes 2 of 3, leaves the third armed, and does NOT revert the title', async () => {
+    const harness = mountTunable({
+      viewer,
+      consentGranted: true,
+      storage: { seed: { [RUN_STORAGE_KEY]: threeDoneManifest() } },
+      publishImageIds: [9101],
+    });
+    try {
+      const titleBox = await screen.findByTestId('gm-publish-title');
+      await userEvent.clear(titleBox);
+      await userEvent.type(titleBox, 'Autumn lighthouse study');
+
+      // 🔴 THE HOOK IS THE MESSAGE BOUNDARY, NOT THE DOM. Gating on the rendered
+      // "Confirming image 2 of 3" does NOT work — measured: the mock answers fast
+      // enough that the whole loop completes inside one React batch and that
+      // intermediate state never paints. Wrapping the patched
+      // `window.parent.postMessage` fires exactly when the third publish request
+      // is SENT, before the mock handles it, so the flip is deterministic and
+      // carries no timing dependency.
+      const parentWindow = window.parent as unknown as {
+        postMessage: (message: unknown, ...rest: unknown[]) => void;
+      };
+      const originalPostMessage = parentWindow.postMessage;
+      let publishRequests = 0;
+      parentWindow.postMessage = (message: unknown, ...rest: unknown[]) => {
+        if ((message as { type?: string } | null)?.type === 'PUBLISH_GENERATION_OUTPUTS') {
+          publishRequests += 1;
+          if (publishRequests === 3) {
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            harness.host.setScenario({ publishError: 'the host refused this one' } as any);
+          }
+        }
+        return originalPostMessage.call(parentWindow, message, ...rest);
+      };
+
+      const button = screen.getByTestId('gm-publish');
+      expect(button).toHaveTextContent('Publish 3 images');
+      await userEvent.click(button);
+
+      await waitFor(
+        () =>
+          expect(screen.getByTestId('gm-publish-status')).toHaveTextContent(
+            /Published 2 of 3 images/i,
+          ),
+        { timeout: 4000 },
+      );
+
+      // PROBE: one cell is still armed, so the title the viewer typed must
+      // survive. Clearing it here reverts the box to the suggested default, and
+      // their next Publish creates a public row carrying that default instead.
+      expect(screen.getByTestId('gm-publish')).toHaveTextContent('Publish 1 more image');
+      expect(
+        screen.getByTestId('gm-publish-title'),
+        'gallery-title-seam-guard: the clear is gated on `shouldClearPublishTitle(landed, attempted)` — an unconditional clear (the pre-fix code) throws away a title typed while cells are still publishable',
+      ).toHaveValue('Autumn lighthouse study');
+    } finally {
+      harness.cleanup();
+    }
+  });
+
+  it('clears the box once the attempt covered everything that was armed', async () => {
+    const harness = mountTunable({
+      viewer,
+      consentGranted: true,
+      storage: { seed: { [RUN_STORAGE_KEY]: oneCellRunManifest() } },
+      publishImageIds: [9102],
+    });
+    try {
+      const titleBox = await screen.findByTestId('gm-publish-title');
+      await userEvent.clear(titleBox);
+      await userEvent.type(titleBox, 'Typed and finished');
+      await userEvent.click(screen.getByTestId('gm-publish'));
+
+      await waitFor(() =>
+        expect(screen.getByTestId('gm-publish-status')).toHaveTextContent(/Published 1 image/i),
+      );
+      // Nothing left armed, so the box returns to the suggestion — and this is
+      // the assertion that reddens an INVERTED seam (`if (!shouldClear…)`).
+      await waitFor(() =>
+        expect(
+          screen.getByTestId('gm-publish-title'),
+          'gallery-title-seam-guard: with nothing left armed the typed title is spent, and the box must not keep it for a different matrix',
+        ).not.toHaveValue('Typed and finished'),
+      );
+    } finally {
+      harness.cleanup();
+    }
   });
 });

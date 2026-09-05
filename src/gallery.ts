@@ -713,6 +713,25 @@ export interface PublishDeps {
   } | null>;
 }
 
+/**
+ * What is true about the gallery row when a publish is orphaned.
+ *
+ * The three states are genuinely different facts, and the copy for each has to
+ * be different — an orphan is already the worst outcome this feature can
+ * produce, so the one thing it must not do is describe it wrongly.
+ */
+export type OrphanEntryState =
+  /** `update` was attempted on a row we had just read: it exists, unchanged. */
+  | 'existing-unchanged'
+  /** `append` was attempted: no row was created, so nothing points at the images. */
+  | 'none-created'
+  /**
+   * We never learned whether a row is there — the authoritative read itself
+   * failed. Asserting either of the above here would be a guess, and the code
+   * eight lines up already says "we do NOT know".
+   */
+  | 'unknown';
+
 /** What one publish attempt ended as. */
 export type PublishResult =
   /** Nothing was publishable — no host call was made and nothing was spent. */
@@ -759,12 +778,32 @@ export type PublishResult =
       error: string;
       landed: PublishedCell[];
       /**
-       * The failure happened while EXTENDING an existing row, which therefore
-       * still exists and is unchanged — a different fact from "no entry was
-       * created", and the copy says so.
+       * What is TRUE about the gallery row after the failure.
+       *
+       * 🔴 THIS WAS A BOOLEAN INFERRED FROM `targetKey != null`, AND THAT WAS
+       * WRONG ON TWO OF THE THREE PATHS THAT REACH IT. A target key only says
+       * the ledger named a row; it says nothing about whether an extend was
+       * attempted. The reachable case: the ledger names `shared_1`, that row has
+       * since been moderated or deleted, `getEntry` resolves `null` — "genuinely
+       * gone", so the APPEND branch runs — and when the append fails the viewer
+       * was told the entry "is unchanged", asserting a row exists that
+       * `getEntry` had positively reported gone. Before the boolean existed this
+       * path produced the correct wording, so introducing it made that path
+       * worse.
+       *
+       * Each value is now assigned at the point it BECOMES true, immediately
+       * before the call whose failure it describes, so no path can inherit
+       * another's claim.
        */
-      extendedTarget?: true;
+      entryState: OrphanEntryState;
     };
+
+/** The default error text for each orphan state, when the host gave none. */
+const ORPHAN_FALLBACK_ERROR: Record<OrphanEntryState, string> = {
+  'existing-unchanged': 'the existing gallery entry could not be updated',
+  'none-created': 'the gallery entry could not be saved',
+  unknown: 'this matrix’s gallery entry could not be read',
+};
 
 function errorText(err: unknown, fallback: string): string {
   if (err instanceof Error && err.message.length > 0) return err.message;
@@ -837,6 +876,9 @@ export async function publishMatrix(
 
   let key: string;
   let extended = false;
+  // 🔴 SET IMMEDIATELY BEFORE THE CALL WHOSE FAILURE IT DESCRIBES. Starts
+  // `unknown`, which is the truth until the authoritative read has resolved.
+  let entryState: OrphanEntryState = 'unknown';
   try {
     // 🔴 RE-READ THE ROW NOW, as late as possible and never from the list page —
     // see `PublishDeps.getEntry`. FOUR states, not three, and only ONE of them
@@ -849,9 +891,10 @@ export async function publishMatrix(
     //   row present, UNREADABLE payload                    → orphan (never append)
     //
     // `null` is a positive answer, not an absence: civitai
-    // `src/server/routers/apps-shared.router.ts:369` selects the row `WHERE
-    // s.key = $1 AND s.hidden_at IS NULL`, and `:394` is `if (!row) return
-    // { item: null }` — so a MISSING row and a MODERATED/hidden one both resolve
+    // civitai `src/server/routers/apps-shared.router.ts`: the `get` procedure is
+    // declared at `:369`, its query selects `WHERE s.key = $1 AND s.hidden_at IS
+    // NULL` at `:390`, and `:394` is `if (!row) return { item: null }` — so a
+    // MISSING row and a MODERATED/hidden one both resolve
     // `{ item: null }` and neither throws. Appending is therefore right for both.
     //
     // 🔴 THE UNREADABLE-PAYLOAD CASE USED TO APPEND, AND THAT CONTRADICTED THE
@@ -869,6 +912,8 @@ export async function publishMatrix(
     const fresh = targetKey == null ? null : await deps.getEntry(targetKey);
     const freshData = fresh == null ? null : parseGalleryData(fresh.data);
     if (fresh != null && freshData == null) {
+      // The host resolved the row, so it demonstrably exists and we did not
+      // touch it — `existing-unchanged` is a fact here, not an inference.
       return {
         kind: 'orphaned',
         published: landed.length,
@@ -876,13 +921,14 @@ export async function publishMatrix(
         landed: [...landed],
         error:
           'this matrix’s gallery entry could not be read, so the new images were not added to it',
-        extendedTarget: true,
+        entryState: 'existing-unchanged',
       };
     }
     if (fresh != null && freshData != null && targetKey != null) {
       // Extend the matrix's existing row. Its OWN title/body are re-sent, not the
       // current form's — the author already chose them, and `update` replaces the
       // whole value.
+      entryState = 'existing-unchanged';
       await deps.update(targetKey, {
         title: fresh.title,
         ...(fresh.body !== undefined ? { body: fresh.body } : {}),
@@ -891,6 +937,7 @@ export async function publishMatrix(
       key = targetKey;
       extended = true;
     } else {
+      entryState = 'none-created';
       const appended = await deps.append({
         title: meta.title,
         ...(meta.body !== undefined ? { body: meta.body } : {}),
@@ -911,13 +958,12 @@ export async function publishMatrix(
       // a second permanent image of it. The ledger's question is "did this cell
       // already cost something irreversible", never "did the operation succeed".
       landed: [...landed],
-      ...(targetKey != null ? { extendedTarget: true as const } : {}),
-      error: errorText(
-        err,
-        targetKey != null
-          ? 'the existing gallery entry could not be updated'
-          : 'the gallery entry could not be saved',
-      ),
+      entryState,
+      // 🔴 The fallback branches on the SAME fact as the state above. Branching
+      // it on `targetKey != null` was wrong on exactly the paths the state was
+      // wrong on — it predates this arc, but the boolean promoted the same bad
+      // assumption into the headline sentence.
+      error: errorText(err, ORPHAN_FALLBACK_ERROR[entryState]),
     };
   }
 
@@ -959,14 +1005,23 @@ export function publishResultMessage(result: PublishResult): string {
         : `Published ${result.published} ${result.published === 1 ? 'image' : 'images'} to the gallery.`;
     case 'partial':
       return `Published ${result.published} of ${result.total} images. The gallery entry shows the ones that landed. ${result.error}`;
-    case 'orphaned':
-      // 🔴 TWO DIFFERENT FACTS. On the append path there is no row at all, so
-      // "nothing links to them" is true. On the EXTEND path the row exists and
-      // only the new images are missing from it — saying nothing links to them
-      // would send the author looking for a gallery entry that is right there.
-      return result.extendedTarget === true
-        ? `${result.published} ${result.published === 1 ? 'image is' : 'images are'} now public on Civitai, but they could not be added to this matrix’s gallery entry, which is unchanged. ${result.error}`
-        : `${result.published} ${result.published === 1 ? 'image is' : 'images are'} now public on Civitai, but the gallery entry could not be saved, so nothing links to them. ${result.error}`;
+    case 'orphaned': {
+      // 🔴 THREE DIFFERENT FACTS, THREE SENTENCES. "Nothing links to them" is
+      // true only when an append failed; "which is unchanged" only when a row
+      // was read and left alone; and when the read itself failed we know
+      // neither, so the copy must not pick one. A two-way split inferred from
+      // `targetKey != null` asserted a row existed on the append-after-gone
+      // path, where `getEntry` had positively reported it gone.
+      const images = `${result.published} ${result.published === 1 ? 'image is' : 'images are'} now public on Civitai`;
+      switch (result.entryState) {
+        case 'existing-unchanged':
+          return `${images}, but they could not be added to this matrix’s gallery entry, which is unchanged. ${result.error}`;
+        case 'none-created':
+          return `${images}, but the gallery entry could not be saved, so nothing links to them. ${result.error}`;
+        case 'unknown':
+          return `${images}, but we couldn’t reach this matrix’s gallery entry, so we can’t tell you whether they were added to it. ${result.error}`;
+      }
+    }
     case 'failed':
       return `Nothing was published. ${result.error}`;
   }

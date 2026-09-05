@@ -30,6 +30,7 @@ import {
   parsePublishedCells,
   publishTargetKey,
   shouldClearPublishTitle,
+  type OrphanEntryState,
   isExtendableEntryKey,
   ORPHANED_ENTRY_KEY,
   publishedCellsBlob,
@@ -1199,25 +1200,35 @@ describe('extending an entry re-reads it first', () => {
     expect(result.kind).toBe('orphaned');
     // The existing row is left exactly as it was, so the other cells' ledger
     // records still point at it and the matrix stays single-rowed.
-    expect(result.kind === 'orphaned' && result.extendedTarget).toBe(true);
+    expect(result.kind === 'orphaned' && result.entryState).toBe('existing-unchanged');
   });
 
-  it('says the existing entry is UNCHANGED rather than "nothing links to them"', () => {
-    const onExtend = {
+  it('gives each orphan state its own sentence, and none of them the others’ claim', () => {
+    const at = (entryState: OrphanEntryState) => ({
       kind: 'orphaned' as const,
       published: 1,
       total: 1,
       landed: [],
       error: 'boom',
-      extendedTarget: true as const,
-    };
-    const onAppend = { kind: 'orphaned' as const, published: 1, total: 1, landed: [], error: 'boom' };
+      entryState,
+    });
+    // Every pair below is a DIFFERENT fact, and the wrong one is a false claim
+    // about a permanent, irreversible outcome.
     expect(
-      publishResultMessage(onExtend),
+      publishResultMessage(at('existing-unchanged')),
       'gallery-orphan-copy-guard: on the extend path the row EXISTS and only the new images are missing from it — telling the author nothing links to them sends them looking for an entry that is right there',
     ).toContain('which is unchanged');
-    expect(publishResultMessage(onExtend)).not.toContain('nothing links to them');
-    expect(publishResultMessage(onAppend)).toContain('nothing links to them');
+    expect(publishResultMessage(at('existing-unchanged'))).not.toContain('nothing links to them');
+
+    expect(publishResultMessage(at('none-created'))).toContain('nothing links to them');
+    expect(publishResultMessage(at('none-created'))).not.toContain('unchanged');
+
+    expect(
+      publishResultMessage(at('unknown')),
+      'gallery-orphan-unknown-copy-guard: when the authoritative read itself failed we know neither that a row exists nor that none does — the code says "we do NOT know" and the copy must not pick one',
+    ).toContain('can’t tell you whether');
+    expect(publishResultMessage(at('unknown'))).not.toContain('unchanged');
+    expect(publishResultMessage(at('unknown'))).not.toContain('nothing links to them');
   });
 });
 
@@ -1330,5 +1341,88 @@ describe('shouldClearPublishTitle', () => {
     expect(shouldClearPublishTitle(1, 1)).toBe(true);
     // Defensive: a landed count above the attempt is still "nothing left".
     expect(shouldClearPublishTitle(4, 3)).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Round-6: the orphan's entry state must be a FACT, never inferred from
+// "we had a target key".
+// ---------------------------------------------------------------------------
+
+describe('an orphan describes the row honestly on every path', () => {
+  const one = () => publishableCells(cellsFor(1, 1));
+
+  it('🔴 append-after-GONE says nothing links to them — it does NOT claim a row is unchanged', async () => {
+    // The reachable failure this closes: the ledger names a row that has since
+    // been moderated or deleted, so `getEntry` resolves null ("genuinely gone")
+    // and the APPEND branch runs. When that append fails, inferring the state
+    // from `targetKey != null` told the viewer the entry "is unchanged" —
+    // asserting a row exists that the host had positively reported gone.
+    const deps = extendDeps();
+    deps.getEntry.mockResolvedValue(null);
+    deps.append.mockRejectedValue(new Error('SHARED_UNAVAILABLE'));
+
+    const result = await publishMatrix([one()[0]], { title: 'T' }, deps, undefined, 'k_gone');
+
+    expect(deps.append).toHaveBeenCalledTimes(1);
+    expect(deps.update).not.toHaveBeenCalled();
+    expect(
+      result.kind === 'orphaned' && result.entryState,
+      'gallery-orphan-state-guard: a target KEY only says the ledger named a row — it says nothing about whether an extend was attempted, and three paths reach this catch with one in hand',
+    ).toBe('none-created');
+    const message = publishResultMessage(result);
+    expect(
+      message,
+      'gallery-orphan-state-guard: `getEntry` positively reported the row gone, so "which is unchanged" asserts the existence of something we know is not there',
+    ).not.toContain('which is unchanged');
+    expect(message).toContain('nothing links to them');
+  });
+
+  it('🔴 a failed authoritative READ claims neither existence nor absence', async () => {
+    const deps = extendDeps();
+    deps.getEntry.mockRejectedValue(new Error('SHARED_UNAVAILABLE'));
+
+    const result = await publishMatrix([one()[0]], { title: 'T' }, deps, undefined, 'k_unknown');
+
+    expect(deps.append).not.toHaveBeenCalled();
+    expect(deps.update).not.toHaveBeenCalled();
+    expect(
+      result.kind === 'orphaned' && result.entryState,
+      'gallery-orphan-unknown-copy-guard: the code on this path says "we do NOT know" — the reported state has to say the same',
+    ).toBe('unknown');
+    // Messaged too: the state and the SENTENCE are separate mutable things, and
+    // a mutant that leaves the state right while making the copy assert
+    // existence would otherwise go red without naming the guard.
+    expect(
+      publishResultMessage(result),
+      'gallery-orphan-unknown-copy-guard: when the authoritative read itself failed we know neither that a row exists nor that none does — the code says "we do NOT know" and the copy must not pick one',
+    ).toContain('can’t tell you whether');
+  });
+
+  it('a failed UPDATE is the one path that may say the row is unchanged', async () => {
+    const deps = extendDeps();
+    deps.getEntry.mockResolvedValue({
+      title: 'T',
+      data: buildGalleryData([{ cell: one()[0].cell, workflowId: 'w_old', imageId: 42 }]),
+    });
+    deps.update.mockRejectedValue(new Error('FORBIDDEN'));
+
+    const result = await publishMatrix([one()[0]], { title: 'T' }, deps, undefined, 'k_live');
+
+    expect(deps.append).not.toHaveBeenCalled();
+    expect(result.kind === 'orphaned' && result.entryState).toBe('existing-unchanged');
+    expect(publishResultMessage(result)).toContain('which is unchanged');
+  });
+
+  it('the fallback error text follows the same fact, not the target key', async () => {
+    const deps = extendDeps();
+    deps.getEntry.mockResolvedValue(null);
+    // Reject with no message, so the FALLBACK is what surfaces.
+    deps.append.mockRejectedValue(new Error(''));
+    const result = await publishMatrix([one()[0]], { title: 'T' }, deps, undefined, 'k_gone');
+    expect(
+      result.kind === 'orphaned' && result.error,
+      'gallery-orphan-fallback-guard: the fallback branched on `targetKey != null` too, so it was wrong on exactly the paths the state was wrong on',
+    ).toBe('the gallery entry could not be saved');
   });
 });
