@@ -89,8 +89,16 @@ export function PublishMatrixPanel({
           it can — "This creates 0 real, public images on Civitai" — and while
           the button is disabled and the note below is correct, a sentence that
           argues with the state next to it is how a reader stops trusting either.
-          The `gm-publish-already` note says what is true instead. */}
-      {!alreadyPublished && (
+          The `gm-publish-already` note says what is true instead.
+
+          🔴 GUARDED ON `publishable`, THE VALUE THE SENTENCE PRINTS — not on
+          `alreadyPublished`. Those are independent props that coincide only
+          because today's single call site derives both from
+          `publishRemaining.length`; a second call site, or an `alreadyPublished`
+          later widened to cover (say) anonymous viewers, would re-open the exact
+          sentence this withholds. A guard spelled on a NEIGHBOURING value is a
+          guard that can pass while the hazard is on screen. */}
+      {publishable > 0 && (
         <p style={{ ...noteStyle(c), margin: 0 }} data-testid="gm-publish-explainer">
           This creates {publishable} real, public {publishable === 1 ? 'image' : 'images'} on
           Civitai &mdash; one per finished cell &mdash; and{' '}

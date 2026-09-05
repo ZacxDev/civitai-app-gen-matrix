@@ -606,6 +606,24 @@ export function addPublishedCells(
   );
 }
 
+/**
+ * Should the publish form's title box be cleared after an attempt?
+ *
+ * 🔴 ONLY WHEN NOTHING IS LEFT ARMED. Clearing unconditionally threw away a
+ * title the viewer had typed while other cells were still publishable: the form
+ * falls back to the suggested title, so the box silently reverted to the default
+ * and the viewer's NEXT publish created a public row carrying the default rather
+ * than theirs. The shape pre-existed on `partial`; routing `orphaned` through the
+ * same branch widened it, because an orphan leaves every unlanded cell armed.
+ *
+ * Pure and exported so the rule is testable — a partial land is unreachable
+ * through `createMockHost` (its publish knob succeeds for every call or fails for
+ * every call), so this is the only tier that can see the armed-remainder case.
+ */
+export function shouldClearPublishTitle(landed: number, attempted: number): boolean {
+  return landed >= attempted;
+}
+
 /** The stored shape of the ledger. */
 export function publishedCellsBlob(rows: readonly PublishedCellRecord[]): {
   cells: PublishedCellRecord[];
@@ -740,6 +758,12 @@ export type PublishResult =
       total: number;
       error: string;
       landed: PublishedCell[];
+      /**
+       * The failure happened while EXTENDING an existing row, which therefore
+       * still exists and is unchanged — a different fact from "no entry was
+       * created", and the copy says so.
+       */
+      extendedTarget?: true;
     };
 
 function errorText(err: unknown, fallback: string): string {
@@ -815,14 +839,46 @@ export async function publishMatrix(
   let extended = false;
   try {
     // 🔴 RE-READ THE ROW NOW, as late as possible and never from the list page —
-    // see `PublishDeps.getEntry`. A rejection here is NOT the same as a `null`:
-    // `null` means the row is genuinely gone, so a fresh entry is right, while a
-    // rejection means we do not know, and appending on "do not know" is how a
-    // matrix ends up with two rows and a permanently split ledger. On a
-    // rejection the images are reported orphaned instead, which the ledger
-    // records, so nothing republishes them.
+    // see `PublishDeps.getEntry`. FOUR states, not three, and only ONE of them
+    // may append:
+    //
+    //   targetKey == null      no row to extend            → append (a new matrix)
+    //   getEntry → a row       authoritative base          → update (extend it)
+    //   getEntry → null        the row is GENUINELY GONE   → append (a fresh row)
+    //   getEntry → rejects     we do NOT know              → orphan (never append)
+    //   row present, UNREADABLE payload                    → orphan (never append)
+    //
+    // `null` is a positive answer, not an absence: civitai
+    // `src/server/routers/apps-shared.router.ts:369` selects the row `WHERE
+    // s.key = $1 AND s.hidden_at IS NULL`, and `:394` is `if (!row) return
+    // { item: null }` — so a MISSING row and a MODERATED/hidden one both resolve
+    // `{ item: null }` and neither throws. Appending is therefore right for both.
+    //
+    // 🔴 THE UNREADABLE-PAYLOAD CASE USED TO APPEND, AND THAT CONTRADICTED THE
+    // RULE FIVE LINES UP. Here we know MORE than on a rejection — the host
+    // resolved the row, so it demonstrably exists — and appending anyway is the
+    // very "two rows for one matrix" this arm exists to prevent. It is armed by a
+    // one-line change: bump `GALLERY_DATA_VERSION`, and every part-published
+    // matrix from the previous version resolves its row, fails the strict version
+    // check in `parseGalleryData`, and mints a second row — and because
+    // `publishTargetKey` returns `null` whenever the ledger names more than one
+    // entry, EVERY later publish for that matrix appends again, forever.
+    // Merging against a base we cannot read is impossible, but orphaning leaves
+    // the existing row intact and leaves the other cells' records pointing at it,
+    // so the matrix stays single-rowed.
     const fresh = targetKey == null ? null : await deps.getEntry(targetKey);
     const freshData = fresh == null ? null : parseGalleryData(fresh.data);
+    if (fresh != null && freshData == null) {
+      return {
+        kind: 'orphaned',
+        published: landed.length,
+        total: plan.length,
+        landed: [...landed],
+        error:
+          'this matrix’s gallery entry could not be read, so the new images were not added to it',
+        extendedTarget: true,
+      };
+    }
     if (fresh != null && freshData != null && targetKey != null) {
       // Extend the matrix's existing row. Its OWN title/body are re-sent, not the
       // current form's — the author already chose them, and `update` replaces the
@@ -855,6 +911,7 @@ export async function publishMatrix(
       // a second permanent image of it. The ledger's question is "did this cell
       // already cost something irreversible", never "did the operation succeed".
       landed: [...landed],
+      ...(targetKey != null ? { extendedTarget: true as const } : {}),
       error: errorText(
         err,
         targetKey != null
@@ -903,7 +960,13 @@ export function publishResultMessage(result: PublishResult): string {
     case 'partial':
       return `Published ${result.published} of ${result.total} images. The gallery entry shows the ones that landed. ${result.error}`;
     case 'orphaned':
-      return `${result.published} ${result.published === 1 ? 'image is' : 'images are'} now public on Civitai, but the gallery entry could not be saved, so nothing links to them. ${result.error}`;
+      // 🔴 TWO DIFFERENT FACTS. On the append path there is no row at all, so
+      // "nothing links to them" is true. On the EXTEND path the row exists and
+      // only the new images are missing from it — saying nothing links to them
+      // would send the author looking for a gallery entry that is right there.
+      return result.extendedTarget === true
+        ? `${result.published} ${result.published === 1 ? 'image is' : 'images are'} now public on Civitai, but they could not be added to this matrix’s gallery entry, which is unchanged. ${result.error}`
+        : `${result.published} ${result.published === 1 ? 'image is' : 'images are'} now public on Civitai, but the gallery entry could not be saved, so nothing links to them. ${result.error}`;
     case 'failed':
       return `Nothing was published. ${result.error}`;
   }

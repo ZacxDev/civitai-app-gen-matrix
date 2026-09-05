@@ -11,7 +11,7 @@ import { CHECKPOINTS, MODIFIERS } from './models.js';
 import { buildMatrix, type MatrixCell } from './matrix.js';
 import { RUN_STORAGE_KEY, buildRunManifest } from './persistence.js';
 import { ACTIVE_RUN_POINTER_KEY, historyKeyFor } from './history.js';
-import { GALLERY_DATA_VERSION } from './gallery.js';
+import { GALLERY_DATA_VERSION, GALLERY_LIST_CAP } from './gallery.js';
 
 // The block bundles its allowed-parent-origins from env; in the test env the mock
 // host fires from window.location.origin, so allow it via the transport (main.tsx
@@ -1228,5 +1228,189 @@ describe('gallery — the extend target survives an unloaded gallery (F1-round4)
     await userEvent.click(await screen.findByTestId('gm-reset-confirm'));
     await screen.findByTestId('gm-gallery-item');
     expect(screen.getAllByTestId('gm-gallery-item')).toHaveLength(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Round-5: the regression test for the authoritative single-row read.
+//
+// 🔴 THE PREVIOUS VERSION OF THIS TEST DID NOT GO RED ON THE DEFECT IT NAMED.
+// It pinned "a target is passed at all", not "the target is resolved
+// authoritatively": the fixture seeded ONE shared row whose key the ledger
+// named, so round 3's list-page lookup FOUND it and took the identical path.
+// Measured — restoring round 3's rule verbatim left all 609 tests passing.
+//
+// The condition the fix exists for is a target that the list page does NOT
+// contain. `loadGallery` fetches `GALLERY_LIST_CAP + 1` and slices to
+// `GALLERY_LIST_CAP`; the mock lists newest-first and seeds newest-LAST, so a
+// row seeded FIRST is the oldest and falls off the page once enough rows follow
+// it. That is the fixture below.
+// ---------------------------------------------------------------------------
+
+describe('gallery — the extend target is resolved AUTHORITATIVELY (F1-round5)', () => {
+  it('🔴 extends a target that is OFF the loaded list page', async () => {
+    const { manifest, cells } = fourDoneManifest();
+    // Cells 0-2 already live in the OLDEST shared row — `shared_1`, seeded first.
+    const ledger = {
+      cells: cells.slice(0, 3).map((cell, i) => ({
+        cell: `${cell.id}@${cell.workflowId}`,
+        imageId: 300 + i,
+        entryKey: 'shared_1',
+      })),
+    };
+
+    // The target first (oldest ⇒ last in a newest-first listing), then enough
+    // rows to push it past GALLERY_LIST_CAP.
+    const seed = [
+      {
+        value: {
+          title: 'The off-page row',
+          data: galleryData([{ imageId: 300, row: 0, col: 0 }]),
+        },
+      },
+      ...Array.from({ length: GALLERY_LIST_CAP + 2 }, (_, i) => ({
+        value: {
+          title: `Filler ${i}`,
+          data: galleryData([{ imageId: 400 + i, row: 0, col: 0 }]),
+        },
+      })),
+    ];
+
+    renderApp({
+      viewer,
+      consentGranted: true,
+      storage: {
+        seed: {
+          [RUN_STORAGE_KEY]: manifest,
+          'gen-matrix:gallery:cells:v1': ledger,
+        },
+      },
+      shared: { seed },
+      publishImageIds: [9003],
+    });
+
+    const button = await screen.findByTestId('gm-publish');
+    expect(button).toHaveTextContent('Publish 1 more image');
+    await userEvent.click(button);
+
+    // "Added … to this matrix's gallery entry" is the `extended` wording and it
+    // only appears when `update` was taken. Resolving the target from the loaded
+    // page cannot find `shared_1` here, so that rule produces
+    // "Published 1 image to the gallery." — a SECOND row for one matrix, after
+    // the UI had already promised the same entry.
+    await waitFor(
+      () =>
+        expect(
+          screen.getByTestId('gm-publish-status'),
+          'gallery-authoritative-target-guard: the target must be re-read by key, not looked up in the 12-row list page — off-page, the page lookup silently appends a second row and the ledger then names two entries, which makes every LATER publish append again, forever',
+        ).toHaveTextContent(/Added 1 image to this matrix/i),
+      { timeout: 4000 },
+    );
+  });
+
+  // 🔴 AN INVARIANT GUARD, NOT REGRESSION COVERAGE — labelled as one because it
+  // was MEASURED not to discriminate: under round 3's list-page rule this case
+  // still passes, because the fixture's single row IS on the page, so the old
+  // lookup finds it and takes the identical path. It pins that the ordinary
+  // one-row extend keeps working; the test above is the one that fails on the
+  // defect. Keeping the distinction visible is the whole point of the label.
+  it('[invariant guard] extends the ordinary single-row target', async () => {
+    const { manifest, cells } = fourDoneManifest();
+    const ledger = {
+      cells: cells.slice(0, 3).map((cell, i) => ({
+        cell: `${cell.id}@${cell.workflowId}`,
+        imageId: 500 + i,
+        entryKey: 'shared_1',
+      })),
+    };
+
+    renderApp({
+      viewer,
+      consentGranted: true,
+      storage: {
+        seed: {
+          [RUN_STORAGE_KEY]: manifest,
+          'gen-matrix:gallery:cells:v1': ledger,
+        },
+      },
+      shared: {
+        seed: [
+          {
+            // Authored by SOMEBODY ELSE, so the app's own gallery still lists it
+            // but the row is not one this viewer's page would treat as theirs —
+            // the point is only that the key resolves through `get`.
+            value: {
+              title: 'Row one',
+              data: galleryData([{ imageId: 500, row: 0, col: 0 }]),
+            },
+          },
+        ],
+      },
+      publishImageIds: [9004],
+    });
+
+    await userEvent.click(await screen.findByTestId('gm-publish'));
+    await waitFor(() =>
+      expect(screen.getByTestId('gm-publish-status')).toHaveTextContent(
+        /Added 1 image to this matrix/i,
+      ),
+    );
+  });
+});
+
+describe('gallery — an orphaned publish keeps the viewer’s typed title (F4-round5)', () => {
+  it('🔴 does not silently revert the title while cells are still armed', async () => {
+    const { manifest, cells } = fourDoneManifest();
+    // Only cell 0 is published, so three cells stay armed after the attempt.
+    const ledger = {
+      cells: [
+        {
+          cell: `${cells[0].id}@${cells[0].workflowId}`,
+          imageId: 600,
+          entryKey: 'shared_1',
+        },
+      ],
+    };
+
+    renderApp({
+      viewer,
+      consentGranted: true,
+      storage: {
+        seed: {
+          [RUN_STORAGE_KEY]: manifest,
+          'gen-matrix:gallery:cells:v1': ledger,
+        },
+      },
+      shared: {
+        seed: [
+          { value: { title: 'Row', data: galleryData([{ imageId: 600, row: 0, col: 0 }]) } },
+        ],
+        // The authoritative re-read fails after the images are created.
+        failNext: 1,
+      },
+      publishImageIds: [9005],
+    });
+
+    const titleBox = await screen.findByTestId('gm-publish-title');
+    await userEvent.clear(titleBox);
+    await userEvent.type(titleBox, 'Autumn lighthouse study');
+    expect(titleBox).toHaveValue('Autumn lighthouse study');
+
+    await userEvent.click(screen.getByTestId('gm-publish'));
+    await waitFor(() =>
+      expect(screen.getByTestId('gm-publish-status')).toHaveTextContent(/now public on Civitai/i),
+    );
+
+    // Everything the click attempted DID land here — the mock's publish knob
+    // succeeds for every call or fails for every call, so a partial land is
+    // unreachable at this tier. With nothing left armed, clearing the box is the
+    // correct behaviour, and this pins that the orphan path still reaches the
+    // ledger and disarms.
+    //
+    // The armed-remainder case — the one the F-4 fix is actually about — is
+    // covered by `shouldClearPublishTitle` in gallery.test.ts, which is the only
+    // tier that can construct it.
+    await waitFor(() => expect(screen.getByTestId('gm-publish')).toBeDisabled());
+    expect(screen.getByTestId('gm-publish')).toHaveTextContent(/already published/i);
   });
 });

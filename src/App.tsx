@@ -111,6 +111,7 @@ import {
   parsePublishedCells,
   publishTargetKey,
   publishedCellsBlob,
+  shouldClearPublishTitle,
   unpublishedCells,
   type PublishedCellRecord,
   type GalleryEntry,
@@ -1574,8 +1575,17 @@ export function App() {
             );
             return next;
           });
-          setPublishTitle('');
-          setPublishTitleTouched(false);
+          // 🔴 ONLY WHEN NOTHING IS LEFT ARMED. Clearing it unconditionally
+          // threw away a title the viewer had typed while other cells were still
+          // publishable: `effectivePublishTitle` falls back to the suggestion, so
+          // the box silently reverted to the default and the viewer's NEXT
+          // Publish created a public row carrying the default title rather than
+          // theirs. The shape pre-existed on `partial`; adding `orphaned` to this
+          // branch widened it, because an orphan leaves every unlanded cell armed.
+          if (shouldClearPublishTitle(landedCells.length, publishRemaining.length)) {
+            setPublishTitle('');
+            setPublishTitleTouched(false);
+          }
           setGalleryNonce((n) => n + 1);
         }
       })

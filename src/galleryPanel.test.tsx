@@ -607,3 +607,40 @@ describe('PublishMatrixPanel — copy cannot contradict its own state', () => {
     );
   });
 });
+
+// ---------------------------------------------------------------------------
+// Round-5 follow-ups.
+// ---------------------------------------------------------------------------
+
+describe('PublishMatrixPanel — the explainer is guarded on what it prints', () => {
+  const base = {
+    c,
+    publishable: 0,
+    alreadyPublishedCount: 4,
+    title: 'T',
+    setTitle: vi.fn(),
+    phase: { kind: 'idle' } as const,
+    message: null,
+    messageIsProblem: false,
+    signedIn: true,
+    alreadyPublished: false,
+    onPublish: vi.fn(),
+  };
+
+  it('🔴 withholds "0 real, public images" even when alreadyPublished is FALSE', () => {
+    // The two props are independent and coincide only because today's single
+    // call site derives both from `publishRemaining.length`. Guarding on the
+    // neighbour lets a second call site — or a widened `alreadyPublished` —
+    // re-open the sentence.
+    render(<PublishMatrixPanel {...base} />);
+    expect(
+      screen.queryByTestId('gm-publish-explainer'),
+      'gallery-zero-copy-guard: a guard spelled on a NEIGHBOURING value can pass while the hazard is on screen — guard on the value the sentence prints',
+    ).toBeNull();
+  });
+
+  it('still renders it whenever there is something to publish', () => {
+    render(<PublishMatrixPanel {...base} publishable={3} alreadyPublished={false} />);
+    expect(screen.getByTestId('gm-publish-explainer')).toHaveTextContent(/3 real, public images/);
+  });
+});

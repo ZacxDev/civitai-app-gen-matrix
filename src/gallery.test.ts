@@ -29,6 +29,7 @@ import {
   mergeGalleryData,
   parsePublishedCells,
   publishTargetKey,
+  shouldClearPublishTitle,
   isExtendableEntryKey,
   ORPHANED_ENTRY_KEY,
   publishedCellsBlob,
@@ -1147,7 +1148,13 @@ describe('extending an entry re-reads it first', () => {
       deps.append.mock.calls.length,
       'gallery-offpage-target-guard: the target must be resolved by an authoritative single-row read, not by searching the 12-row list page — its own contract names exactly this case',
     ).toBe(0);
-    expect(deps.update).toHaveBeenCalledTimes(1);
+    // Messaged as well: a mutant that diverts this to a THIRD arm leaves `append`
+    // untouched, so the un-messaged form would go red without naming the guard —
+    // the same ordering lesson as S01.
+    expect(
+      deps.update,
+      'gallery-offpage-target-guard: the target must be resolved by an authoritative single-row read, not by searching the 12-row list page — its own contract names exactly this case',
+    ).toHaveBeenCalledTimes(1);
     expect(result).toMatchObject({ kind: 'ok', key: 'k_offpage', extended: true });
   });
 
@@ -1172,12 +1179,45 @@ describe('extending an entry re-reads it first', () => {
     expect(result.kind).toBe('orphaned');
   });
 
-  it('appends when the row exists but its payload is not a matrix this app wrote', async () => {
+  it('🔴 ORPHANS when the row exists but its payload cannot be read — it does NOT append', async () => {
+    // The fourth state, and it used to share an arm with "genuinely gone". Here
+    // we know MORE than on a rejection: the host resolved the row, so it
+    // demonstrably exists. Appending anyway mints a second row for one matrix —
+    // and because `publishTargetKey` returns null whenever the ledger names more
+    // than one entry, every LATER publish for that matrix appends again, forever.
+    //
+    // Armed by a one-line change: bump `GALLERY_DATA_VERSION` and every
+    // part-published matrix from the previous version lands here.
     const deps = extendDeps();
-    deps.getEntry.mockResolvedValue({ title: 'T', data: { v: 99 } });
+    deps.getEntry.mockResolvedValue({ title: 'T', data: { v: GALLERY_DATA_VERSION + 1 } });
     const result = await publishMatrix([plan()[1]], { title: 'T' }, deps, undefined, 'k_alien');
+    expect(
+      deps.append.mock.calls.length,
+      'gallery-unreadable-target-guard: a row we can SEE but cannot parse is not "gone" — appending against it is the same two-rows-forever failure the rejection arm exists to prevent, taken with MORE information rather than less',
+    ).toBe(0);
     expect(deps.update).not.toHaveBeenCalled();
-    expect(result).toMatchObject({ kind: 'ok', key: 'k_appended' });
+    expect(result.kind).toBe('orphaned');
+    // The existing row is left exactly as it was, so the other cells' ledger
+    // records still point at it and the matrix stays single-rowed.
+    expect(result.kind === 'orphaned' && result.extendedTarget).toBe(true);
+  });
+
+  it('says the existing entry is UNCHANGED rather than "nothing links to them"', () => {
+    const onExtend = {
+      kind: 'orphaned' as const,
+      published: 1,
+      total: 1,
+      landed: [],
+      error: 'boom',
+      extendedTarget: true as const,
+    };
+    const onAppend = { kind: 'orphaned' as const, published: 1, total: 1, landed: [], error: 'boom' };
+    expect(
+      publishResultMessage(onExtend),
+      'gallery-orphan-copy-guard: on the extend path the row EXISTS and only the new images are missing from it — telling the author nothing links to them sends them looking for an entry that is right there',
+    ).toContain('which is unchanged');
+    expect(publishResultMessage(onExtend)).not.toContain('nothing links to them');
+    expect(publishResultMessage(onAppend)).toContain('nothing links to them');
   });
 });
 
@@ -1268,5 +1308,27 @@ describe('a blank title from another client', () => {
     );
     expect(entry).not.toBeNull();
     expect(entry?.title).toBe('Untitled matrix');
+  });
+});
+
+describe('shouldClearPublishTitle', () => {
+  it('🔴 keeps the typed title while any attempted cell is still armed', () => {
+    // An orphan (or a partial) leaves the unlanded cells publishable. Clearing
+    // the box there reverts it to the suggestion, so the viewer's NEXT publish
+    // creates a public row carrying the DEFAULT title rather than the one they
+    // typed — and there is no un-publish.
+    expect(
+      shouldClearPublishTitle(1, 3),
+      'gallery-title-retention-guard: the title is cleared only when nothing is left armed — a partial or orphaned attempt leaves every unlanded cell publishable',
+    ).toBe(false);
+    expect(shouldClearPublishTitle(0, 3)).toBe(false);
+    expect(shouldClearPublishTitle(2, 3)).toBe(false);
+  });
+
+  it('clears it once the attempt covered everything that was armed', () => {
+    expect(shouldClearPublishTitle(3, 3)).toBe(true);
+    expect(shouldClearPublishTitle(1, 1)).toBe(true);
+    // Defensive: a landed count above the attempt is still "nothing left".
+    expect(shouldClearPublishTitle(4, 3)).toBe(true);
   });
 });
