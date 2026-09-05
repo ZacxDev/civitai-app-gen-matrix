@@ -11,6 +11,7 @@ import { CHECKPOINTS, MODIFIERS } from './models.js';
 import { buildMatrix, type MatrixCell } from './matrix.js';
 import { RUN_STORAGE_KEY, buildRunManifest } from './persistence.js';
 import { ACTIVE_RUN_POINTER_KEY, historyKeyFor } from './history.js';
+import { GALLERY_DATA_VERSION, GALLERY_LIST_CAP } from './gallery.js';
 
 // The block bundles its allowed-parent-origins from env; in the test env the mock
 // host fires from window.location.origin, so allow it via the transport (main.tsx
@@ -616,5 +617,951 @@ describe('the configure screen shows the grid OR the explainer, never both', () 
 
     await waitFor(() => expect(screen.queryByTestId('gm-shape-preview')).toBeNull());
     expect(screen.getByText(/Example: 2 models/)).toBeInTheDocument();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The published-matrix GALLERY, end-to-end through the mock host.
+//
+// These cross the seams no unit test can: `App` is what decides which host
+// surface is called with what, and it is the only place the three
+// (publish → shared index → gated read) meet. A gallery module that parses
+// correctly and a panel that renders correctly can still be wired to each other
+// wrongly, and neither file's tests can see it.
+// ---------------------------------------------------------------------------
+
+/** A published entry as it sits in the shared store, in the `data` shape. */
+function galleryData(images: { imageId: number; row: number; col: number }[]) {
+  return {
+    v: GALLERY_DATA_VERSION,
+    rows: [{ row: 0, versionId: CHECKPOINTS[0].versionId }],
+    cols: [
+      { col: 0, key: MODIFIERS[0].key, loraVersionId: null },
+      { col: 1, key: MODIFIERS[1].key, loraVersionId: null },
+    ],
+    images,
+  };
+}
+
+/** A completed ONE-cell run seeded into the legacy slot, so it restores on mount. */
+function oneCellRunManifest() {
+  const cells = buildMatrix('a lighthouse', [CHECKPOINTS[0]], [MODIFIERS[0]]).map(
+    (cell): MatrixCell => ({
+      ...cell,
+      status: 'done',
+      workflowId: 'wf_pub_1',
+      imageUrl: 'https://img.example/pub.jpeg',
+      cost: 8,
+      nsfwLevel: 1,
+    }),
+  );
+  return buildRunManifest({ phase: 'done', cells, perCellEstimate: 8 });
+}
+
+describe('gallery — browsing published matrices', () => {
+  it('lists a published matrix and renders its images under the viewer clamp', async () => {
+    renderApp({
+      viewer,
+      consentGranted: true,
+      shared: {
+        seed: [
+          {
+            value: {
+              title: 'Lighthouse study',
+              body: 'Prompt: a lighthouse at dusk',
+              data: galleryData([
+                { imageId: 9001, row: 0, col: 0 },
+                { imageId: 9002, row: 0, col: 1 },
+              ]),
+            },
+          },
+        ],
+      },
+      // The mock's default projection: 9001 visible (with a url), 9002 hidden.
+    });
+
+    expect(await screen.findByTestId('gm-gallery-title')).toHaveTextContent('Lighthouse study');
+    expect(screen.getByTestId('gm-gallery-body')).toHaveTextContent('a lighthouse at dusk');
+    // The visible one paints through the app's own maturity gate; the hidden one
+    // never gets a url from the host, so it can only be a placeholder.
+    await waitFor(() => expect(screen.getAllByTestId('gm-maturity-image')).toHaveLength(1));
+    expect(screen.getByTestId('gm-gallery-cell-hidden')).toBeInTheDocument();
+  });
+
+  it('🔴 an id the host omits becomes a `gone` cell, not a shifted grid', async () => {
+    renderApp({
+      viewer,
+      consentGranted: true,
+      shared: {
+        seed: [
+          {
+            value: {
+              title: 'Two cells',
+              data: galleryData([
+                { imageId: 4101, row: 0, col: 0 },
+                { imageId: 4102, row: 0, col: 1 },
+              ]),
+            },
+          },
+        ],
+      },
+      // The host resolved only the SECOND id. Zipping by index would paint 4102
+      // into the first cell and leave the second blank — a wrong answer that
+      // looks entirely correct on screen.
+      gatedImages: [
+        { imageId: 4102, status: 'visible', nsfwLevel: 1, contentRating: 'pg', url: 'https://img/4102', width: 8, height: 8 },
+      ],
+    });
+
+    expect(await screen.findByTestId('gm-gallery-cell-gone')).toBeInTheDocument();
+    await waitFor(() => expect(screen.getAllByTestId('gm-maturity-image')).toHaveLength(1));
+    expect(screen.getByAltText(/Cinematic/)).toBeInTheDocument();
+  });
+
+  it('renders a matrix whose images have ALL gone as an honest statement', async () => {
+    renderApp({
+      viewer,
+      consentGranted: true,
+      shared: {
+        seed: [{ value: { title: 'Removed', data: galleryData([{ imageId: 7777, row: 0, col: 0 }]) } }],
+      },
+      gatedImages: [],
+    });
+
+    expect(await screen.findByTestId('gm-gallery-all-gone')).toBeInTheDocument();
+    expect(screen.queryByTestId('gm-gallery-grid')).toBeNull();
+  });
+
+  it('🔴 a failed gated-image read is NOT rendered as images that are gone', async () => {
+    renderApp({
+      viewer,
+      consentGranted: true,
+      shared: {
+        seed: [{ value: { title: 'Unreadable', data: galleryData([{ imageId: 9001, row: 0, col: 0 }]) } }],
+      },
+      gatedImagesError: 'gated images unavailable',
+    });
+
+    expect(await screen.findByTestId('gm-gallery-images-error')).toBeInTheDocument();
+    expect(screen.queryByTestId('gm-gallery-all-gone')).toBeNull();
+    // The entry itself still lists — the index read succeeded, only the images failed.
+    expect(screen.getByTestId('gm-gallery-title')).toHaveTextContent('Unreadable');
+  });
+
+  it('shows an empty gallery to a viewer when nothing has been published', async () => {
+    renderApp({ viewer, consentGranted: true });
+    expect(await screen.findByTestId('gm-gallery-empty')).toBeInTheDocument();
+    expect(screen.queryByTestId('gm-gallery-error')).toBeNull();
+  });
+
+  it('lets an ANONYMOUS viewer browse, but offers them no vote, report or publish', async () => {
+    renderApp({
+      viewer: null,
+      shared: {
+        seed: [{ value: { title: 'Public grid', data: galleryData([{ imageId: 9001, row: 0, col: 0 }]) } }],
+      },
+    });
+
+    expect(await screen.findByTestId('gm-gallery-title')).toHaveTextContent('Public grid');
+    expect(screen.getByTestId('gm-gallery-vote')).toBeDisabled();
+    // `report()` rejects for an anonymous viewer, so the control is withheld
+    // rather than offered as an error.
+    expect(screen.queryByTestId(/-report$/)).toBeNull();
+    expect(screen.queryByTestId('gm-publish-panel')).toBeNull();
+  });
+});
+
+describe('gallery — voting', () => {
+  it('🔴 hydrates from viewerVoted, so one click on an already-voted entry UNVOTES', async () => {
+    renderApp({
+      viewer,
+      consentGranted: true,
+      shared: {
+        seed: [
+          {
+            value: { title: 'Already voted', data: galleryData([{ imageId: 9001, row: 0, col: 0 }]) },
+            // The viewer (id 42) has an active up-vote on this row.
+            voters: [42],
+          },
+        ],
+      },
+    });
+
+    const button = await screen.findByTestId('gm-gallery-vote');
+    // Guessing "not voted" here is what makes the first click a no-op re-vote and
+    // forces the viewer to click twice to remove it.
+    expect(button).toHaveAttribute('aria-pressed', 'true');
+    expect(button).toHaveTextContent('1');
+
+    await userEvent.click(button);
+
+    await waitFor(() =>
+      expect(screen.getByTestId('gm-gallery-vote')).toHaveAttribute('aria-pressed', 'false'),
+    );
+    expect(screen.getByTestId('gm-gallery-vote')).toHaveTextContent('0');
+  });
+
+  it('surfaces a rejected vote on the entry instead of silently doing nothing', async () => {
+    renderApp({
+      viewer,
+      consentGranted: true,
+      shared: {
+        seed: [{ value: { title: 'Vote fails', data: galleryData([{ imageId: 9001, row: 0, col: 0 }]) } }],
+        failNext: 1,
+      },
+    });
+
+    await userEvent.click(await screen.findByTestId('gm-gallery-vote'));
+    expect(await screen.findByTestId('gm-gallery-action-error')).toHaveTextContent(
+      /SHARED_UNAVAILABLE/,
+    );
+    // The button did not flip to "voted" on a request that failed.
+    expect(screen.getByTestId('gm-gallery-vote')).toHaveAttribute('aria-pressed', 'false');
+  });
+});
+
+describe('gallery — publishing', () => {
+  it('🔴 a publish refused by the app-developer gate says so, and creates NO entry', async () => {
+    renderApp({
+      viewer,
+      consentGranted: true,
+      storage: { seed: { [RUN_STORAGE_KEY]: oneCellRunManifest() } },
+      publishError: 'FORBIDDEN: publishing app outputs is limited to app developers',
+    });
+
+    await userEvent.click(await screen.findByTestId('gm-publish'));
+
+    const status = await screen.findByTestId('gm-publish-status');
+    await waitFor(() =>
+      expect(status).toHaveTextContent(/limited to app developers/i),
+    );
+    // Not a silent no-op, and not a claim that anything was published.
+    expect(status).toHaveTextContent(/Nothing was published/i);
+  });
+
+  it('publishes a finished matrix and lists it, with Remove offered to its author', async () => {
+    renderApp({
+      viewer,
+      consentGranted: true,
+      storage: { seed: { [RUN_STORAGE_KEY]: oneCellRunManifest() } },
+      publishImageIds: [9001],
+    });
+
+    const publishButton = await screen.findByTestId('gm-publish');
+    expect(publishButton).toHaveTextContent('Publish 1 image');
+    await userEvent.click(publishButton);
+
+    await waitFor(() =>
+      expect(screen.getByTestId('gm-publish-status')).toHaveTextContent(
+        /Published 1 image to the gallery/i,
+      ),
+    );
+
+    // Back to the build screen, where the gallery lives, to read it back.
+    await userEvent.click(screen.getByTestId('gm-newrun'));
+    await userEvent.click(await screen.findByTestId('gm-reset-confirm'));
+
+    // The title defaulted to the run's own shared prompt — moderated text, in
+    // `title`, never in `data`.
+    expect(await screen.findByTestId('gm-gallery-title')).toHaveTextContent('a lighthouse');
+    // The author sees Remove (recorded in their PRIVATE storage), not Report.
+    expect(screen.getByTestId('gm-gallery-withdraw')).toBeInTheDocument();
+    expect(screen.queryByTestId(/-report$/)).toBeNull();
+  });
+
+  it('offers no publish control on a matrix with nothing publishable', async () => {
+    renderApp({ viewer, consentGranted: true });
+    // The build screen has no finished matrix at all.
+    await screen.findByLabelText('Shared generation prompt');
+    expect(screen.queryByTestId('gm-publish-panel')).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Audit follow-ups, driven end-to-end.
+// ---------------------------------------------------------------------------
+
+describe('gallery — provenance (F1)', () => {
+  it('🔴 a row appended by someone else cannot present as the app author’s', async () => {
+    renderApp({
+      viewer, // id 42
+      consentGranted: true,
+      shared: {
+        seed: [
+          {
+            // A different account entirely. Appending is NOT cohort-gated — any
+            // authenticated viewer past min-trust can add a row, including one
+            // carrying image ids read straight out of a genuine entry, which
+            // then renders REAL images.
+            authorUserId: 777,
+            value: {
+              title: 'Looks official',
+              data: galleryData([{ imageId: 9001, row: 0, col: 0 }]),
+            },
+          },
+        ],
+      },
+    });
+
+    expect(await screen.findByTestId('gm-gallery-provenance')).toHaveTextContent(
+      'Published by another Civitai member',
+    );
+    // The panel makes no app-authorship claim anywhere — that is what stopped a
+    // stranger's row inheriting the app's voice.
+    expect(screen.getByTestId('gm-gallery').textContent).not.toMatch(/app author/i);
+    // And it is not treated as the viewer's own.
+    expect(screen.queryByTestId('gm-gallery-withdraw')).toBeNull();
+  });
+});
+
+describe('gallery — publishing cannot be repeated (F2)', () => {
+  it('🔴 one publish, one gallery row — the control does not re-arm on the same matrix', async () => {
+    renderApp({
+      viewer,
+      consentGranted: true,
+      storage: { seed: { [RUN_STORAGE_KEY]: oneCellRunManifest() } },
+      publishImageIds: [9001],
+    });
+
+    const button = await screen.findByTestId('gm-publish');
+    // CONTROL: armed before the click, so the disabled state below is the
+    // publish's doing and not the panel's default.
+    expect(button).toBeEnabled();
+
+    await userEvent.click(button);
+    await waitFor(() =>
+      expect(screen.getByTestId('gm-publish-status')).toHaveTextContent(/Published 1 image/i),
+    );
+
+    // PROBE: the same matrix can no longer be published. There is no un-publish,
+    // so a second click would mean a second permanent set of public images.
+    await waitFor(() =>
+      expect(
+        screen.getByTestId('gm-publish'),
+        'two clicks used to produce two rows, each backed by its own publish() call and its own set of permanent public images — and there is no un-publish',
+      ).toBeDisabled(),
+    );
+    // 🔴 The LABEL is what `alreadyPublished` uniquely decides, so the message
+    // lives here too. Since round 3 the disabled state is OVER-DETERMINED — with
+    // every cell published, `publishable` is 0 and that alone disables the
+    // button — so a mutation of `alreadyPublished` survives `toBeDisabled()` and
+    // dies on this copy assertion instead. A guard asserted only through the
+    // disabled state would pass whether or not the thing it names still works.
+    expect(
+      screen.getByTestId('gm-publish'),
+      'two clicks used to produce two rows, each backed by its own publish() call and its own set of permanent public images',
+    ).toHaveTextContent(/already published/i);
+    expect(screen.getByTestId('gm-publish-already')).toBeInTheDocument();
+
+    // A second click attempt changes nothing.
+    await userEvent.click(screen.getByTestId('gm-publish'));
+
+    await userEvent.click(screen.getByTestId('gm-newrun'));
+    await userEvent.click(await screen.findByTestId('gm-reset-confirm'));
+
+    await screen.findByTestId('gm-gallery-item');
+    expect(
+      screen.getAllByTestId('gm-gallery-item'),
+      'two clicks used to produce two rows, each backed by its own publish() call and its own set of permanent public images',
+    ).toHaveLength(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Round-3: the publish disarm must survive a GROWING set and a RELOAD.
+// ---------------------------------------------------------------------------
+
+/** A 2x2 with three cells done and one failed — the shape a retry leaves. */
+function retryShapedManifest() {
+  const cells = buildMatrix(
+    'a lighthouse',
+    [CHECKPOINTS[0], CHECKPOINTS[1]],
+    [MODIFIERS[0], MODIFIERS[1]],
+  ).map(
+    (cell, i): MatrixCell => ({
+      ...cell,
+      status: i === 3 ? 'failed' : 'done',
+      workflowId: i === 3 ? null : `wf_r${i}`,
+      imageUrl: i === 3 ? null : `https://img.example/r${i}.jpeg`,
+      cost: i === 3 ? null : 8,
+      nsfwLevel: 1,
+      error: i === 3 ? 'boom' : null,
+    }),
+  );
+  return buildRunManifest({ phase: 'done', cells, perCellEstimate: 8 });
+}
+
+describe('gallery — a GROWING publishable set does not re-arm the control (F1-round3)', () => {
+  it('🔴 after a retry, only the NEW cell is offered — not all four again', async () => {
+    renderApp({
+      viewer,
+      consentGranted: true,
+      buzzBudget: 200,
+      generation: { costPerGen: 8, images: ['https://img.example/retried.jpeg'] },
+      storage: { seed: { [RUN_STORAGE_KEY]: retryShapedManifest() } },
+      publishImageIds: [9001],
+    });
+
+    // CONTROL: three done cells are publishable, and Retry is offered alongside
+    // — which is exactly what makes this reachable.
+    const button = await screen.findByTestId('gm-publish');
+    expect(button).toHaveTextContent('Publish 3 images');
+    expect(screen.getByTestId('gm-retry')).toBeInTheDocument();
+
+    await userEvent.click(button);
+    await waitFor(() =>
+      expect(screen.getByTestId('gm-publish-status')).toHaveTextContent(/Published 3 images/i),
+    );
+    // 🔴 Messaged, because this is the FIRST observable the ledger decides — the
+    // "1 more image" assertion below never runs if this one throws, and a test
+    // that goes red without naming what it guards is how a guard gets believed.
+    await waitFor(() =>
+      expect(
+        screen.getByTestId('gm-publish'),
+        'the set GREW, so an exact-set key misses and offers every cell again — three of which are already public and cannot be un-published',
+      ).toBeDisabled(),
+    );
+
+    // Retry the failed cell. `RETRY_FAILED` preserves every done cell WITH its id
+    // and workflowId, so the publishable set grows 3 -> 4.
+    await userEvent.click(screen.getByTestId('gm-retry'));
+
+    // PROBE: the control re-arms for the ONE new cell only. An exact-set key
+    // missed here and offered "Publish 4 images", republishing three cells that
+    // were already permanent public images.
+    await waitFor(
+      () =>
+        expect(
+          screen.getByTestId('gm-publish'),
+          'the set GREW, so an exact-set key misses and offers every cell again — three of which are already public and cannot be un-published',
+        ).toHaveTextContent('Publish 1 more image'),
+      { timeout: 4000 },
+    );
+    expect(screen.getByTestId('gm-publish-extending')).toHaveTextContent(
+      /3 cells of this matrix are already published/i,
+    );
+  });
+});
+
+describe('gallery — the publish disarm survives a RELOAD (F2-round3)', () => {
+  it('🔴 a remount against the same storage does not re-offer a published matrix', async () => {
+    // `<Harness>` cannot express a reload — it builds a fresh store on mount — so
+    // this uses the same `mountShared` helper the M1 persistence tests use: one
+    // host, one backing store, rendered twice.
+    const shared = mountShared({
+      viewer,
+      consentGranted: true,
+      storage: { seed: { [RUN_STORAGE_KEY]: oneCellRunManifest() } },
+      publishImageIds: [9001],
+    });
+    try {
+      const button = await screen.findByTestId('gm-publish');
+      expect(button).toHaveTextContent('Publish 1 image');
+      await userEvent.click(button);
+      await waitFor(() =>
+        expect(screen.getByTestId('gm-publish-status')).toHaveTextContent(/Published 1 image/i),
+      );
+
+      shared.remount();
+
+      // PROBE: the ledger was written to the viewer's durable per-viewer KV, so
+      // the second mount knows this cell is already published. The previous
+      // session-held Set was simply gone here, and clicking again emitted
+      // "Published 1 image to the gallery." a second time — a string that only
+      // appears for a landed publish() AND a successful append().
+      await waitFor(() =>
+        expect(
+          screen.getByTestId('gm-publish'),
+          'the disarm used to live in useState, so a reload re-armed it while the cell ids and workflow ids came back intact',
+        ).toBeDisabled(),
+      );
+      expect(screen.getByTestId('gm-publish')).toHaveTextContent(/already published/i);
+      // No second publish happened, so the status line is absent on this mount.
+      expect(screen.queryByTestId('gm-publish-status')).toBeNull();
+
+      // And the gallery still holds exactly ONE row for this matrix. (The panel
+      // lives on the build screen, so this navigates there first — which is what
+      // makes row-counting reachable through `mountShared` at all.)
+      await userEvent.click(screen.getByTestId('gm-newrun'));
+      await userEvent.click(await screen.findByTestId('gm-reset-confirm'));
+      await screen.findByTestId('gm-gallery-item');
+      expect(screen.getAllByTestId('gm-gallery-item')).toHaveLength(1);
+    } finally {
+      shared.cleanup();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Round-4: an irreversible act must reach the ledger even when the entry write
+// fails, and the extend target must not come from the loaded list page.
+// ---------------------------------------------------------------------------
+
+/** A 4-cell matrix, every cell done — three of them already in the gallery. */
+function fourDoneManifest() {
+  const cells = buildMatrix(
+    'a lighthouse',
+    [CHECKPOINTS[0], CHECKPOINTS[1]],
+    [MODIFIERS[0], MODIFIERS[1]],
+  ).map(
+    (cell, i): MatrixCell => ({
+      ...cell,
+      status: 'done',
+      workflowId: `wf_d${i}`,
+      imageUrl: `https://img.example/d${i}.jpeg`,
+      cost: 8,
+      nsfwLevel: 1,
+    }),
+  );
+  return { manifest: buildRunManifest({ phase: 'done', cells, perCellEstimate: 8 }), cells };
+}
+
+describe('gallery — an orphaned publish still disarms the cell (F3-round4)', () => {
+  it('🔴 the image is permanent, so a failed entry write must not re-offer the cell', async () => {
+    const { manifest, cells } = fourDoneManifest();
+    // Cells 0-2 are already published into `shared_1`; cell 3 is not.
+    const ledger = {
+      cells: cells.slice(0, 3).map((cell, i) => ({
+        cell: `${cell.id}@${cell.workflowId}`,
+        imageId: 100 + i,
+        entryKey: 'shared_1',
+      })),
+    };
+
+    renderApp({
+      viewer,
+      consentGranted: true,
+      storage: {
+        seed: {
+          [RUN_STORAGE_KEY]: manifest,
+          'gen-matrix:gallery:cells:v1': ledger,
+        },
+      },
+      shared: {
+        seed: [
+          {
+            value: {
+              title: 'Existing row',
+              data: galleryData([{ imageId: 100, row: 0, col: 0 }]),
+            },
+          },
+        ],
+        // The next SHARED mutation/read fails — so the authoritative re-read of
+        // the row rejects AFTER the image has already been created.
+        failNext: 1,
+      },
+      publishImageIds: [9001],
+    });
+
+    // CONTROL: exactly one cell is offered, into the existing entry.
+    const button = await screen.findByTestId('gm-publish');
+    expect(button).toHaveTextContent('Publish 1 more image');
+
+    await userEvent.click(button);
+
+    // The image WAS created; the entry write was not.
+    await waitFor(() =>
+      expect(screen.getByTestId('gm-publish-status')).toHaveTextContent(/now public on Civitai/i),
+    );
+
+    // PROBE: the cell is nonetheless disarmed. Recording only successes left the
+    // button reading "Publish 1 more image" over a cell that had already cost an
+    // irreversible act, so a second click made a SECOND permanent public image.
+    await waitFor(() =>
+      expect(
+        screen.getByTestId('gm-publish'),
+        'the ledger asks "did this cell already cost the viewer an irreversible act", never "did the operation succeed"',
+      ).toBeDisabled(),
+    );
+    expect(screen.getByTestId('gm-publish')).toHaveTextContent(/already published/i);
+  });
+});
+
+describe('gallery — the extend target survives an unloaded gallery (F1-round4)', () => {
+  it('🔴 extends the existing row even when the gallery list itself failed to help', async () => {
+    const { manifest, cells } = fourDoneManifest();
+    const ledger = {
+      cells: cells.slice(0, 3).map((cell, i) => ({
+        cell: `${cell.id}@${cell.workflowId}`,
+        imageId: 200 + i,
+        entryKey: 'shared_1',
+      })),
+    };
+
+    renderApp({
+      viewer,
+      consentGranted: true,
+      storage: {
+        seed: {
+          [RUN_STORAGE_KEY]: manifest,
+          'gen-matrix:gallery:cells:v1': ledger,
+        },
+      },
+      shared: {
+        seed: [
+          {
+            value: {
+              title: 'Existing row',
+              data: galleryData([{ imageId: 200, row: 0, col: 0 }]),
+            },
+          },
+        ],
+      },
+      publishImageIds: [9002],
+    });
+
+    await userEvent.click(await screen.findByTestId('gm-publish'));
+
+    // "Added … to this matrix's gallery entry" is the `extended` wording, and it
+    // only appears when `update` was taken. Resolving the target from the loaded
+    // list page produced "Published 1 image to the gallery." — a SECOND row —
+    // whenever that page did not happen to contain the row.
+    await waitFor(() =>
+      expect(
+        screen.getByTestId('gm-publish-status'),
+        'the target must be resolved by an authoritative single-row read, not by searching a 12-row page that may not contain it',
+      ).toHaveTextContent(/Added 1 image to this matrix/i),
+    );
+
+    // Still exactly one row for this matrix.
+    await userEvent.click(screen.getByTestId('gm-newrun'));
+    await userEvent.click(await screen.findByTestId('gm-reset-confirm'));
+    await screen.findByTestId('gm-gallery-item');
+    expect(screen.getAllByTestId('gm-gallery-item')).toHaveLength(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Round-5: the regression test for the authoritative single-row read.
+//
+// 🔴 THE PREVIOUS VERSION OF THIS TEST DID NOT GO RED ON THE DEFECT IT NAMED.
+// It pinned "a target is passed at all", not "the target is resolved
+// authoritatively": the fixture seeded ONE shared row whose key the ledger
+// named, so round 3's list-page lookup FOUND it and took the identical path.
+// Measured — restoring round 3's rule verbatim left all 609 tests passing.
+//
+// The condition the fix exists for is a target that the list page does NOT
+// contain. `loadGallery` fetches `GALLERY_LIST_CAP + 1` and slices to
+// `GALLERY_LIST_CAP`; the mock lists newest-first and seeds newest-LAST, so a
+// row seeded FIRST is the oldest and falls off the page once enough rows follow
+// it. That is the fixture below.
+// ---------------------------------------------------------------------------
+
+describe('gallery — the extend target is resolved AUTHORITATIVELY (F1-round5)', () => {
+  it('🔴 extends a target that is OFF the loaded list page', async () => {
+    const { manifest, cells } = fourDoneManifest();
+    // Cells 0-2 already live in the OLDEST shared row — `shared_1`, seeded first.
+    const ledger = {
+      cells: cells.slice(0, 3).map((cell, i) => ({
+        cell: `${cell.id}@${cell.workflowId}`,
+        imageId: 300 + i,
+        entryKey: 'shared_1',
+      })),
+    };
+
+    // The target first (oldest ⇒ last in a newest-first listing), then enough
+    // rows to push it past GALLERY_LIST_CAP.
+    const seed = [
+      {
+        value: {
+          title: 'The off-page row',
+          data: galleryData([{ imageId: 300, row: 0, col: 0 }]),
+        },
+      },
+      ...Array.from({ length: GALLERY_LIST_CAP + 2 }, (_, i) => ({
+        value: {
+          title: `Filler ${i}`,
+          data: galleryData([{ imageId: 400 + i, row: 0, col: 0 }]),
+        },
+      })),
+    ];
+
+    renderApp({
+      viewer,
+      consentGranted: true,
+      storage: {
+        seed: {
+          [RUN_STORAGE_KEY]: manifest,
+          'gen-matrix:gallery:cells:v1': ledger,
+        },
+      },
+      shared: { seed },
+      publishImageIds: [9003],
+    });
+
+    const button = await screen.findByTestId('gm-publish');
+    expect(button).toHaveTextContent('Publish 1 more image');
+    await userEvent.click(button);
+
+    // "Added … to this matrix's gallery entry" is the `extended` wording and it
+    // only appears when `update` was taken. Resolving the target from the loaded
+    // page cannot find `shared_1` here, so that rule produces
+    // "Published 1 image to the gallery." — a SECOND row for one matrix, after
+    // the UI had already promised the same entry.
+    await waitFor(
+      () =>
+        expect(
+          screen.getByTestId('gm-publish-status'),
+          'gallery-authoritative-target-guard: the target must be re-read by key, not looked up in the 12-row list page — off-page, the page lookup silently appends a second row and the ledger then names two entries, which makes every LATER publish append again, forever',
+        ).toHaveTextContent(/Added 1 image to this matrix/i),
+      { timeout: 4000 },
+    );
+  });
+
+  // 🔴 AN INVARIANT GUARD, NOT REGRESSION COVERAGE — labelled as one because it
+  // was MEASURED not to discriminate: under round 3's list-page rule this case
+  // still passes, because the fixture's single row IS on the page, so the old
+  // lookup finds it and takes the identical path. It pins that the ordinary
+  // one-row extend keeps working; the test above is the one that fails on the
+  // defect. Keeping the distinction visible is the whole point of the label.
+  it('[invariant guard] extends the ordinary single-row target', async () => {
+    const { manifest, cells } = fourDoneManifest();
+    const ledger = {
+      cells: cells.slice(0, 3).map((cell, i) => ({
+        cell: `${cell.id}@${cell.workflowId}`,
+        imageId: 500 + i,
+        entryKey: 'shared_1',
+      })),
+    };
+
+    renderApp({
+      viewer,
+      consentGranted: true,
+      storage: {
+        seed: {
+          [RUN_STORAGE_KEY]: manifest,
+          'gen-matrix:gallery:cells:v1': ledger,
+        },
+      },
+      shared: {
+        seed: [
+          {
+            // Authored by SOMEBODY ELSE, so the app's own gallery still lists it
+            // but the row is not one this viewer's page would treat as theirs —
+            // the point is only that the key resolves through `get`.
+            value: {
+              title: 'Row one',
+              data: galleryData([{ imageId: 500, row: 0, col: 0 }]),
+            },
+          },
+        ],
+      },
+      publishImageIds: [9004],
+    });
+
+    await userEvent.click(await screen.findByTestId('gm-publish'));
+    await waitFor(() =>
+      expect(screen.getByTestId('gm-publish-status')).toHaveTextContent(
+        /Added 1 image to this matrix/i,
+      ),
+    );
+  });
+});
+
+describe('gallery — an orphaned publish still reaches the ledger', () => {
+  // 🔴 RENAMED. It used to be called "keeps the viewer's typed title", and it
+  // never re-read the title box — typing into it was decorative and the test
+  // passed identically without it. Names are what a later round greps, and this
+  // one was being counted as coverage for a property it did not test. The
+  // property has real coverage now, in the PARTIAL-land test above, which is the
+  // only shape where the rule bites.
+  it('disarms the cell when the attempt covered everything that was armed', async () => {
+    const { manifest, cells } = fourDoneManifest();
+    // Only cell 0 is published, so three cells stay armed after the attempt.
+    const ledger = {
+      cells: [
+        {
+          cell: `${cells[0].id}@${cells[0].workflowId}`,
+          imageId: 600,
+          entryKey: 'shared_1',
+        },
+      ],
+    };
+
+    renderApp({
+      viewer,
+      consentGranted: true,
+      storage: {
+        seed: {
+          [RUN_STORAGE_KEY]: manifest,
+          'gen-matrix:gallery:cells:v1': ledger,
+        },
+      },
+      shared: {
+        seed: [
+          { value: { title: 'Row', data: galleryData([{ imageId: 600, row: 0, col: 0 }]) } },
+        ],
+        // The authoritative re-read fails after the images are created.
+        failNext: 1,
+      },
+      publishImageIds: [9005],
+    });
+
+    const titleBox = await screen.findByTestId('gm-publish-title');
+    await userEvent.clear(titleBox);
+    await userEvent.type(titleBox, 'Autumn lighthouse study');
+    expect(titleBox).toHaveValue('Autumn lighthouse study');
+
+    await userEvent.click(screen.getByTestId('gm-publish'));
+    await waitFor(() =>
+      expect(screen.getByTestId('gm-publish-status')).toHaveTextContent(/now public on Civitai/i),
+    );
+
+    // Everything the click attempted DID land here — the mock's publish knob
+    // succeeds for every call or fails for every call, so a partial land is
+    // unreachable at this tier. With nothing left armed, clearing the box is the
+    // correct behaviour, and this pins that the orphan path still reaches the
+    // ledger and disarms.
+    //
+    // The armed-remainder case — the one the F-4 fix is actually about — is
+    // covered by `shouldClearPublishTitle` in gallery.test.ts, which is the only
+    // tier that can construct it.
+    await waitFor(() => expect(screen.getByTestId('gm-publish')).toBeDisabled());
+    expect(screen.getByTestId('gm-publish')).toHaveTextContent(/already published/i);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Round-6: a PARTIAL land — the state the title-retention rule exists for.
+//
+// 🔴 I PREVIOUSLY RECORDED THIS AS "STRUCTURALLY UNREACHABLE THROUGH
+// createMockHost". That was overstated, and a limit stated too strongly stops
+// the next person trying. `publishImageIds` and `publishError` are both
+// documented "Live-tunable via MockHost.setScenario", and the publish loop
+// reports progress BEFORE issuing each cell's request — so flipping the
+// scenario once cell 2 is in flight makes cell 3 fail while cells 1 and 2 have
+// landed. That is a partial land, and it is deterministic: cell 3 is issued only
+// after cell 2's reply resolves, and the progress render that gates the flip
+// happens before that reply.
+// ---------------------------------------------------------------------------
+
+/** A 3-cell run, every cell done, so all three are publishable. */
+function threeDoneManifest() {
+  const cells = buildMatrix('a lighthouse', [CHECKPOINTS[0]], [
+    MODIFIERS[0],
+    MODIFIERS[1],
+    MODIFIERS[2],
+  ]).map(
+    (cell, i): MatrixCell => ({
+      ...cell,
+      status: 'done',
+      workflowId: `wf_p${i}`,
+      imageUrl: `https://img.example/p${i}.jpeg`,
+      cost: 8,
+      nsfwLevel: 1,
+    }),
+  );
+  return buildRunManifest({ phase: 'done', cells, perCellEstimate: 8 });
+}
+
+/** Mount against a host the test keeps a handle on, so it can retune mid-run. */
+function mountTunable(options: Record<string, unknown>) {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const host = createMockHost(options as any);
+  resetTransport();
+  getTransport({ allowedParentOrigins: [window.location.origin] });
+  const uninstall = host.install();
+  const view = render(
+    <ToastProvider>
+      <App />
+    </ToastProvider>,
+  );
+  return {
+    host,
+    cleanup: () => {
+      view.unmount();
+      uninstall();
+    },
+  };
+}
+
+describe('gallery — a PARTIAL land keeps the viewer’s typed title (F4-round6)', () => {
+  it('🔴 publishes 2 of 3, leaves the third armed, and does NOT revert the title', async () => {
+    const harness = mountTunable({
+      viewer,
+      consentGranted: true,
+      storage: { seed: { [RUN_STORAGE_KEY]: threeDoneManifest() } },
+      publishImageIds: [9101],
+    });
+    try {
+      const titleBox = await screen.findByTestId('gm-publish-title');
+      await userEvent.clear(titleBox);
+      await userEvent.type(titleBox, 'Autumn lighthouse study');
+
+      // 🔴 THE HOOK IS THE MESSAGE BOUNDARY, NOT THE DOM. Gating on the rendered
+      // "Confirming image 2 of 3" does NOT work — measured: the mock answers fast
+      // enough that the whole loop completes inside one React batch and that
+      // intermediate state never paints. Wrapping the patched
+      // `window.parent.postMessage` fires exactly when the third publish request
+      // is SENT, before the mock handles it, so the flip is deterministic and
+      // carries no timing dependency.
+      const parentWindow = window.parent as unknown as {
+        postMessage: (message: unknown, ...rest: unknown[]) => void;
+      };
+      const originalPostMessage = parentWindow.postMessage;
+      let publishRequests = 0;
+      parentWindow.postMessage = (message: unknown, ...rest: unknown[]) => {
+        if ((message as { type?: string } | null)?.type === 'PUBLISH_GENERATION_OUTPUTS') {
+          publishRequests += 1;
+          if (publishRequests === 3) {
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            harness.host.setScenario({ publishError: 'the host refused this one' } as any);
+          }
+        }
+        return originalPostMessage.call(parentWindow, message, ...rest);
+      };
+
+      const button = screen.getByTestId('gm-publish');
+      expect(button).toHaveTextContent('Publish 3 images');
+      await userEvent.click(button);
+
+      await waitFor(
+        () =>
+          expect(screen.getByTestId('gm-publish-status')).toHaveTextContent(
+            /Published 2 of 3 images/i,
+          ),
+        { timeout: 4000 },
+      );
+
+      // PROBE: one cell is still armed, so the title the viewer typed must
+      // survive. Clearing it here reverts the box to the suggested default, and
+      // their next Publish creates a public row carrying that default instead.
+      expect(screen.getByTestId('gm-publish')).toHaveTextContent('Publish 1 more image');
+      expect(
+        screen.getByTestId('gm-publish-title'),
+        'gallery-title-seam-guard: the clear is gated on `shouldClearPublishTitle(landed, attempted)` — an unconditional clear (the pre-fix code) throws away a title typed while cells are still publishable',
+      ).toHaveValue('Autumn lighthouse study');
+    } finally {
+      harness.cleanup();
+    }
+  });
+
+  it('clears the box once the attempt covered everything that was armed', async () => {
+    const harness = mountTunable({
+      viewer,
+      consentGranted: true,
+      storage: { seed: { [RUN_STORAGE_KEY]: oneCellRunManifest() } },
+      publishImageIds: [9102],
+    });
+    try {
+      const titleBox = await screen.findByTestId('gm-publish-title');
+      await userEvent.clear(titleBox);
+      await userEvent.type(titleBox, 'Typed and finished');
+      await userEvent.click(screen.getByTestId('gm-publish'));
+
+      await waitFor(() =>
+        expect(screen.getByTestId('gm-publish-status')).toHaveTextContent(/Published 1 image/i),
+      );
+      // Nothing left armed, so the box returns to the suggestion — and this is
+      // the assertion that reddens an INVERTED seam (`if (!shouldClear…)`).
+      await waitFor(() =>
+        expect(
+          screen.getByTestId('gm-publish-title'),
+          'gallery-title-seam-guard: with nothing left armed the typed title is spent, and the box must not keep it for a different matrix',
+        ).not.toHaveValue('Typed and finished'),
+      );
+    } finally {
+      harness.cleanup();
+    }
   });
 });

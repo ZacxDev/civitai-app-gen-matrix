@@ -1,3 +1,5 @@
+import type { CSSProperties } from 'react';
+
 // Design-system theme (STEP 2). The block renders in a sandboxed iframe where
 // the host can't inject CSS, so it drives colour through inline styles. This
 // module replaces the old hand-rolled hardcoded-hex `palette(dark)` with values
@@ -67,4 +69,44 @@ export function palette(_dark?: boolean): Palette {
     skelShine: wash('var(--civitai-color-text)', 14),
     fadeColor: 'var(--civitai-color-body)',
   };
+}
+
+// ---------------------------------------------------------------------------
+// Shared control styles.
+//
+// These three live here rather than beside their first caller because more than
+// one surface renders them — App's build/result panels and the gallery. A second
+// copy of a button style is the cheap kind of drift, but it is still drift: the
+// two diverge, and the screen ends up with two things that are meant to be the
+// same control looking subtly different.
+// ---------------------------------------------------------------------------
+
+export function primaryBtn(c: Palette, disabled = false): CSSProperties {
+  return {
+    padding: '12px 18px',
+    border: 'none',
+    borderRadius: 8,
+    background: disabled ? c.border : c.accent,
+    color: disabled ? c.muted : c.accentFg,
+    fontWeight: 700,
+    fontSize: 15,
+    cursor: disabled ? 'not-allowed' : 'pointer',
+  };
+}
+
+export function secondaryBtn(c: Palette): CSSProperties {
+  return {
+    padding: '12px 18px',
+    border: `1px solid ${c.border}`,
+    borderRadius: 8,
+    background: 'transparent',
+    color: c.fg,
+    fontWeight: 600,
+    fontSize: 15,
+    cursor: 'pointer',
+  };
+}
+
+export function noteStyle(c: Palette): CSSProperties {
+  return { fontSize: 13, color: c.muted, margin: 0, lineHeight: 1.5 };
 }

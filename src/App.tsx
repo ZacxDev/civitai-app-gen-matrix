@@ -9,9 +9,12 @@ import {
   useDomainMaturity,
   useBuzzPurchase,
   useBuzzWorkflow,
+  useGatedImages,
+  usePublishGenerationOutputs,
   useRequestConsent,
   useRequestSignIn,
   useResourcePicker,
+  useSharedStorage,
 } from '@civitai/blocks-react';
 import { Slider, Tooltip, useToast } from '@civitai/components-react';
 import type { BlockWorkflowSnapshot } from '@civitai/app-sdk/blocks';
@@ -70,7 +73,7 @@ import { ResourceBrowser } from './ResourceBrowser.js';
 import { CatalogCache, defaultKvStore } from './catalog-cache.js';
 import { DEFAULT_LIMIT, fetchCatalog, type CatalogQuery } from './catalog-api.js';
 import { loraBaseModelFilter } from './ecosystem.js';
-import { palette, type Palette } from './theme.js';
+import { noteStyle, palette, primaryBtn, secondaryBtn, type Palette } from './theme.js';
 import { paintTheme } from './bootTheme.js';
 import { MaturityImage } from './MaturityImage.js';
 import {
@@ -83,6 +86,37 @@ import {
   type AppWorkflowLike,
   type MaturityGate,
 } from './persistence.js';
+import { GalleryPanel, type GalleryImages } from './GalleryPanel.js';
+import { PublishMatrixPanel, type PublishPhase } from './PublishMatrixPanel.js';
+import {
+  PUBLISHED_KEYS_STORAGE_KEY,
+  REPORTED_KEYS_STORAGE_KEY,
+  addKeyToSet,
+  collectImageIds,
+  composeGalleryBody,
+  defaultGalleryTitle,
+  indexGatedImages,
+  keySetBlob,
+  loadGallery,
+  normalizeGalleryTitle,
+  parseKeySet,
+  publishMatrix,
+  publishResultMessage,
+  publishableCells,
+  PUBLISHED_CELLS_STORAGE_KEY,
+  ORPHANED_ENTRY_KEY,
+  addPublishedCells,
+  cellPublishKey,
+  indexPublishedCells,
+  parsePublishedCells,
+  publishTargetKey,
+  publishedCellsBlob,
+  shouldClearPublishTitle,
+  unpublishedCells,
+  type PublishedCellRecord,
+  type GalleryEntry,
+  type GalleryLoad,
+} from './gallery.js';
 import {
   ACTIVE_RUN_POINTER_KEY,
   HISTORY_LIST_CAP,
@@ -197,7 +231,7 @@ function useModalA11y(
 }
 
 export function App() {
-  const { ready, viewer, theme } = useBlockContext();
+  const { ready, viewer, theme, context } = useBlockContext();
   const token = useBlockToken();
   // The block's domain maturity ceiling (fail-closed SFW). Threaded into the
   // anon catalog read so a red-domain block's anon browse can show mature while
@@ -215,6 +249,13 @@ export function App() {
   // per-app-tag-scoped list we reconcile against for status/image/nsfwLevel/cost.
   const storage = useAppStorage();
   const { workflows: appWorkflows, refetch: refetchWorkflows } = useAppWorkflows();
+  // The gallery's three host surfaces. `shared` is the app-scoped index every
+  // viewer reads; `publish` turns this viewer's own workflow outputs into real
+  // public Image rows; `getImages` reads those ids back under the REQUESTING
+  // viewer's own maturity clamp (see gallery.ts for why ids, not urls).
+  const shared = useSharedStorage();
+  const { publish } = usePublishGenerationOutputs();
+  const { getImages } = useGatedImages();
   const toast = useToast();
 
   // G1 — the domain ceiling the result-image gate consults (stable identity for
@@ -234,6 +275,18 @@ export function App() {
   const isDark = paintTheme(ready, theme) === 'dark';
   const c = palette(isDark);
   const anon = ready && !viewer;
+  // 🔴 THE SLOT CONTEXT, NOT `viewer.id`. `ViewerInfo.id`/`username` are
+  // `@deprecated` ("Init-time identity disclosure … scheduled for removal") and
+  // their supported replacement `useViewer()` is scope-gated on
+  // `user:read:self`. `PageSlotContext.viewerUserId` is neither: it is part of
+  // the context `PageBlockHost.buildContext()` already sends, carries no
+  // deprecation marker, and costs no scope. It is used for ONE thing — deciding
+  // whether a gallery row is this viewer's own — and it fails CLOSED when absent.
+  // This does NOT touch the sign-in gate above, which stays `ready && !viewer`.
+  const viewerUserId =
+    context != null && 'viewerUserId' in context && typeof context.viewerUserId === 'number'
+      ? context.viewerUserId
+      : null;
   const granted = hasBudgetedScope(token.scopes);
 
   const rootRef = useRef<HTMLDivElement>(null);
@@ -325,6 +378,32 @@ export function App() {
   const startedThisSessionRef = useRef(false);
   // Ticks once a second while running so the elapsed label advances.
   const [nowTick, setNowTick] = useState(() => Date.now());
+
+  // ---- The published-matrix gallery ----
+  // `null` renders "loading", never "empty" — before the read resolves we know
+  // neither that the gallery has entries nor that it has none.
+  const [galleryLoad, setGalleryLoad] = useState<GalleryLoad | null>(null);
+  const [galleryImages, setGalleryImages] = useState<GalleryImages | null>(null);
+  const [galleryNonce, setGalleryNonce] = useState(0);
+  // The viewer's OWN gallery keys and the ones they have reported, both read
+  // from their PRIVATE per-viewer storage. This is what lets the app answer
+  // "is this row mine" without a `user:read:self` scope — see gallery.ts.
+  const [ownKeys, setOwnKeys] = useState<Set<string>>(() => new Set());
+  const [reportedKeys, setReportedKeys] = useState<Set<string>>(() => new Set());
+  const [galleryBusyKeys, setGalleryBusyKeys] = useState<Set<string>>(() => new Set());
+  const [galleryErrors, setGalleryErrors] = useState<Map<string, string>>(() => new Map());
+  const [publishTitle, setPublishTitle] = useState('');
+  const [publishTitleTouched, setPublishTitleTouched] = useState(false);
+  const [publishPhase, setPublishPhase] = useState<PublishPhase>({ kind: 'idle' });
+  // 🔴 THE PER-CELL PUBLISH LEDGER, READ FROM DURABLE PER-VIEWER STORAGE.
+  // This replaces a session-held signature of the whole publishable set, which
+  // re-armed the control both when the set GREW (retry a failed cell → the other
+  // three republish) and when the SESSION ended (a reload lost the Set while the
+  // cell ids came back intact). Both produced duplicate permanent public images.
+  // The durable answer is per cell — see `PUBLISHED_CELLS_STORAGE_KEY`.
+  const [publishedCells, setPublishedCells] = useState<PublishedCellRecord[]>([]);
+  const [publishMessage, setPublishMessage] = useState<string | null>(null);
+  const [publishProblem, setPublishProblem] = useState(false);
 
   // Auto-resume intent across the consent round-trip.
   const consentPendingRef = useRef(false);
@@ -872,6 +951,90 @@ export function App() {
     };
   }, [ready, viewer, storage, historyNonce]);
 
+  // ---- Gallery — read the shared index ----
+  // Runs for anon too: reading the gallery is NOT behind the publish cohort gate
+  // and `list` has an anonymous read path, so a signed-out viewer browses it.
+  // 🔴 A REJECTION MUST NOT BECOME AN EMPTY LIST. `loadGallery` already maps one
+  // to `{kind:'error'}`; the `.catch` is the belt for anything thrown before it.
+  // Until a version carrying the shared scopes is APPROVED this is the branch
+  // every viewer lands in, so it is the one that has to be honest.
+  useEffect(() => {
+    if (!ready) return;
+    let cancelled = false;
+    setGalleryLoad(null);
+    setGalleryImages(null);
+    void (async () => {
+      const load = await loadGallery(shared).catch(() => ({ kind: 'error' }) as GalleryLoad);
+      if (!cancelled) setGalleryLoad(load);
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [ready, shared, galleryNonce]);
+
+  // ---- Gallery — read the images, per viewer, through the host's clamp ----
+  // ONE call for every listed entry's ids, then distributed BY ID. The host
+  // OMITS ids it cannot resolve, so the reply may be shorter than the request
+  // and its order means nothing — `indexGatedImages` is what makes that safe.
+  const galleryEntryIds = galleryLoad?.kind === 'ok' ? collectImageIds(galleryLoad.entries) : null;
+  // A stable signature so the effect fires on a real change of ids, not on the
+  // new array identity `collectImageIds` returns every render.
+  const galleryIdSig = galleryEntryIds?.join(',') ?? '';
+  useEffect(() => {
+    if (galleryEntryIds == null) return;
+    if (galleryEntryIds.length === 0) {
+      setGalleryImages({ kind: 'ok', byId: new Map() });
+      return;
+    }
+    let cancelled = false;
+    setGalleryImages(null);
+    void getImages(galleryEntryIds)
+      .then((images) => {
+        if (!cancelled) setGalleryImages({ kind: 'ok', byId: indexGatedImages(images) });
+      })
+      .catch(() => {
+        if (!cancelled) setGalleryImages({ kind: 'error' });
+      });
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [galleryIdSig, getImages]);
+
+  // ---- Gallery — the viewer's own + reported keys, from PRIVATE storage ----
+  useEffect(() => {
+    if (!ready) return;
+    // 🔴 CLEAR ON SIGN-OUT, DON'T JUST STOP READING. Early-returning without
+    // clearing left the previous viewer's keys in state: `Remove` stayed offered
+    // and ENABLED on rows the new (or anonymous) viewer does not own, and
+    // `withdraw` is author-scoped server-side, so pressing it is a guaranteed
+    // rejection — offering an error, which is the exact failure the id-free
+    // ownership design existed to avoid. Stale `reportedKeys` also suppressed
+    // Report for a viewer who never reported anything.
+    if (!viewer) {
+      setOwnKeys(new Set());
+      setReportedKeys(new Set());
+      setPublishedCells([]);
+      return;
+    }
+    let cancelled = false;
+    void (async () => {
+      const [own, reported, cells] = await Promise.all([
+        storage.get(PUBLISHED_KEYS_STORAGE_KEY).catch(() => null),
+        storage.get(REPORTED_KEYS_STORAGE_KEY).catch(() => null),
+        storage.get(PUBLISHED_CELLS_STORAGE_KEY).catch(() => null),
+      ]);
+      if (cancelled) return;
+      setOwnKeys(new Set(parseKeySet(own)));
+      setReportedKeys(new Set(parseKeySet(reported)));
+      // 🔴 This is what makes the publish disarm survive a reload.
+      setPublishedCells(parsePublishedCells(cells));
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [ready, viewer, storage]);
+
   // ---- Release A — stamp the run's finish, once, in the session that ran it ----
   // 🔴 GATED ON `startedThisSessionRef`. Stamping any run that merely LOOKS done
   // would give a matrix restored from storage a finish time of "now", so a run
@@ -1168,6 +1331,288 @@ export function App() {
     );
   }, [openPurchaseModal, billable, state.perCellEstimate]);
 
+  // ---- Gallery actions ----
+
+  /** Mark one entry's request in flight (or not), keyed by entry. */
+  const setEntryBusy = useCallback((key: string, busy: boolean) => {
+    setGalleryBusyKeys((prev) => {
+      const next = new Set(prev);
+      if (busy) next.add(key);
+      else next.delete(key);
+      return next;
+    });
+  }, []);
+
+  const setEntryError = useCallback((key: string, message: string | null) => {
+    setGalleryErrors((prev) => {
+      const next = new Map(prev);
+      if (message == null) next.delete(key);
+      else next.set(key, message);
+      return next;
+    });
+  }, []);
+
+  /** Replace one loaded entry in place, leaving the rest of the list alone. */
+  const patchEntry = useCallback((key: string, patch: Partial<GalleryEntry>) => {
+    setGalleryLoad((prev) => {
+      if (prev == null || prev.kind !== 'ok') return prev;
+      return {
+        ...prev,
+        entries: prev.entries.map((entry) => (entry.key === key ? { ...entry, ...patch } : entry)),
+      };
+    });
+  }, []);
+
+  /** Write one of the viewer's private key sets. Best-effort, like every write. */
+  const persistKeySet = useCallback(
+    (storageKey: string, keys: readonly string[]) => {
+      storage.set(storageKey, keySetBlob(keys)).catch(() => undefined);
+    },
+    [storage],
+  );
+
+  // 🔴 THE VOTE STATE COMES FROM `viewerVoted`, AND THE NEW STATE COMES FROM THE
+  // ACTION — never from a local guess. Guessing "not voted" on load is what
+  // produces the "click twice to unvote" bug; guessing the post-click state is
+  // the same error one step later, and it survives a failed request.
+  const handleToggleVote = useCallback(
+    (entry: GalleryEntry) => {
+      if (galleryBusyKeys.has(entry.key)) return;
+      const wasVoted = entry.viewerVoted;
+      setEntryBusy(entry.key, true);
+      setEntryError(entry.key, null);
+      const request = wasVoted ? shared.unvote(entry.key) : shared.vote(entry.key);
+      void request
+        .then((count) => {
+          patchEntry(entry.key, { count, viewerVoted: !wasVoted });
+        })
+        .catch((err: unknown) => {
+          setEntryError(
+            entry.key,
+            err instanceof Error && err.message.length > 0
+              ? err.message
+              : 'Your vote could not be saved.',
+          );
+        })
+        .finally(() => setEntryBusy(entry.key, false));
+    },
+    [shared, galleryBusyKeys, setEntryBusy, setEntryError, patchEntry],
+  );
+
+  // 🔴 RE-THROWS. `ReportButton`'s contract is that a rejected `onReport` keeps
+  // the control armed rather than settling — swallowing the error here would
+  // render "Reported for review" for a report that was never filed.
+  const handleReportEntry = useCallback(
+    async (entry: GalleryEntry) => {
+      await shared.report(entry.key);
+      setReportedKeys((prev) => {
+        const next = addKeyToSet([...prev], entry.key);
+        persistKeySet(REPORTED_KEYS_STORAGE_KEY, next);
+        return new Set(next);
+      });
+    },
+    [shared, persistKeySet],
+  );
+
+  const handleWithdrawEntry = useCallback(
+    (entry: GalleryEntry) => {
+      if (galleryBusyKeys.has(entry.key)) return;
+      setEntryBusy(entry.key, true);
+      setEntryError(entry.key, null);
+      void shared
+        .withdraw(entry.key)
+        .then(() => {
+          setGalleryLoad((prev) =>
+            prev == null || prev.kind !== 'ok'
+              ? prev
+              : { ...prev, entries: prev.entries.filter((e) => e.key !== entry.key) },
+          );
+          setOwnKeys((prev) => {
+            const next = [...prev].filter((k) => k !== entry.key);
+            persistKeySet(PUBLISHED_KEYS_STORAGE_KEY, next);
+            return new Set(next);
+          });
+        })
+        .catch((err: unknown) => {
+          setEntryError(
+            entry.key,
+            err instanceof Error && err.message.length > 0
+              ? err.message
+              : 'This entry could not be removed.',
+          );
+        })
+        .finally(() => setEntryBusy(entry.key, false));
+    },
+    [shared, galleryBusyKeys, setEntryBusy, setEntryError, persistKeySet],
+  );
+
+  // The cells of the open matrix that can be published: `done`, with a
+  // workflowId the host can re-derive ownership from.
+  const publishPlan = useMemo(() => publishableCells(state.cells), [state.cells]);
+  const publishedIndex = useMemo(() => indexPublishedCells(publishedCells), [publishedCells]);
+  // What a click would actually publish: the cells NOT already in the gallery.
+  const publishRemaining = useMemo(
+    () => unpublishedCells(publishPlan, publishedIndex),
+    [publishPlan, publishedIndex],
+  );
+  const alreadyPublishedCount = publishPlan.length - publishRemaining.length;
+  const alreadyPublished = publishPlan.length > 0 && publishRemaining.length === 0;
+  // The row this matrix's earlier cells landed in, so a later publish EXTENDS it
+  // rather than minting a second entry for one grid.
+  const publishTarget = useMemo(
+    () => publishTargetKey(publishPlan, publishedIndex),
+    [publishPlan, publishedIndex],
+  );
+  // The title offered until the author edits it. Derived from the run's own
+  // shared prompt, so it describes the matrix on screen rather than the form.
+  const suggestedPublishTitle = defaultGalleryTitle(sharedPromptFromCells(state.cells));
+  const effectivePublishTitle = publishTitleTouched ? publishTitle : suggestedPublishTitle;
+
+  // 🔴 THE SDK'S OWN DOC-COMMENT IS INCOMPLETE ABOUT WHY THIS REJECTS, AND AN
+  // AUDIT ALREADY GOT IT WRONG FROM THE CLIENT TYPES. `usePublishGenerationOutputs`
+  // enumerates its rejection causes as "anon viewer / missing scope / not-owned
+  // workflow / rate-limit / upload or scan failure" and OMITS the cohort gate
+  // entirely — and `assertViewerIsAppDeveloper` appears in the vendored `.d.ts`
+  // only on inline `customComfy` submission, so reading the client types alone
+  // yields the confident, wrong conclusion that publishing is open to everyone.
+  //
+  // The server is the authority, and it gates: civitai/civitai
+  // `src/server/routers/blocks.router.ts:3604` declares `publishGenerationOutputs`
+  // a `publicProcedure`, then `:3631` runs `assertAppBlocksEnabledForTokenUser`
+  // and `:3632` runs `assertViewerIsAppDeveloper(userId)` — BEFORE any image is
+  // created. So the cohort note in `PublishMatrixPanel` is true, and an ordinary
+  // viewer clicking Publish creates nothing.
+  //
+  // Do not re-derive "there is no cohort gate" from the client's declarations.
+  const handlePublish = useCallback(() => {
+    if (publishPhase.kind === 'busy') return;
+    // Belt for the disabled button: a duplicate publish is unrecoverable.
+    if (publishRemaining.length === 0) return;
+    setPublishMessage(null);
+    setPublishProblem(false);
+    setPublishPhase({ kind: 'busy', done: 0, total: publishRemaining.length });
+    // 🔴 THE KEY, NOT A SNAPSHOT. `publishMatrix` re-reads the row through
+    // `shared.get` immediately before merging — see `PublishDeps.getEntry`.
+    // Resolving it here from the loaded 12-row page silently appended a second
+    // row whenever the matrix's entry was off-page, or the gallery read had
+    // failed, or it had not resolved yet; and even when found, the snapshot
+    // could be stale enough to drop another tab's image out of the entry.
+    void publishMatrix(
+      publishRemaining,
+      {
+        // Every user-visible string goes in the MODERATED fields. `data` carries
+        // ids and grid coordinates only — see gallery.ts.
+        title: normalizeGalleryTitle(effectivePublishTitle),
+        ...(composeGalleryBody(sharedPromptFromCells(state.cells)) !== undefined
+          ? { body: composeGalleryBody(sharedPromptFromCells(state.cells)) }
+          : {}),
+      },
+      {
+        publish,
+        append: (value) => shared.append(value),
+        update: (key, value) => shared.update(key, value),
+        // The authoritative single-row read. Its own contract covers exactly this
+        // case — an item past the first page — and it returns `null` for a
+        // withdrawn or moderated row, which is the one case where appending a
+        // fresh entry is right.
+        getEntry: async (key) => {
+          const item = await shared.get(key);
+          return item == null
+            ? null
+            : {
+                title: item.value.title,
+                ...(item.value.body !== undefined ? { body: item.value.body } : {}),
+                data: item.value.data,
+              };
+        },
+      },
+      (done, total) => setPublishPhase({ kind: 'busy', done, total }),
+      publishTarget,
+    )
+      .then((result) => {
+        setPublishMessage(publishResultMessage(result));
+        setPublishProblem(result.kind !== 'ok');
+        // 🔴 `orphaned` IS INCLUDED, AND THAT IS THE POINT. Its images were
+        // created — they are permanent public Civitai rows — even though the
+        // entry write failed. Recording only the successes left the control
+        // enabled over a cell that had already cost the viewer an irreversible
+        // act, so a second click made a second permanent image of it. The
+        // ledger's question is "did this already cost something irreversible",
+        // never "did the operation succeed".
+        if (result.kind === 'ok' || result.kind === 'partial' || result.kind === 'orphaned') {
+          // Record the minted key as OURS, in the viewer's private storage — the
+          // same-session supplement to the host-stamped `authorUserId` check.
+          // An orphaned result has no entry, so there is nothing to own.
+          if (result.kind !== 'orphaned') {
+            const ownedKey = result.key;
+            setOwnKeys((prev) => {
+              const next = addKeyToSet([...prev], ownedKey);
+              persistKeySet(PUBLISHED_KEYS_STORAGE_KEY, next);
+              return new Set(next);
+            });
+          }
+          // 🔴 Record EVERY cell that landed, durably. Disarming on a
+          // session-held signature of the whole set re-armed on a retry (the set
+          // grew) and on a reload (the Set was gone) — both republishing images
+          // that already existed, permanently and with no un-publish.
+          //
+          // The result carries the actual `(cell, workflowId, imageId)` triples,
+          // so both halves of the ledger key come from the same object the
+          // publish used — no `?? ''` fallback that could mint a key which never
+          // matches. An orphaned result has no entry key; `''` is rejected by
+          // `parsePublishedCells`, so it is recorded against a sentinel that says
+          // what it is and can never resolve as a target to extend.
+          const entryKey = result.kind === 'orphaned' ? ORPHANED_ENTRY_KEY : result.key;
+          const landedCells = result.landed.map((item) => ({
+            cell: cellPublishKey(item.cell.id, item.workflowId),
+            imageId: item.imageId,
+            entryKey,
+          }));
+          setPublishedCells((prev) => {
+            const next = addPublishedCells(prev, landedCells);
+            storage.set(PUBLISHED_CELLS_STORAGE_KEY, publishedCellsBlob(next)).catch(
+              () => undefined,
+            );
+            return next;
+          });
+          // 🔴 ONLY WHEN NOTHING IS LEFT ARMED. Clearing it unconditionally
+          // threw away a title the viewer had typed while other cells were still
+          // publishable: `effectivePublishTitle` falls back to the suggestion, so
+          // the box silently reverted to the default and the viewer's NEXT
+          // Publish created a public row carrying the default title rather than
+          // theirs. The shape pre-existed on `partial`; adding `orphaned` to this
+          // branch widened it, because an orphan leaves every unlanded cell armed.
+          if (shouldClearPublishTitle(landedCells.length, publishRemaining.length)) {
+            setPublishTitle('');
+            setPublishTitleTouched(false);
+          }
+          setGalleryNonce((n) => n + 1);
+        }
+      })
+      .catch((err: unknown) => {
+        // `publishMatrix` maps every host failure to a result, so reaching here
+        // means something unexpected threw — still say so rather than sit silent.
+        setPublishMessage(
+          err instanceof Error && err.message.length > 0
+            ? `Nothing was published. ${err.message}`
+            : 'Nothing was published.',
+        );
+        setPublishProblem(true);
+      })
+      .finally(() => setPublishPhase({ kind: 'idle' }));
+  }, [
+    publishPhase.kind,
+    publishRemaining,
+    publishTarget,
+    galleryLoad,
+    effectivePublishTitle,
+    state.cells,
+    publish,
+    shared,
+    storage,
+    persistKeySet,
+  ]);
+
   // ---- Render ----
   if (!ready) {
     return (
@@ -1256,6 +1701,27 @@ export function App() {
           <HistoryPanel c={c} load={history} now={nowTick} onOpen={handleOpenHistory} />
         )}
 
+        {/* Browsing the gallery is NOT behind the publish cohort gate, and not
+            behind sign-in either — an anonymous viewer reads it, and simply
+            cannot vote, report or withdraw. */}
+        {inBuild && (
+          <GalleryPanel
+            c={c}
+            load={galleryLoad}
+            images={galleryImages}
+            maturityGate={maturityGate}
+            signedIn={!anon}
+            viewerUserId={viewerUserId}
+            ownKeys={ownKeys}
+            reportedKeys={reportedKeys}
+            busyKeys={galleryBusyKeys}
+            actionErrors={galleryErrors}
+            onToggleVote={handleToggleVote}
+            onReport={handleReportEntry}
+            onWithdraw={handleWithdrawEntry}
+          />
+        )}
+
         {inBuild && browse && cacheRef.current && (
           <ResourceBrowser
             c={c}
@@ -1315,6 +1781,28 @@ export function App() {
                 prompt: cell.prompt,
               })
             }
+          />
+        )}
+
+        {/* Offered on a FINISHED matrix with something to publish — including one
+            reopened from history, which is equally publishable: publishing does
+            not re-run anything, so `readOnly` does not apply. */}
+        {showGrid && state.phase === 'done' && publishPlan.length > 0 && (
+          <PublishMatrixPanel
+            c={c}
+            publishable={publishRemaining.length}
+            alreadyPublishedCount={alreadyPublishedCount}
+            title={effectivePublishTitle}
+            setTitle={(value) => {
+              setPublishTitleTouched(true);
+              setPublishTitle(value);
+            }}
+            phase={publishPhase}
+            message={publishMessage}
+            messageIsProblem={publishProblem}
+            signedIn={!anon}
+            alreadyPublished={alreadyPublished}
+            onPublish={handlePublish}
           />
         )}
 
@@ -2933,36 +3421,6 @@ function backdropStyle(): React.CSSProperties {
     zIndex: 60,
     boxSizing: 'border-box',
   };
-}
-
-function primaryBtn(c: Palette, disabled = false): React.CSSProperties {
-  return {
-    padding: '12px 18px',
-    border: 'none',
-    borderRadius: 8,
-    background: disabled ? c.border : c.accent,
-    color: disabled ? c.muted : c.accentFg,
-    fontWeight: 700,
-    fontSize: 15,
-    cursor: disabled ? 'not-allowed' : 'pointer',
-  };
-}
-
-function secondaryBtn(c: Palette): React.CSSProperties {
-  return {
-    padding: '12px 18px',
-    border: `1px solid ${c.border}`,
-    borderRadius: 8,
-    background: 'transparent',
-    color: c.fg,
-    fontWeight: 600,
-    fontSize: 15,
-    cursor: 'pointer',
-  };
-}
-
-function noteStyle(c: Palette): React.CSSProperties {
-  return { fontSize: 13, color: c.muted, margin: 0, lineHeight: 1.5 };
 }
 
 // A dashed "add" chip for the resource-picker affordance — visually distinct
