@@ -106,6 +106,95 @@ describe('BuildPanel', () => {
     expect(screen.queryByText('Checkpoints (rows)')).toBeNull();
   });
 
+  // -------------------------------------------------------------------------
+  // The two axes as RESOURCES (the ResourceCard adoption)
+  // -------------------------------------------------------------------------
+
+  it('renders each checkpoint as a resource card carrying its type and base model, not a bare pill', () => {
+    render(<BuildPanel {...buildProps()} />);
+    // 🔴 The two facts a bare "SD XL" pill could never carry. `ckpts[0]` has no
+    // `modelName`, so this ALSO exercises the pre-`modelName` persisted case:
+    // the label is the fallback and must still be what renders.
+    expect(screen.getByTestId('gm-ckpt-1-name')).toHaveTextContent('SD XL');
+    expect(screen.getByTestId('gm-ckpt-1-type')).toHaveTextContent('Checkpoint');
+    // 🔴 SCOPED TO THE META NODE, NOT `getByText` ACROSS THE AXIS — and the
+    // reason is a fixture collision worth naming: `ckpts[1]` has BOTH
+    // `label: 'Pony'` and `baseModel: 'Pony'`, so a bare text query for "Pony"
+    // matches the name line and the meta line and cannot tell which field
+    // travelled. (It threw "Found multiple elements", which is the query being
+    // honest; a `getAllByText` would have papered over it.)
+    expect(screen.getByTestId('gm-ckpt-1-meta')).toHaveTextContent('SDXL 1.0');
+    expect(screen.getByTestId('gm-ckpt-2-meta')).toHaveTextContent('Pony');
+    expect(screen.getByTestId('gm-ckpt-2-name')).toHaveTextContent('Pony');
+  });
+
+  it('a checkpoint card is the toggle: pressing a SELECTED one deselects rather than being disabled', async () => {
+    // 🔴 THE OPPOSITE WIRING FROM THE BROWSE GRID, and asserted here because the
+    // two are one line apart in review and only one of them is right. The browse
+    // grid is add-only, so an added tile IS disabled. This axis is the toggle,
+    // so a selected card must stay focusable and must still fire — disabling it
+    // would strand a keyboard user with no way to remove a chosen model.
+    const props = buildProps(); // selectedCkpts = {1}
+    render(<BuildPanel {...props} />);
+    const hit = screen.getByTestId('gm-ckpt-1-hit');
+    expect(hit).toHaveAttribute('aria-pressed', 'true');
+    expect(hit).not.toBeDisabled();
+    await userEvent.click(hit);
+    expect(props.toggleCkpt).toHaveBeenCalledWith(1);
+  });
+
+  it('splits the column axis: prompt styles stay pills, resource LoRAs become cards', () => {
+    const richLora: ModifierOption = {
+      key: 'lora-rich',
+      label: 'Detail Tweaker — v1.0',
+      promptSuffix: '',
+      loraVersionId: 135867,
+      loraModelId: 122359,
+      modelName: 'Detail Tweaker',
+      versionName: 'v1.0',
+      baseModelFamily: 'SDXL 1.0',
+      loraStrength: 1,
+    };
+    render(<BuildPanel {...buildProps({ modifiers: [baseline, cine, richLora] })} />);
+
+    // The prompt styles are pills, in the style row.
+    const styles = screen.getByTestId('gm-style-axis');
+    expect(within(styles).getByText('Baseline')).toBeInTheDocument();
+    expect(within(styles).getByText('Cinematic')).toBeInTheDocument();
+
+    // The LoRA is a card, in its own labelled group, with the split names.
+    const loras = screen.getByTestId('gm-lora-axis');
+    expect(loras).toHaveAccessibleName('LoRA columns');
+    expect(screen.getByTestId('gm-lora-col-lora-rich-name')).toHaveTextContent('Detail Tweaker');
+    expect(screen.getByTestId('gm-lora-col-lora-rich-type')).toHaveTextContent('LoRA');
+    expect(within(loras).getByText('v1.0')).toBeInTheDocument();
+
+    // 🔴 AND EACH IS IN EXACTLY ONE GROUP. Asserting only "the LoRA is a card"
+    // would pass a partition that renders it in BOTH — two controls for one
+    // column, whose selected states then disagree on screen.
+    expect(within(styles).queryByText(/Detail Tweaker/)).toBeNull();
+    expect(within(loras).queryByText('Cinematic')).toBeNull();
+  });
+
+  // 🔴 THE FALLBACK ARM, and it is the one a mutation is most likely to break
+  // silently. `lora` (the shared fixture) has a `loraVersionId` and NO
+  // `loraModelId` — the shape a build before this change persisted. It has no
+  // renderable resource, so it must keep its PILL rather than render a card
+  // whose name, type and base are half-empty.
+  it('a LoRA column with no resolvable resource keeps its pill instead of a half-filled card', () => {
+    render(<BuildPanel {...buildProps({ modifiers: [baseline, lora] })} />);
+    expect(within(screen.getByTestId('gm-style-axis')).getByText('LoRA One')).toBeInTheDocument();
+    // No card group at all — there is nothing to put in it.
+    expect(screen.queryByTestId('gm-lora-axis')).toBeNull();
+    expect(screen.queryByTestId('gm-lora-col-lora-1')).toBeNull();
+  });
+
+  it('renders no LoRA group when every column is a prompt style', () => {
+    render(<BuildPanel {...buildProps({ modifiers: [baseline, cine] })} />);
+    expect(screen.queryByTestId('gm-lora-axis')).toBeNull();
+    expect(screen.getByTestId('gm-style-axis')).toBeInTheDocument();
+  });
+
   it('HEADLINES the "≈" estimate and demotes the ceiling to a "safety max" hint (I3)', () => {
     // matrixTotalLabel([], 8) → a real "≈" estimate (non-ceiling) with a ceilingAmount.
     render(<BuildPanel {...buildProps({ previewLabel: matrixTotalLabel([], 8) })} />);

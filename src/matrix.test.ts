@@ -9,7 +9,9 @@ import {
   MODIFIERS,
   PICKED_LORA_DEFAULT_STRENGTH,
   checkpointFromPick,
+  checkpointResource,
   loraModifierFromPick,
+  loraResource,
   pickedCheckpointLabel,
   pickedLoraLabel,
 } from './models.js';
@@ -126,20 +128,74 @@ describe('curated model set', () => {
     const keys = new Set(MODIFIERS.map((m) => m.key));
     expect(keys.size).toBe(MODIFIERS.length);
   });
-  it('the sample LoRA is attempted on EVERY checkpoint (no client pre-block) and emits additionalResources', () => {
-    const lora = MODIFIERS.find((m) => m.loraVersionId != null)!;
-    expect(lora.loraVersionId).toBe(407532);
+  // 🔴 REPOINTED, NOT DELETED, AND THE FIXTURE MOVED FOR A REASON. This used to
+  // read its LoRA out of `MODIFIERS` (`.find(m => m.loraVersionId != null)`) and
+  // assert `407532`. That seed column has been removed — the resource is not in
+  // the anon catalog (see the comment in `models.ts`) — so the `find` now
+  // returns `undefined` and the `!` turns a real behavioural claim into a
+  // TypeError.
+  //
+  // The CLAIM was never about the curated table: it is that a LoRA column emits
+  // `additionalResources` and is attempted on every checkpoint with no
+  // client-side pre-block. That is `buildCellBody`/`buildMatrix` behaviour and
+  // is still true, so it keeps its coverage from a local fixture. Sourcing it
+  // from the shipped table was the coupling that made a data change look like a
+  // logic failure.
+  it('a LoRA column is attempted on EVERY checkpoint (no client pre-block) and emits additionalResources', () => {
+    const lora: ModifierOption = {
+      key: 'lora-fixture',
+      label: 'Some LoRA',
+      promptSuffix: '',
+      // 🔴 Deliberately NOT a version id this app ships, so the test cannot
+      // start passing or failing because the curated table changed again.
+      loraVersionId: 555001,
+      loraStrength: 0.7,
+      baseModelFamily: 'SDXL 1.0',
+    };
     expect(lora.loraStrength).toBeGreaterThanOrEqual(-1);
     expect(lora.loraStrength).toBeLessThanOrEqual(2);
     // It emits an additionalResources entry on any checkpoint.
     const body = buildCellBody(CHECKPOINTS[0], 'a cat', lora);
-    expect(body.additionalResources).toEqual([
-      { modelVersionId: 407532, strength: lora.loraStrength },
-    ]);
+    expect(body.additionalResources).toEqual([{ modelVersionId: 555001, strength: 0.7 }]);
     // Built into a matrix against ALL curated checkpoints, every cell starts
     // `idle` (none pre-blocked client-side — the server decides compatibility).
     const cells = buildMatrix('a cat', CHECKPOINTS, [lora]);
     expect(cells.every((cell) => cell.status === 'idle')).toBe(true);
+    expect(cells.length).toBe(CHECKPOINTS.length);
+  });
+
+  // 🔴 THE GUARD THE DEAD SEED EARNED. The removed column was a resource this
+  // app SHIPPED SELECTED-able whose model version had silently disappeared from
+  // the catalog, so every cell in it was server-rejected. Nothing could catch
+  // that, because a curated LoRA needed only a `loraVersionId` — a bare number
+  // nobody had to look up.
+  //
+  // This does NOT ban a curated LoRA, and banning one would be the wrong fix. It
+  // requires that a shipped one carry a RENDERABLE resource: `loraResource`
+  // returns non-null only with a `loraModelId` AND a `loraVersionId`, and the
+  // model id is a field you can only fill in by actually resolving the resource.
+  // The check that the seed was alive rides along with the work of naming it.
+  it('a curated LoRA column, if this app ever ships one again, carries a full resource', () => {
+    for (const m of MODIFIERS) {
+      if (m.loraVersionId == null) {
+        // A prompt style is not a resource and must not pretend to be one.
+        expect(loraResource(m)).toBeNull();
+        continue;
+      }
+      const resource = loraResource(m);
+      expect(resource, `curated LoRA "${m.key}" has no renderable resource`).not.toBeNull();
+      expect(resource!.modelType).toBe('LORA');
+      expect(resource!.modelName.trim()).not.toBe('');
+      expect(Number.isFinite(resource!.modelId)).toBe(true);
+    }
+  });
+
+  it('ships no LoRA column today — every curated column is a prompt style', () => {
+    // Not a policy, a STATE, and it is the state the removal created: the seed
+    // is gone and LoRA columns are user-supplied. If someone adds a live seed
+    // back, this line is the one that says so out loud, and the guard above is
+    // what makes sure they resolved it first.
+    expect(MODIFIERS.filter((m) => m.loraVersionId != null)).toEqual([]);
   });
 });
 
@@ -178,6 +234,100 @@ describe('picker → axis member', () => {
     // key is derived from versionId so re-picking the same LoRA DEDUPES.
     expect(mod.key).toBe('lora-picked-666002');
     expect(loraModifierFromPick(pickedSdxlLora).key).toBe(mod.key);
+  });
+
+  // ---------------------------------------------------------------------------
+  // The `ResourceCard` projections.
+  //
+  // 🔴 THESE EXIST BECAUSE A MUTANT SURVIVED. Replacing
+  // `ckpt.modelName?.trim() || ckpt.label` with a bare `ckpt.label` left the
+  // whole suite GREEN — every checkpoint fixture in `panels.test.tsx` has no
+  // `modelName`, so the two expressions could only ever produce the same string
+  // and no assertion could see the difference. That is the blind spot where a
+  // fixture cannot distinguish a value from the constant it falls back to; the
+  // control is mechanical — feed a `modelName` the `label` CANNOT equal and
+  // watch the output move.
+  // ---------------------------------------------------------------------------
+
+  it('checkpointResource PREFERS the split model name over the composed grid label', () => {
+    const withNames = checkpointResource({
+      versionId: 7,
+      modelId: 77,
+      // 🔴 label and modelName deliberately share NO substring, so a mutant that
+      // returns either one is unambiguous in the failure message.
+      label: 'Short Row Header',
+      baseModel: 'SDXL 1.0',
+      modelName: 'Full Public Model Name',
+      versionName: 'v4.2',
+    });
+    expect(withNames.modelName).toBe('Full Public Model Name');
+    expect(withNames.versionName).toBe('v4.2');
+    expect(withNames.modelType).toBe('Checkpoint');
+    expect(withNames.baseModel).toBe('SDXL 1.0');
+  });
+
+  it('checkpointResource falls back to the label for state persisted before the names existed', () => {
+    const legacy = checkpointResource({
+      versionId: 7,
+      modelId: 77,
+      label: 'Short Row Header',
+      baseModel: 'SDXL 1.0',
+    });
+    expect(legacy.modelName).toBe('Short Row Header');
+    // Absent, not the string "undefined" — an empty version renders as nothing.
+    expect(legacy.versionName).toBe('');
+  });
+
+  it('checkpointResource treats a whitespace-only model name as absent', () => {
+    // A name of '   ' would render as a blank line, which is indistinguishable
+    // from a broken card — the exact case `resourceDisplayName` guards upstream.
+    const blank = checkpointResource({
+      versionId: 7,
+      modelId: 77,
+      label: 'Short Row Header',
+      baseModel: 'SDXL 1.0',
+      modelName: '   ',
+    });
+    expect(blank.modelName).toBe('Short Row Header');
+  });
+
+  it('loraResource PREFERS the split model name, and needs BOTH ids to return one', () => {
+    const full = loraResource({
+      key: 'k',
+      label: 'Short Column Header',
+      promptSuffix: '',
+      loraVersionId: 9,
+      loraModelId: 99,
+      modelName: 'Full Public LoRA Name',
+      versionName: 'v1.1',
+      baseModelFamily: 'Pony',
+    })!;
+    expect(full.modelName).toBe('Full Public LoRA Name');
+    expect(full.versionName).toBe('v1.1');
+    expect(full.modelType).toBe('LORA');
+    expect(full.baseModel).toBe('Pony');
+    expect(full.modelId).toBe(99);
+    expect(full.versionId).toBe(9);
+
+    // Each id alone is not enough — and the two arms are asserted SEPARATELY,
+    // because one missing id can otherwise die to the other's check.
+    expect(loraResource({ key: 'k', label: 'L', promptSuffix: '', loraVersionId: 9 })).toBeNull();
+    expect(loraResource({ key: 'k', label: 'L', promptSuffix: '', loraModelId: 99 })).toBeNull();
+    // A prompt style is not a resource at all.
+    expect(loraResource({ key: 'k', label: 'L', promptSuffix: 'cinematic' })).toBeNull();
+  });
+
+  it('loraResource falls back to the label when only the composed name was persisted', () => {
+    const legacy = loraResource({
+      key: 'k',
+      label: 'Detail Tweaker — v1.0',
+      promptSuffix: '',
+      loraVersionId: 9,
+      loraModelId: 99,
+    })!;
+    expect(legacy.modelName).toBe('Detail Tweaker — v1.0');
+    expect(legacy.versionName).toBe('');
+    expect(legacy.baseModel).toBe('');
   });
 
   it('a picker-added LoRA builds the right additionalResources on the checkpoint', () => {

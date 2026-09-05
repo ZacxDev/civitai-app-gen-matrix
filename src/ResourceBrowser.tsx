@@ -13,13 +13,14 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
+import { Badge, ResourceCard } from '@civitai/blocks-react/ui';
 import { SegmentedControl } from '@civitai/components-react';
 
 import {
   DEFAULT_LIMIT,
-  THUMB_WIDTH,
   cardToCheckpoint,
   cardToLoraModifier,
+  cardToPicked,
   fetchCatalog,
   type CatalogCard,
   type CatalogQuery,
@@ -374,7 +375,6 @@ export function ResourceBrowser(props: ResourceBrowserProps) {
               {state.cards.map((card) => (
                 <CardTile
                   key={card.versionId}
-                  c={c}
                   card={card}
                   added={selectedVersionIds.has(card.versionId)}
                   onAdd={() => addCard(card)}
@@ -528,45 +528,78 @@ function EcosystemMultiselect({
   );
 }
 
+/**
+ * One browse-grid tile — now the SHARED `ResourceCard` from
+ * `@civitai/blocks-react/ui` rather than this app's own markup.
+ *
+ * 🔴 WHAT THE SWAP BUYS, beyond "one less local component". Each of these was a
+ * thing this tile got WRONG or omitted, and each is now frozen in the shared
+ * component so three apps cannot disagree about it:
+ *   - The **model type** was never shown at all. A LoRA and a checkpoint tile
+ *     were visually identical, in a grid you open from two different buttons.
+ *     `ResourceCard` renders a type badge (and maps LyCORIS/LoCon/DoRA onto
+ *     "LoRA" rather than showing three near-synonyms).
+ *   - The **version name** was only in the `title` attribute, which is invisible
+ *     to touch and to keyboard users.
+ *   - An **absent name** rendered as an empty line. `resourceDisplayName` falls
+ *     back to `#<versionId>` — still wrong-looking, but identifiable.
+ *   - A **thumbnail URL that 404s** rendered an empty grey square here (only a
+ *     MISSING url got the "no preview" copy). The shared card's `onError` sends
+ *     a dead URL to the same placeholder. gen-matrix is the one consumer that
+ *     supplies thumbnails, from a live catalog fetch, so it is the likeliest to
+ *     hit this.
+ *   - **Selection was carried by border colour alone** (plus `aria-pressed`).
+ *     The shared card adds a non-colour ✓ mark, which is WCAG 1.4.1.
+ *
+ * 🔴 `disabled={added}` is KEPT, deliberately, against the shared component's
+ * own advice not to wire `disabled` to the same expression as `selected`. That
+ * advice is about a PICKER, where re-pressing a selected card deselects it.
+ * This browser is ADD-ONLY: `addCard` returns early for a version already on the
+ * axis and there is no remove-from-here path, so an added tile genuinely has no
+ * action. Leaving it focusable would make `aria-pressed="true"` promise a toggle
+ * that does not exist. Removal lives on the axis chips in `App.tsx`.
+ *
+ * 🔴 The "Added" pill is `aria-hidden` because `aria-pressed` already announces
+ * the state, and it goes in `overlay` (a sibling of the hit button with
+ * `pointer-events: none`) rather than `actions` — it is status, not a control.
+ */
+// 🔴 NO `c: Palette` PROP, and its removal is the point rather than tidying: a
+// tile that still took the app palette would still be a tile the app themes by
+// hand, and the next app would theme it differently. `ResourceCard` reads
+// `--civitai-*` tokens, which the block already sets from the HOST's theme
+// (`bootTheme.ts` → `data-theme` on the app root), so the browse grid now
+// follows the host instead of this file's private colour table.
 export function CardTile({
-  c,
   card,
   added,
   onAdd,
 }: {
-  c: Palette;
   card: CatalogCard;
   added: boolean;
   onAdd: () => void;
 }) {
   return (
-    <button
-      type="button"
-      onClick={onAdd}
+    <ResourceCard
+      variant="card"
+      interactive
+      resource={cardToPicked(card)}
+      // `null` (no image on this model version) and `undefined` (the caller has
+      // no thumbnail at all) mean the same thing to the card, which takes the
+      // optional form.
+      thumbnailUrl={card.thumbnailUrl ?? undefined}
+      selected={added}
       disabled={added}
-      aria-pressed={added}
-      title={`${card.modelName}${card.versionName ? ` — ${card.versionName}` : ''} (${card.baseModel || 'unknown base'})`}
-      style={tile(c, added)}
-      className={added ? undefined : 'gm-chip'}
+      onSelect={onAdd}
+      overlay={added ? <Badge size="sm" aria-hidden="true">Added</Badge> : null}
+      // 🔴 NO `style` OVERRIDE. The old tile forced `display: grid` + its own
+      // border/background/opacity from the app palette; the shared card is
+      // `display: flex` off `--civitai-*` tokens and paints its own selected
+      // border and disabled opacity. Passing the local box back in would fight
+      // the layout it just adopted — which is what "adopting" is supposed to
+      // stop. `className` is dropped for the same reason: `gm-chip` is a
+      // hover/press transform tuned for a pill, not a tile.
       data-testid="gm-browse-card"
-    >
-      <div style={thumbWrap(c)}>
-        {card.thumbnailUrl ? (
-          <img
-            src={card.thumbnailUrl}
-            alt=""
-            loading="lazy"
-            width={THUMB_WIDTH}
-            style={{ width: '100%', height: '100%', objectFit: 'cover', display: 'block' }}
-          />
-        ) : (
-          <span style={{ color: c.muted, fontSize: 11 }}>no preview</span>
-        )}
-        {added && <span style={addedBadge(c)}>Added</span>}
-      </div>
-      <span style={tileName(c)}>{card.modelName}</span>
-      <span style={{ fontSize: 10, color: c.muted }}>{card.baseModel || '—'}</span>
-    </button>
+    />
   );
 }
 
@@ -720,29 +753,13 @@ function thumbWrap(c: Palette): React.CSSProperties {
     placeItems: 'center',
   };
 }
-function addedBadge(c: Palette): React.CSSProperties {
-  return {
-    position: 'absolute',
-    top: 4,
-    right: 4,
-    background: c.accent,
-    color: c.accentFg,
-    fontSize: 10,
-    fontWeight: 700,
-    borderRadius: 4,
-    padding: '2px 6px',
-  };
-}
-function tileName(c: Palette): React.CSSProperties {
-  return {
-    fontSize: 12,
-    fontWeight: 600,
-    color: c.fg,
-    overflow: 'hidden',
-    textOverflow: 'ellipsis',
-    whiteSpace: 'nowrap',
-  };
-}
+// `addedBadge` and `tileName` were the old tile's "Added" pill and truncating
+// name line. Both now come from `ResourceCard` (the `overlay` slot positions the
+// pill from the card root; the name line truncates via the pack's own
+// `min-width: 0` rule), so the local copies are gone rather than left to rot.
+// `tile`/`thumbWrap` SURVIVE because `SkeletonGrid` still draws the loading
+// placeholders with them, and a skeleton is deliberately not a ResourceCard —
+// it has no resource.
 function footerRow(c: Palette): React.CSSProperties {
   return { borderTop: `1px solid ${c.border}`, paddingTop: 10 };
 }
