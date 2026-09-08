@@ -37,6 +37,13 @@ import { describe, expect, it } from 'vitest';
  *          asserted equal here. This is the assertion that actually compares
  *          two values; the node ones assert a structure.
  *
+ *   package manager — THREE places name one, and the third is the one CI can
+ *          never speak for. `block.manifest.json`'s `buildCommand` is run by
+ *          the PLATFORM's builder, on a bundle that does not contain
+ *          `.github/` at all, so a green merge gate says exactly nothing about
+ *          it. The last assertion below derives CI's manager from the workflow
+ *          and the builder's from `buildCommand`, and asserts they agree.
+ *
  * Read off disk rather than imported, for the same reason
  * `version-lockstep.test.ts` does it: `tsconfig.json` scopes `include` to
  * `src` and does not set `resolveJsonModule`, and `import.meta.url` makes the
@@ -141,5 +148,30 @@ describe('toolchain lockstep', () => {
     // would rot on a routine `nix flake update` and turn main red for nothing —
     // a permanently-red gate teaches everyone to merge through it.
     expect(ciPin).toBe(flakePin[1]);
+  });
+
+  it('keeps the platform builder on the same package manager as CI', () => {
+    // `buildCommand` is what the PLATFORM's builder runs, and CI green is not
+    // evidence about it: `.github/` is not in the submitted bundle, so the
+    // merge gate never executes this string once. A mismatch hands the builder
+    // a tree its package manager cannot install — an npm builder facing a
+    // pnpm-only lockfile, or the reverse — and the first anyone hears of it is
+    // a failed publish. Not hypothetical: `generate-from-model` shipped exactly
+    // that state, and `civitai app validate` was what caught it.
+    const manifest = JSON.parse(repoFile('../block.manifest.json')) as { buildCommand?: unknown };
+    if (typeof manifest.buildCommand !== 'string' || manifest.buildCommand.trim() === '') {
+      throw new Error('block.manifest.json has no string "buildCommand" to read a package manager from');
+    }
+    const builderManager = manifest.buildCommand.trim().split(/\s+/)[0];
+
+    // DERIVED from the workflow, never restated. Hardcoding `'pnpm'` on this
+    // side would make the assertion's own name false: CI could move to npm and
+    // this would stay green while the two disagreed, which is the exact split
+    // it exists to catch. `pnpm/action-setup` is the only thing that puts pnpm
+    // on the runner's PATH, so its presence is what makes CI a pnpm job and its
+    // absence leaves the npm that `actions/setup-node` ships.
+    const ciManager = /^\s*-\s+uses:\s*pnpm\/action-setup@/m.test(workflow) ? 'pnpm' : 'npm';
+
+    expect(builderManager).toBe(ciManager);
   });
 });
