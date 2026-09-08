@@ -95,6 +95,47 @@ function settingsIn(block: string[]): Array<[string, string]> {
     .map((m) => [m[1], m[2]] as [string, string]);
 }
 
+/**
+ * The package manager CI actually INVOKES, read out of the workflow's commands.
+ *
+ * Not the presence of a `pnpm/action-setup` step: that says only what is
+ * INSTALLED on the runner, and a workflow can install pnpm and then run npm.
+ * Measured, on this repo: with the setup step left in place and the three
+ * `run:` lines switched to `npm ci` / `npm test` / `npm run build`, the
+ * step-presence version of this check reported "pnpm" and the whole suite
+ * stayed green — from a CI job that never touches pnpm.
+ *
+ * Comments are stripped first so a line of prose mentioning `npm ci` is not
+ * mistaken for a step. Two or more distinct managers is not a package manager
+ * the builder can match, so it throws rather than picking one.
+ */
+function ciPackageManager(workflow: string): string {
+  const active = workflow.replace(/(^|\s)#.*$/gm, '$1');
+
+  const invoked = new Set(
+    [...active.matchAll(/\b(npm|pnpm|yarn|bun)\s+(?:install|ci|run|test|build|exec)\b/g)].map(
+      (m) => m[1],
+    ),
+  );
+
+  if (invoked.size === 0) {
+    // Same rule as every other extractor here: an absent answer is thrown, not
+    // invented. Reporting a default would let a workflow that runs no build at
+    // all compare equal to a manifest that does.
+    throw new Error(
+      'ci.yml invokes no npm/pnpm/yarn/bun command — there is no CI package manager to compare against',
+    );
+  }
+  if (invoked.size > 1) {
+    throw new Error(
+      `ci.yml invokes more than one package manager (${[...invoked].sort().join(', ')}) — ` +
+        'the platform builder runs exactly one, so it cannot match all of them',
+    );
+  }
+
+  return [...invoked][0];
+}
+
 describe('toolchain lockstep', () => {
   const workflow = repoFile('../.github/workflows/ci.yml');
   const flake = repoFile('../flake.nix');
@@ -164,13 +205,18 @@ describe('toolchain lockstep', () => {
     }
     const builderManager = manifest.buildCommand.trim().split(/\s+/)[0];
 
-    // DERIVED from the workflow, never restated. Hardcoding `'pnpm'` on this
-    // side would make the assertion's own name false: CI could move to npm and
-    // this would stay green while the two disagreed, which is the exact split
-    // it exists to catch. `pnpm/action-setup` is the only thing that puts pnpm
-    // on the runner's PATH, so its presence is what makes CI a pnpm job and its
-    // absence leaves the npm that `actions/setup-node` ships.
-    const ciManager = /^\s*-\s+uses:\s*pnpm\/action-setup@/m.test(workflow) ? 'pnpm' : 'npm';
+    // DERIVED from the workflow, never restated — and derived from what CI
+    // RUNS, not from what it installs.
+    //
+    // An earlier version of this assertion keyed off the presence of a
+    // `pnpm/action-setup` step. That was measurably wrong: leaving the step in
+    // place as decoration while every `run:` reverts to npm produced a fully
+    // GREEN suite from a workflow that installs pnpm and then never uses it —
+    // the exact split this assertion is named for, reported as agreement. A
+    // guard that reads as coverage while providing none is worse than none, so
+    // the question asked here is "which package manager does CI invoke", which
+    // is the one the builder has to match.
+    const ciManager = ciPackageManager(workflow);
 
     expect(builderManager).toBe(ciManager);
   });
