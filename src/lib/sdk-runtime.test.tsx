@@ -122,9 +122,22 @@ function fakeTransport(initial: FakeSnapshot = baseSnapshot()) {
   };
 }
 
-/** A fetch that records every call and answers each route from a table. */
+/**
+ * A fetch that records every call and answers each route from a table.
+ *
+ * `signal` is recorded because it is the ONLY observable for the request deadline:
+ * the SDK's `createHttp` forwards `opts.signal` straight into `fetch` and nothing
+ * else about a bound reaches the wire, so a call that carries none is
+ * indistinguishable from a bounded one except right here.
+ */
 function fakeFetch(routes: Record<string, unknown>, status = 200) {
-  const calls: Array<{ url: string; method: string; body: unknown; auth: string | null }> = [];
+  const calls: Array<{
+    url: string;
+    method: string;
+    body: unknown;
+    auth: string | null;
+    signal: AbortSignal | null | undefined;
+  }> = [];
   const impl = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = String(input);
     const headers = new Headers(init?.headers);
@@ -133,6 +146,7 @@ function fakeFetch(routes: Record<string, unknown>, status = 200) {
       method: init?.method ?? 'GET',
       body: init?.body == null ? null : JSON.parse(String(init.body)),
       auth: headers.get('Authorization'),
+      signal: init?.signal,
     });
     const key = Object.keys(routes).find((route) => url.includes(route));
     const payload = key === undefined ? { error: `no fake route for ${url}` } : routes[key];
@@ -1001,7 +1015,20 @@ describe('group 3: app storage and the gated read', () => {
     expect(call.url).toContain('ids=9001%2C9002');
   });
 
-  it('useGatedImages returns an empty array when the reply carries no images', async () => {
+  /**
+   * 🔴 A MALFORMED 200 MUST THROW, NEVER ANSWER "no rows" — AND THIS TEST USED TO
+   * PIN THE OPPOSITE. It asserted `resolves.toEqual([])` for a reply carrying no
+   * `images` key, which made a guard read as coverage while licensing the wrong
+   * answer: an empty map makes `resolveEntryImages` report `allGone`, and
+   * `GalleryPanel` then renders `gm-gallery-all-gone` — *"The images in this matrix
+   * are no longer available."* That sentence is FALSE for a reply the app failed to
+   * understand, and the honest state (`gm-gallery-images-error`) is already wired to
+   * `App.tsx`'s own `.catch()` on this very call.
+   *
+   * Watched to FAIL against the `?? []` this replaced: the old code resolves `[]`
+   * and a rejects-assertion goes red with "promise resolved ... instead of rejecting".
+   */
+  it('useGatedImages THROWS on a malformed 200 rather than reporting "no images"', async () => {
     const t = fakeTransport();
     const f = fakeFetch({ 'blocks/gated-images': {} });
     configureSdkRuntime({ transport: t.transport as never, fetch: f.impl });
@@ -1013,10 +1040,248 @@ describe('group 3: app storage and the gated read', () => {
     }
     render(<G />);
 
-    // A REFUSAL rejects (HTTP), so reaching here means the read succeeded and the
-    // app genuinely may see none of them — `indexGatedImages` then produces an
-    // empty map and every cell renders `gone`, which is the honest answer.
+    // The MESSAGE is asserted, not merely "it rejected": `App.tsx` funnels every
+    // rejection from this call into one `{ kind: 'error' }`, so the message is the
+    // only thing that tells a reader which failure they are looking at.
+    await expect(getImages!([1])).rejects.toThrow(/malformed response \(no `images` array\)/);
+  });
+
+  /**
+   * The other half, and what stops the fix above from being over-wide: a reply that
+   * genuinely carries an EMPTY array still RESOLVES. Misses are reported by omission
+   * on this route, so `{ images: [] }` means "none of those ids are visible to you",
+   * which the per-cell `gone` state reflects honestly. A fix that threw on emptiness
+   * too would turn a legitimate answer into an error, and this is the case that
+   * fails if anyone widens it that way.
+   */
+  it('useGatedImages resolves an explicitly EMPTY images array as an answer', async () => {
+    const t = fakeTransport();
+    const f = fakeFetch({ 'blocks/gated-images': { images: [] } });
+    configureSdkRuntime({ transport: t.transport as never, fetch: f.impl });
+
+    let getImages: ((ids: number[]) => Promise<unknown[]>) | null = null;
+    function G() {
+      getImages = useGatedImages().getImages as typeof getImages;
+      return null;
+    }
+    render(<G />);
+
     await expect(getImages!([1])).resolves.toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// the money path's request deadline
+// ---------------------------------------------------------------------------
+
+describe('group 3: the money path carries a request deadline', () => {
+  /** The bridge's `WORKFLOW_REQUEST_TIMEOUT_MS`, restated rather than imported. */
+  const EXPECTED_MS = 120_000;
+
+  function mountWorkflow() {
+    let fns: ReturnType<typeof useBuzzWorkflow> | null = null;
+    function W() {
+      fns = useBuzzWorkflow();
+      return null;
+    }
+    render(<W />);
+    return () => fns!;
+  }
+
+  /**
+   * 🔴 THE FOUR MONEY-PATH CALLS MUST CARRY A DEADLINE, AND POLL IS THE ONE THAT
+   * TURNS ITS ABSENCE INTO A PERMANENT STALL. The bridge gave estimate / submit /
+   * poll / cancel an explicit `WORKFLOW_REQUEST_TIMEOUT_MS` (120s); the SDK's
+   * `createHttp` forwards only `opts.signal`, so a call passing none has no deadline
+   * at all. `runPollLoop` advances `attempt` and reaches `giveUp()`
+   * (`CELL_TIMEDOUT`) ONLY from its `catch`, so a request that never settles never
+   * rejects, never re-ticks, and leaves the cell on `polling` forever with the app's
+   * own bounded-poll guard silently disabled.
+   *
+   * 🔴 THE NUMBER IS ASSERTED, NOT JUST "A SIGNAL EXISTS". `AbortSignal` does not
+   * expose its own deadline, so the spy on `AbortSignal.timeout` is the only place
+   * the 120_000 is observable — and a test that merely checked `signal != null`
+   * would pass on any wrong bound, which is the defect's own shape one level over.
+   * Both halves are asserted: the DURATION here, and the WIRING (that the signal
+   * actually reaches `fetch` and is honoured) in the case below.
+   *
+   * Watched to FAIL on `30f30b0`: with no `workflowRequestOpts()` in the call the
+   * spy records nothing and `signal` arrives `undefined` — red on both assertions
+   * for all four routes.
+   */
+  const OPS: ReadonlyArray<[string, string, (w: ReturnType<typeof useBuzzWorkflow>) => Promise<unknown>]> =
+    [
+      ['estimate', 'blocks/workflows/estimate', (w) => w.estimate({} as never)],
+      ['submit', 'blocks/workflows/submit', (w) => w.submit({} as never)],
+      ['poll', 'blocks/workflows/poll', (w) => w.poll('wf-1')],
+      ['cancel', 'blocks/workflows/cancel', (w) => w.cancel('wf-1')],
+    ];
+
+  it.each(OPS)('%s passes AbortSignal.timeout(120_000) through to fetch', async (_name, route, call) => {
+    const spy = vi.spyOn(AbortSignal, 'timeout');
+    const t = fakeTransport();
+    const f = fakeFetch({ [route]: { snapshot: { status: 'succeeded', cost: { total: 3 } } } });
+    configureSdkRuntime({ transport: t.transport as never, fetch: f.impl });
+
+    const w = mountWorkflow();
+    await call(w());
+
+    const made = f.calls.find((c) => c.url.includes(route))!;
+    expect(made).toBeDefined();
+    expect(made.signal).toBeInstanceOf(AbortSignal);
+    expect(spy.mock.calls.map(([ms]) => ms)).toContain(EXPECTED_MS);
+  });
+
+  /**
+   * 🔴 THE WIRING HALF — the positive control for the case above, and the one that
+   * proves the signal is not merely constructed but OBSERVED. `AbortSignal.timeout`
+   * is stubbed to a 10ms deadline (so the assertion fits a test budget) against a
+   * fetch that honours the signal and otherwise never settles. `poll` must reject;
+   * under the unbounded call it hangs and this times out.
+   *
+   * The stub is what makes this fast, so the DURATION claim deliberately does not
+   * live here — it lives in the case above, which does not stub the value.
+   */
+  it('a hung poll REJECTS because the deadline signal reaches fetch', async () => {
+    vi.spyOn(AbortSignal, 'timeout').mockImplementation(() => {
+      const ac = new AbortController();
+      setTimeout(() => ac.abort(new Error('deadline (stubbed short)')), 10);
+      return ac.signal;
+    });
+    const t = fakeTransport();
+    // A fetch that NEVER answers, but does honour a signal — i.e. a wedged
+    // orchestrator round-trip, which is precisely the case with no observable.
+    const hanging = vi.fn(
+      (_input: RequestInfo | URL, init?: RequestInit) =>
+        new Promise<Response>((_resolve, reject) => {
+          init?.signal?.addEventListener('abort', () => reject(init.signal!.reason), { once: true });
+        }),
+    ) as unknown as typeof globalThis.fetch;
+    configureSdkRuntime({ transport: t.transport as never, fetch: hanging });
+
+    const w = mountWorkflow();
+
+    await expect(w().poll('wf-1')).rejects.toThrow(/deadline \(stubbed short\)/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// where the REST calls are AIMED
+// ---------------------------------------------------------------------------
+
+describe('the site base URL is derived from the validated host origin', () => {
+  const PREVIEW = 'https://pr-42.civitaic.com';
+
+  /**
+   * 🔴 EVERY REST CALL USED TO BE HARDCODED TO PRODUCTION, WHICH BREAKS THIS REPO'S
+   * OWN DOCUMENTED PREVIEW FLOW. `@civitai/sdk`'s fallback is the ABSOLUTE
+   * `DEFAULT_SITE_URL = 'https://civitai.com/api/v1'`, and nothing read
+   * `snapshot.hostOrigin` — so a block rendered inside the preview page host
+   * `.env.production` tells the operator to allow (`https://pr-<N>.civitaic.com`)
+   * would talk to PRODUCTION. On the bridge every data call went to whichever host
+   * was the parent.
+   *
+   * `hostOrigin` is the right source and the safe one: the bridge sets it once from
+   * the `event.origin` of the first `BLOCK_INIT` that cleared the allowlist gate,
+   * and `@civitai/blocks-react`'s `useHostOrigin` documents it as *"the validated
+   * host (parent) origin the block may safely direct-fetch the civitai App Blocks
+   * HTTP API against"*.
+   *
+   * Watched to FAIL on `30f30b0`: the URL comes back
+   * `https://civitai.com/api/v1/blocks/workflows/query`, so `toContain(PREVIEW)`
+   * goes red.
+   */
+  it('aims REST at the parent host, not at production', async () => {
+    const t = fakeTransport(baseSnapshot({ hostOrigin: PREVIEW }));
+    const f = fakeFetch({ 'blocks/workflows/query': { workflows: [], cursor: null } });
+    configureSdkRuntime({ transport: t.transport as never, fetch: f.impl });
+
+    function Q() {
+      useAppWorkflows();
+      return null;
+    }
+    render(<Q />);
+    await waitFor(() => expect(f.calls.length).toBeGreaterThan(0));
+
+    expect(f.calls[0]!.url).toBe(`${PREVIEW}/api/v1/blocks/workflows/query`);
+    // Spelled as a negative too, because production is the plausible wrong answer
+    // and it answers 200 — a preview run would spend real Buzz against the real
+    // gallery rather than failing visibly.
+    expect(f.calls[0]!.url).not.toContain('civitai.com/api/v1');
+  });
+
+  /**
+   * 🔴 THE ORDERING CASE, AND THE ONE A SYNCHRONOUS READ GETS WRONG WHILE LOOKING
+   * FIXED. `initialize`'s `siteUrl` is captured at CALL time, and `app()`'s first
+   * caller is `useAppWorkflows`'s mount effect — which runs BEFORE `BLOCK_INIT`
+   * lands, because `BlockGate` renders children immediately when embedded. So a
+   * plain `snapshot.get().hostOrigin` read here would find `null` on essentially
+   * every production boot and fall back to the SDK default, leaving the defect
+   * entirely in place. This mounts with NO host origin and supplies it afterwards.
+   *
+   * Watched to FAIL against a synchronous read (`siteUrlFromHostOrigin(t.snapshot.
+   * get().hostOrigin)` with no wait): the call goes to `civitai.com` and this is red.
+   */
+  it('WAITS for a host origin that arrives after mount', async () => {
+    const t = fakeTransport(baseSnapshot({ ready: false, hostOrigin: null }));
+    const f = fakeFetch({ 'blocks/workflows/query': { workflows: [], cursor: null } });
+    configureSdkRuntime({ transport: t.transport as never, fetch: f.impl });
+
+    function Q() {
+      useAppWorkflows();
+      return null;
+    }
+    render(<Q />);
+
+    // Nothing may have gone out yet — the runtime has no destination to aim at.
+    expect(f.calls.length).toBe(0);
+
+    act(() => t.set(baseSnapshot({ hostOrigin: PREVIEW })));
+    await waitFor(() => expect(f.calls.length).toBeGreaterThan(0));
+
+    expect(f.calls[0]!.url).toBe(`${PREVIEW}/api/v1/blocks/workflows/query`);
+  });
+
+  /**
+   * The termination case. A snapshot that reports `ready` and carries NO host origin
+   * will never gain one — the bridge sets `parentOrigin` and the ready snapshot in
+   * the same `BLOCK_INIT` branch and emits once — so the runtime must stop waiting
+   * and let the SDK's own default stand rather than stall for its whole timeout.
+   * Without this rule every test fake and the inline transport would block for 10s.
+   */
+  it('does not wait once ready is true with no host origin', async () => {
+    const t = fakeTransport(baseSnapshot({ hostOrigin: null }));
+    const f = fakeFetch({ 'blocks/workflows/query': { workflows: [], cursor: null } });
+    configureSdkRuntime({ transport: t.transport as never, fetch: f.impl });
+
+    function Q() {
+      useAppWorkflows();
+      return null;
+    }
+    render(<Q />);
+    await waitFor(() => expect(f.calls.length).toBeGreaterThan(0));
+
+    expect(f.calls[0]!.url).toBe('https://civitai.com/api/v1/blocks/workflows/query');
+  });
+
+  /** An explicit override still wins — the dev harness depends on it. */
+  it('an explicit siteUrl override beats the derived one', async () => {
+    const t = fakeTransport(baseSnapshot({ hostOrigin: PREVIEW }));
+    const f = fakeFetch({ 'blocks/workflows/query': { workflows: [], cursor: null } });
+    configureSdkRuntime({
+      transport: t.transport as never,
+      fetch: f.impl,
+      siteUrl: 'http://localhost:5187/api/v1',
+    });
+
+    function Q() {
+      useAppWorkflows();
+      return null;
+    }
+    render(<Q />);
+    await waitFor(() => expect(f.calls.length).toBeGreaterThan(0));
+
+    expect(f.calls[0]!.url).toBe('http://localhost:5187/api/v1/blocks/workflows/query');
   });
 });
 
@@ -1127,4 +1392,80 @@ describe('configureSdkRuntime', () => {
     await new Promise((r) => setTimeout(r, 20));
     expect(f.calls.length).toBe(0);
   });
+
+  /**
+   * 🔴 A REJECTED `initialize()` MUST NOT POISON THE PAGE FOR ITS WHOLE LIFE. The
+   * runtime cached the AppClient with `appPromise ??= initialize({...})`, and `??=`
+   * assigns only when the left side is nullish — so a promise that SETTLED REJECTED
+   * is never reassigned. `initialize` awaits `ready(transport, 10_000)` and rejects
+   * on timeout, and its first caller is `useAppWorkflows`'s mount effect, which is
+   * not gated on `ready` and starts that clock before `BLOCK_INIT` has landed. One
+   * slow host handshake therefore killed app storage, the gallery AND the money path
+   * for the rest of the page, with nothing retrying because every caller awaited the
+   * same dead promise.
+   *
+   * ⚠ HOW THE REJECTION IS PRODUCED HERE, STATED PLAINLY: a transport whose
+   * `snapshot.get()` throws, which makes `ready()` throw on its very first line
+   * inside `initialize` and gives a REAL rejected `initialize()` with no 10-second
+   * wait and no dangling timer. `siteUrl` is supplied so the base-URL derivation
+   * does not read the snapshot first and pre-empt it. The predicate under test — is
+   * a rejected `app()` cached forever — is the same one either way, and the `retry`
+   * below is the observable that separates the two implementations.
+   *
+   * Watched to FAIL on `30f30b0` (`appPromise ??= …`): the retry re-awaits the same
+   * rejected promise, `cursor` never leaves 'none', and the final `waitFor` times
+   * out.
+   */
+  it('does NOT cache a rejected initialize() — a later call retries', async () => {
+    const inner = fakeTransport();
+    let broken = true;
+    const brittle = {
+      ...inner.transport,
+      snapshot: {
+        get: () => {
+          if (broken) throw new Error('BLOCK_INIT never landed');
+          return inner.transport.snapshot.get();
+        },
+        subscribe: inner.transport.snapshot.subscribe,
+      },
+    };
+    const f = fakeFetch({ 'blocks/workflows/query': { workflows: [], cursor: 'landed' } });
+    configureSdkRuntime({
+      transport: brittle as never,
+      fetch: f.impl,
+      siteUrl: 'https://civitai.com/api/v1',
+    });
+
+    function Q() {
+      const { cursor, error, refetch } = useAppWorkflows();
+      return (
+        <div>
+          <span data-testid="c">{cursor ?? 'none'}</span>
+          <span data-testid="e">{error ? 'err' : 'ok'}</span>
+          <button type="button" data-testid="retry" onClick={refetch}>
+            retry
+          </button>
+        </div>
+      );
+    }
+    render(<Q />);
+
+    // The first attempt fails, and nothing reached the wire.
+    await waitFor(() => expect(screen.getByTestId('e').textContent).toBe('err'));
+    expect(f.calls.length).toBe(0);
+
+    broken = false;
+    act(() => screen.getByTestId('retry').click());
+
+    // Only reachable if the failed promise was dropped and a fresh initialize ran.
+    await waitFor(() => expect(screen.getByTestId('c').textContent).toBe('landed'));
+  });
+
+  // ⚠ NOT COVERED, SAID RATHER THAN IMPLIED: the `appPromise === pending` identity
+  // check inside that `catch` has no test of its own. Its failure mode — a late
+  // rejection clearing a client a concurrent `configureSdkRuntime` had already
+  // installed — costs one extra rebuild and is not observable through any binding
+  // this module exports, so a test for it would have to assert on private state.
+  // The guard stays because dropping it makes a reconfigure racing a doomed init
+  // non-deterministic; it is not claimed as covered.
 });

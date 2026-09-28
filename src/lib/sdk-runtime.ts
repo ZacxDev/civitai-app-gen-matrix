@@ -79,7 +79,18 @@ export interface SdkRuntimeOptions {
    * nothing. `src/dev-rest.ts` is what answers here.
    */
   fetch?: typeof globalThis.fetch;
-  /** Override the site base URL (`/api/v1` by default) — dev harness only. */
+  /**
+   * Override the site base URL — dev harness only.
+   *
+   * ⚠ WITH NO OVERRIDE THE BASE URL IS DERIVED, NOT CONSTANT, and the previous
+   * wording here ("`/api/v1` by default") was wrong in the way that mattered: the
+   * SDK's own fallback is the ABSOLUTE `https://civitai.com/api/v1`
+   * (`@civitai/sdk` `dist/site/index.js` — `DEFAULT_SITE_URL`), not a relative
+   * path. Taking that default would pin every REST call to production regardless
+   * of which host embedded the block. So when this is absent the runtime derives
+   * the base URL from the transport's validated `hostOrigin` instead — see
+   * `siteUrlFromHostOrigin`.
+   */
   siteUrl?: string;
 }
 
@@ -151,13 +162,145 @@ function transport(): BlockTransport {
   return transportSingleton;
 }
 
-/** The one AppClient promise, created on first use. */
-function app(): Promise<BlockAppClient> {
-  appPromise ??= initialize({
-    transport: transport(),
-    ...(options.fetch === undefined ? {} : { fetch: options.fetch }),
-    ...(options.siteUrl === undefined ? {} : { siteUrl: options.siteUrl }),
+/** The `/api/v1` suffix the site client's base URL carries, on any host. */
+const SITE_API_PATH = '/api/v1';
+
+/**
+ * How long `app()` waits for `BLOCK_INIT` to establish the host origin before it
+ * gives up and lets the SDK's own readiness gate speak. Deliberately the SAME
+ * number as `@civitai/sdk`'s `DEFAULT_INIT_TIMEOUT_MS` (`dist/app/index.js:11`),
+ * because it is a bound on the same event: if this expires, `initialize`'s
+ * `ready(transport, 10_000)` is expiring too and the rejection the caller sees
+ * should be that one.
+ */
+const HOST_ORIGIN_WAIT_MS = 10_000;
+
+/**
+ * The site base URL for a given validated host origin, or `undefined` when there
+ * is none to derive one from.
+ *
+ * 🔴 THE HOST ORIGIN IS THE RIGHT SOURCE AND THE PLATFORM SAYS SO IN SO MANY
+ * WORDS. `@civitai/blocks-react`'s `useHostOrigin` is documented as *"the
+ * validated host (parent) origin the block may safely direct-fetch the civitai App
+ * Blocks HTTP API against"*, with `${host}/api/v1/blocks/me` as its own example.
+ * It is also the SECURITY-correct source: the value is set once, from the
+ * `event.origin` of the first `BLOCK_INIT` that cleared the transport's allowlist
+ * gate, and is never derived from `document.referrer` or a `location` — which is
+ * exactly the property a base URL carrying a money-scoped bearer token needs.
+ *
+ * 🔴 AND TAKING THE SDK's DEFAULT INSTEAD BREAKS THIS REPO's OWN DOCUMENTED
+ * PREVIEW FLOW. `.env.production` tells the operator to add a preview page host
+ * (`https://pr-<N>.civitaic.com`) as an extra allowed parent for pre-merge
+ * verification. On the bridge every data call went to whichever host was the
+ * parent, so that worked; pinned to `DEFAULT_SITE_URL` the block renders inside
+ * the preview host and talks to PRODUCTION. Which way that then fails is
+ * UNVERIFIED from here — if preview and production sign block JWTs with different
+ * keys every REST call 401s and the flow is simply dead, and if they share a key a
+ * preview verification run spends real Buzz against the production gallery. Both
+ * are bad and this does not need to know which: deriving the base URL from the
+ * parent restores the bridge's behaviour either way.
+ */
+function siteUrlFromHostOrigin(hostOrigin: string | null): string | undefined {
+  if (hostOrigin === null || hostOrigin === '') return undefined;
+  return `${hostOrigin.replace(/\/+$/, '')}${SITE_API_PATH}`;
+}
+
+/**
+ * Wait for the transport to report the validated host origin, bounded.
+ *
+ * 🔴 THE WAIT IS THE WHOLE FIX, NOT DEFENSIVE PADDING. `initialize`'s `siteUrl` is
+ * read at CALL time (the SDK captures it into `createAppClient` after its own
+ * `await ready(...)`), and `app()`'s first caller is `useAppWorkflows`'s mount
+ * effect — which runs BEFORE `BLOCK_INIT` lands, because `BlockGate` renders
+ * children immediately when embedded. So a plain synchronous read of
+ * `snapshot.hostOrigin` here would find `null` on essentially every production
+ * boot, fall back to the SDK default, and leave the defect in place while looking
+ * like a fix. That is the shape of a guard that reads as coverage and provides
+ * none, so: wait for the value.
+ *
+ * 🔴 `ready` IS THE TERMINATION SIGNAL, AND IT IS NOT AN APPROXIMATION. The bridge
+ * sets `parentOrigin` and the ready snapshot in the SAME branch of `handleMessage`
+ * and emits once (`internal/iframeTransport.js` — `this.parentOrigin =
+ * event.origin; this.snapshot = snapshotFromInit(...); this.emit();`), and
+ * `useHostOrigin`'s own docblock states it: *"the iframe transport captures the
+ * origin and emits in the same tick it applies `BLOCK_INIT`"*. So a snapshot that
+ * says `ready` and carries no host origin will never gain one, and waiting on it
+ * would burn the whole timeout for nothing — including on every test fake and on
+ * the inline transport, both of which report `ready: true` immediately.
+ */
+function waitForHostOrigin(t: BlockTransport): Promise<string | null> {
+  // `undefined` = "nothing decided yet, keep waiting"; a string or `null` settles.
+  const read = (): string | null | undefined => {
+    const snap = t.snapshot.get();
+    if (typeof snap.hostOrigin === 'string' && snap.hostOrigin !== '') return snap.hostOrigin;
+    if (snap.ready) return null;
+    return undefined;
+  };
+
+  const immediate = read();
+  if (immediate !== undefined) return Promise.resolve(immediate);
+
+  return new Promise<string | null>((resolve) => {
+    let off: (() => void) | null = null;
+    let done = false;
+    const finish = (value: string | null) => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      off?.();
+      resolve(value);
+    };
+    const timer = setTimeout(() => finish(null), HOST_ORIGIN_WAIT_MS);
+    off = t.snapshot.subscribe(() => {
+      const value = read();
+      if (value !== undefined) finish(value);
+    });
+    // Re-read AFTER subscribing: an init that landed between the first read and
+    // the subscription emitted to nobody, and nothing else would ever wake this.
+    const raced = read();
+    if (raced !== undefined) finish(raced);
   });
+}
+
+/** An explicit override wins; otherwise derive from the parent this block is in. */
+async function resolveSiteUrl(t: BlockTransport): Promise<string | undefined> {
+  if (options.siteUrl !== undefined) return options.siteUrl;
+  return siteUrlFromHostOrigin(await waitForHostOrigin(t));
+}
+
+/**
+ * The one AppClient promise, created on first use.
+ *
+ * 🔴 A REJECTED `initialize()` MUST NOT BE CACHED FOR THE LIFE OF THE PAGE, and a
+ * plain `??=` caches it. `initialize` awaits `ready(transport, 10_000)` and
+ * REJECTS on timeout; `??=` only assigns when the left side is nullish, so a
+ * settled-rejected promise is never reassigned and one slow `BLOCK_INIT` poisons
+ * every REST call the page will ever make — app storage, the gallery, and the
+ * money path. Nothing retries, because every caller awaits the same dead promise.
+ *
+ * 🔴 THE IDENTITY CHECK IN THE `catch` IS NOT PARANOIA. `configureSdkRuntime` and
+ * `transport()` both null `appPromise` deliberately, and a `configure` can land
+ * while this one is still in flight; clearing unconditionally would then discard
+ * the NEW client the reconfigure had already installed and rebuild it on the old
+ * options. So only the promise that actually failed clears itself.
+ */
+function app(): Promise<BlockAppClient> {
+  if (appPromise === null) {
+    const t = transport();
+    const pending: Promise<BlockAppClient> = resolveSiteUrl(t)
+      .then((siteUrl) =>
+        initialize({
+          transport: t,
+          ...(options.fetch === undefined ? {} : { fetch: options.fetch }),
+          ...(siteUrl === undefined ? {} : { siteUrl }),
+        }),
+      )
+      .catch((err: unknown) => {
+        if (appPromise === pending) appPromise = null;
+        throw err;
+      });
+    appPromise = pending;
+  }
   return appPromise;
 }
 
@@ -659,6 +802,37 @@ const WORKFLOW_QUERY_ROUTE = 'blocks/workflows/query';
 const HOST_SYNTHESISED_WORKFLOW_ID = 'failed';
 
 /**
+ * The deadline every money-path request carries, restored from the bridge.
+ *
+ * 🔴 AN UNBOUNDED REQUEST DEFEATS THIS APP'S OWN GIVE-UP PATH, AND POLL IS WHERE
+ * THAT BITES. `@civitai/blocks-react`'s `useBuzzWorkflow` gave estimate, submit,
+ * poll and cancel an explicit `WORKFLOW_REQUEST_TIMEOUT_MS = 120_000` (its own
+ * longer bound, sized for orchestrator latency rather than for the 30s protocol
+ * default — `internal/requestTimeouts.js` records the reasoning). Over REST the
+ * SDK's `createHttp` forwards only `opts.signal`, so a call that passes none has NO
+ * deadline at all: the browser will hold a connection open indefinitely.
+ *
+ * `runPollLoop` in `App.tsx` implements its bounded poll as *reject → back off →
+ * `attempt++`*, and gives up (`CELL_TIMEDOUT`, the honest "still working — check
+ * back later" state) only once `attempt >= POLL_MAX_ATTEMPTS`. A request that never
+ * settles never rejects, so `tick` never re-runs, `attempt` never advances and
+ * `giveUp()` is unreachable — the cell sits on `polling` forever with the guard
+ * that exists to stop exactly that silently disabled. A wedged `submit` is the same
+ * shape one level up: it holds a `DEFAULT_CONCURRENCY` slot for the life of the
+ * page and stalls the rest of the run.
+ *
+ * `AbortSignal.timeout` is what turns that back into a rejection the loop can see.
+ * Note it bounds the WHOLE call including the SDK's one automatic token-refresh
+ * retry, which is the same thing the bridge's `timeoutMs` bounded.
+ */
+const WORKFLOW_REQUEST_TIMEOUT_MS = 120_000;
+
+/** A fresh deadline per call — a signal is single-use and starts counting on creation. */
+function workflowRequestOpts(): { signal: AbortSignal } {
+  return { signal: AbortSignal.timeout(WORKFLOW_REQUEST_TIMEOUT_MS) };
+}
+
+/**
  * An idempotency key for one logical submit.
  *
  * 🔴 THE REST ROUTE REQUIRES ONE WHERE THE BRIDGE HOOK MINTED IT FOR YOU, and
@@ -779,7 +953,9 @@ export function useBuzzWorkflow(): BuzzWorkflowValue {
       estimate: async (body) => {
         const snapshot = snapshotOf(
           WORKFLOW_ESTIMATE_ROUTE,
-          await (await site()).post<{ snapshot?: unknown }>(WORKFLOW_ESTIMATE_ROUTE, { body }),
+          await (
+            await site()
+          ).post<{ snapshot?: unknown }>(WORKFLOW_ESTIMATE_ROUTE, { body }, workflowRequestOpts()),
         );
         if (snapshot.status === 'failed') throw new WorkflowEstimateError(snapshot, 'failed');
         if (typeof snapshot.cost?.total !== 'number') {
@@ -792,10 +968,11 @@ export function useBuzzWorkflow(): BuzzWorkflowValue {
         const idempotencyKey = submitOptions?.idempotencyKey ?? mintIdempotencyKey();
         const snapshot = snapshotOf(
           WORKFLOW_SUBMIT_ROUTE,
-          await (await site()).post<{ snapshot?: unknown }>(WORKFLOW_SUBMIT_ROUTE, {
-            body,
-            idempotencyKey,
-          }),
+          await (await site()).post<{ snapshot?: unknown }>(
+            WORKFLOW_SUBMIT_ROUTE,
+            { body, idempotencyKey },
+            workflowRequestOpts(),
+          ),
         );
         if (snapshot.status === 'failed' && typeof snapshot.cost?.total !== 'number') {
           throw new WorkflowSubmitError(
@@ -809,13 +986,21 @@ export function useBuzzWorkflow(): BuzzWorkflowValue {
       poll: async (workflowId) =>
         snapshotOf(
           WORKFLOW_POLL_ROUTE,
-          await (await site()).post<{ snapshot?: unknown }>(WORKFLOW_POLL_ROUTE, { workflowId }),
+          await (await site()).post<{ snapshot?: unknown }>(
+            WORKFLOW_POLL_ROUTE,
+            { workflowId },
+            workflowRequestOpts(),
+          ),
         ),
 
       cancel: async (workflowId) =>
         snapshotOf(
           WORKFLOW_CANCEL_ROUTE,
-          await (await site()).post<{ snapshot?: unknown }>(WORKFLOW_CANCEL_ROUTE, { workflowId }),
+          await (await site()).post<{ snapshot?: unknown }>(
+            WORKFLOW_CANCEL_ROUTE,
+            { workflowId },
+            workflowRequestOpts(),
+          ),
         ),
     }),
     [],
@@ -932,7 +1117,31 @@ export function useGatedImages(): { getImages: (imageIds: number[]) => Promise<B
     ).get<{ images?: BlockGatedImage[] }>('blocks/gated-images', {
       query: { ids: imageIds.join(',') },
     });
-    return reply?.images ?? [];
+    // 🔴 NO `?? []`. A MALFORMED 200 MUST THROW, NEVER ANSWER "no rows" — and here
+    // the wrong answer is not a blank panel, it is a SENTENCE THAT IS FALSE. An
+    // empty map makes `resolveEntryImages` report `allGone === true`, and
+    // `GalleryPanel.tsx` renders `gm-gallery-all-gone`: *"The images in this matrix
+    // are no longer available."* That tells the viewer the platform removed images
+    // that may well exist and be perfectly visible — where the honest state,
+    // `gm-gallery-images-error`, is already wired and already reachable from
+    // `App.tsx`'s `.catch()` on this call. A read that did not happen is an error,
+    // not an emptiness.
+    //
+    // This is also the doctrine the SDK's sibling clients enforce for themselves in
+    // as many words (`dist/shared-storage/index.js`, `dist/storage/index.js`), and
+    // the failure mode the PR body cites to justify choosing `blocks/gated-images`
+    // over `blocks/images` in the first place — `blocks/images` answers 200 with an
+    // empty array for every id in this corpus, which under `?? []` would have been
+    // indistinguishable from a whole gallery of deleted images.
+    //
+    // A genuinely empty reply is a DIFFERENT thing and still resolves: misses are
+    // reported by omission, so `{ images: [] }` means "none of those ids are visible
+    // to you", which is the answer `gone` per cell correctly reflects.
+    const images = reply?.images;
+    if (!Array.isArray(images)) {
+      throw new Error('blocks/gated-images: malformed response (no `images` array)');
+    }
+    return images;
   }, []);
   return useMemo(() => ({ getImages }), [getImages]);
 }

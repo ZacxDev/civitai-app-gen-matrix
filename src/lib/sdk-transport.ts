@@ -28,24 +28,65 @@ import type { BlockTransport as BridgeTransport } from '@civitai/blocks-react';
 import { BridgeError } from '@civitai/sdk';
 
 /**
- * The request-shaped host operations this app performs, each with the reply
- * message the bridge requires the caller to NAME.
+ * `HUMAN_INTERACTION_TIMEOUT_MS` from `@civitai/blocks-react`'s
+ * `internal/requestTimeouts.js` (`10 * 60_000`), which that package does not
+ * export — so it is restated here with its source rather than reached for.
  *
- * 🔴 The SDK's `request(type, params)` does NOT carry a response type — it
- * assumes the transport knows. The bridge's `sendRequest` REQUIRES one
- * (`sendTypedRequest(t, req, responseType)`), so the mapping has to live here.
+ * Exported so a test can assert the number that actually goes on the wire
+ * instead of re-deriving it.
+ */
+export const HUMAN_INTERACTION_TIMEOUT_MS = 10 * 60_000;
+
+/**
+ * One row per request-shaped host operation this app performs: the reply message
+ * the bridge requires the caller to NAME, and the deadline it requires the caller
+ * to CHOOSE.
  *
- * Every pairing below is verified THREE ways against the installed
+ * 🔴 THE BRIDGE REQUIRES BOTH AND THE SDK NAMES NEITHER, WHICH IS WHY THEY LIVE
+ * IN ONE TABLE. The SDK's `request(type, params, { signal })` carries no response
+ * type and no timeout — it assumes the transport knows. The bridge's
+ * `sendRequest(request, responseType, opts = {})` requires the first and applies
+ * `DEFAULT_REQUEST_TIMEOUT_MS` (30s) for the second whenever `opts.timeoutMs` is
+ * absent (`internal/iframeTransport.js`:209-217). Keeping the pairing and the
+ * bound in the same row is the point: they are two halves of one decision per
+ * type, and an `undefined` fourth argument is not a neutral default — it SELECTS
+ * the wrong bucket.
+ *
+ * 🔴 `timeoutMs` IS NOT POLISH ON A HUMAN-GATED REQUEST — OMITTING IT REINTRODUCES
+ * civitai/civitai#4158, VERBATIM. `@civitai/blocks-react`'s own ledger
+ * (`internal/requestTimeouts.js`) buckets every block→parent message by the one
+ * question that decides it — *does the reply wait for a person to act?* — and
+ * files `OPEN_BUZZ_PURCHASE`, `OPEN_RESOURCE_PICKER` and
+ * `PUBLISH_GENERATION_OUTPUTS` as `'human'` with a TEN-MINUTE bound. Its comment
+ * on that constant is the incident: `PUBLISH_GENERATION_OUTPUTS` shipped on the
+ * 30s default and *"rejected mid-dialog … the generation had already been billed,
+ * the publish bridge died at 30s, the outputs reached nothing, and there is no
+ * refund path for a dead bridge, so the viewer simply paid for nothing."*
+ *
+ * In THIS app the damage does not stop at one lost publish. `publishMatrix`
+ * (`src/gallery.ts`) calls `publish()` once per cell of a matrix the viewer has
+ * already been charged for, and `App.tsx` writes the per-cell publish ledger
+ * (`PUBLISHED_CELLS_STORAGE_KEY`) only from what `publishMatrix` reports as
+ * LANDED. A 30s rejection against a host that then publishes anyway leaves the
+ * images existing as permanent public rows with the ledger empty — so the control
+ * re-arms and a second press mints a SECOND permanent public image of the same
+ * paid output. That ledger exists precisely to make that impossible.
+ *
+ * `REQUEST_TOKEN` is `'protocol'` in the same ledger, so it takes the bridge's
+ * default — recorded as `undefined` explicitly so a reader sees a decision rather
+ * than an omission.
+ *
+ * Every reply pairing below is verified THREE ways against the installed
  * `@civitai/blocks-react@0.47.0` — the hook that issues it, the mock host that
  * answers it (`internal/mockHost.js`), and the inbound validator
  * (`internal/validate.js`) — and cross-checked against `@civitai/sdk@0.8.0`'s
  * OWN table (`dist/core/transports/iframe-transport.js`, `LEGACY_REPLIES`),
  * which agrees on all four:
  *
- *   REQUEST_TOKEN               -> TOKEN_REFRESH_RESPONSE   (useBlockToken.js:73)
- *   OPEN_RESOURCE_PICKER        -> RESOURCE_PICKER_RESULT   (useResourcePicker.js:41)
- *   OPEN_BUZZ_PURCHASE          -> BUZZ_PURCHASE_RESULT     (useBuzzPurchase.js:24)
- *   PUBLISH_GENERATION_OUTPUTS  -> PUBLISH_RESULT           (usePublishGenerationOutputs.js:33)
+ *   REQUEST_TOKEN               -> TOKEN_REFRESH_RESPONSE   (useBlockToken.js:73)        protocol
+ *   OPEN_RESOURCE_PICKER        -> RESOURCE_PICKER_RESULT   (useResourcePicker.js:41)    human
+ *   OPEN_BUZZ_PURCHASE          -> BUZZ_PURCHASE_RESULT     (useBuzzPurchase.js:24)      human
+ *   PUBLISH_GENERATION_OUTPUTS  -> PUBLISH_RESULT           (usePublishGenerationOutputs.js:33) human
  *
  * The SDK issues two more (`SAVE_IMAGE`, `OPEN_IMAGE_UPLOAD`); this app calls
  * neither `host.download` nor `host.openImageUpload`, so they are deliberately
@@ -54,11 +95,29 @@ import { BridgeError } from '@civitai/sdk';
  * An unmapped type THROWS rather than guessing: a wrong reply type hangs the
  * request until its timeout and surfaces as a dead host.
  */
-const RESPONSE_TYPE: Readonly<Record<string, string>> = Object.freeze({
-  REQUEST_TOKEN: 'TOKEN_REFRESH_RESPONSE',
-  OPEN_RESOURCE_PICKER: 'RESOURCE_PICKER_RESULT',
-  OPEN_BUZZ_PURCHASE: 'BUZZ_PURCHASE_RESULT',
-  PUBLISH_GENERATION_OUTPUTS: 'PUBLISH_RESULT',
+interface BridgeRequestBinding {
+  readonly responseType: string;
+  /**
+   * `undefined` means "the bridge's own 30s default" — spelled out so a
+   * `'protocol'` bucketing reads as a choice, not as a forgotten argument.
+   */
+  readonly timeoutMs?: number;
+}
+
+const BRIDGE_REQUESTS: Readonly<Record<string, BridgeRequestBinding>> = Object.freeze({
+  REQUEST_TOKEN: { responseType: 'TOKEN_REFRESH_RESPONSE' },
+  OPEN_RESOURCE_PICKER: {
+    responseType: 'RESOURCE_PICKER_RESULT',
+    timeoutMs: HUMAN_INTERACTION_TIMEOUT_MS,
+  },
+  OPEN_BUZZ_PURCHASE: {
+    responseType: 'BUZZ_PURCHASE_RESULT',
+    timeoutMs: HUMAN_INTERACTION_TIMEOUT_MS,
+  },
+  PUBLISH_GENERATION_OUTPUTS: {
+    responseType: 'PUBLISH_RESULT',
+    timeoutMs: HUMAN_INTERACTION_TIMEOUT_MS,
+  },
 });
 
 /**
@@ -130,8 +189,75 @@ function unwrapBridgeReply(type: string, payload: unknown): unknown {
 }
 
 /**
- * The SDK's snapshot is the bridge's plus `hostOrigin`, which the bridge exposes
- * as a separate accessor.
+ * The token `kind` this app's host mints, restated here because the bridge drops
+ * the field on the way in.
+ *
+ * 🔴 THIS IS A CLAIM ABOUT THIS BLOCK'S MANIFEST, NOT A DEFAULT. `@civitai/sdk`
+ * documents `kind` as *"`block` is accepted only by the host; `oauth` also by the
+ * API and orchestrator. Older hosts send none"* (`core/handshake.d.ts`), and its
+ * own guard treats an ABSENT `kind` as "not evidence of a block token" so it
+ * behaves as it did before the field existed. Stamping `'block'` is therefore only
+ * legitimate where the block cannot receive any other kind — and this one cannot:
+ * `block.manifest.json` declares no `auth: "oauth"`, so the host mints a
+ * block-scoped JWT and nothing else. Add that opt-in to the manifest and this line
+ * becomes a lie; it is spelled as a named constant beside the reason for exactly
+ * that reason.
+ */
+const BLOCK_TOKEN_KIND = 'block' as const;
+
+/**
+ * Compose the SDK's snapshot out of the bridge's.
+ *
+ * 🔴 THERE ARE **TWO** DELTAS AND ONLY ONE OF THEM IS A TOP-LEVEL FIELD. Measured
+ * against `@civitai/blocks-react@0.47.0` and `@civitai/sdk@0.8.0`:
+ *
+ *   - `hostOrigin` — present on the SDK's `BlockSnapshot`, absent from the
+ *     bridge's snapshot object, which exposes it through a separate
+ *     `getHostOrigin()` accessor instead;
+ *   - `token.kind` — NESTED, and therefore invisible to a field-by-field
+ *     comparison of the two snapshot types. `@civitai/sdk`'s `tokenFromWrapped`
+ *     carries it (`dist/core/transport.js:30-38`); the bridge's function of the
+ *     same name builds `{ raw, scopes, expiresAt, buzzBudget }` and DROPS it
+ *     (`dist/internal/transport.js:157-164`), and the bridge's own `BlockToken`
+ *     type does not declare it.
+ *
+ * (The bridge's extra `appId`/`blockId` go the other way and are simply ignored.)
+ *
+ * The rest of the surface was swept for the same shape — a value the bridge expects
+ * or the SDK reads that this adapter omits — and it comes back clean, recorded so
+ * the next reader does not re-derive it:
+ *   - `sendTypedRequest`'s fourth argument: WAS being passed `undefined`, which is
+ *     the defect `BRIDGE_REQUESTS` above now closes. It is the only argument of the
+ *     bridge's `sendRequest` that the SDK does not supply.
+ *   - `notify` (`{ type, payload }`) and `on` (`type`, `handler`) are the bridge's
+ *     full signatures for `sendMessage`/`onMessage`; nothing is dropped.
+ *   - `effectiveBrowsingLevel` is the one remaining SDK snapshot field the bridge
+ *     never sends (zero occurrences anywhere in `@civitai/blocks-react@0.47.0`'s
+ *     `dist/`), and no code READS it: `@civitai/sdk@0.8.0` only copies it inside its
+ *     own snapshot builder, which this adapter replaces, and `useDomainMaturity`
+ *     deliberately reads the domain ceiling instead. So there is nothing to supply
+ *     and nothing depending on it — unlike `kind`, which two live guards read.
+ *
+ * 🔴 DROPPING `token.kind` DISARMS A PLATFORM ALARM AIMED AT THIS EXACT MIGRATION,
+ * AND IT FAILS SILENT. `@civitai/sdk` gates two runtime guards on
+ * `holdsBlockToken = () => snapshot().viewer !== null && snapshot().token.kind ===
+ * 'block'` (`dist/app/index.js:55`):
+ *
+ *   - `refuseBlockToken` (`:105-111`) rejects every `app.orchestration.*` call
+ *     EAGERLY, before the request, because the orchestrator accepts a block token
+ *     on no route at all;
+ *   - `explainApiRefusal` (`:132-155`) annotates a 401/403 outside the `blocks/*`
+ *     namespace with what the token actually reaches.
+ *
+ * With `kind` undefined both are permanently dead. That matters here more than
+ * anywhere: `sdk-runtime.ts`'s money-path docblock records `app.site` vs
+ * `app.orchestration` as *"the sharpest trap in the whole migration because the
+ * wrong version compiles"* — it type-checks, passes tests, and silently drops the
+ * per-call `buzzBudget`, the per-viewer spend caps, the maturity clamp and per-app
+ * attribution. `refuseBlockToken` is the one runtime net under that mistake, and
+ * without `kind` a future substitution reaches the orchestrator, collects a bare
+ * 401 and reads as a scope misconfiguration rather than as the architectural error
+ * it is. So the adapter supplies the field the bridge drops.
  *
  * 🔴 IDENTITY IS LOAD-BEARING, NOT AN OPTIMISATION. `snapshot.get()` feeds
  * `useSyncExternalStore`, which bails out on `Object.is`. Composing
@@ -151,6 +277,24 @@ function composeSnapshot(bridge: BridgeTransport) {
   let lastBase: unknown;
   let lastHostOrigin: string | null | undefined;
   let lastComposed: unknown;
+  // The token wrapper is cached on the BRIDGE token's identity, separately from
+  // the snapshot cache above: `hostOrigin` lands from its own accessor and can
+  // move while the base snapshot does not, and re-minting the token object on that
+  // event would give `useBlockToken`'s `useMemo([token])` a new identity for a
+  // change that has nothing to do with the token.
+  let lastToken: unknown;
+  let lastWrappedToken: unknown;
+
+  const withKind = (token: unknown) => {
+    // A non-object token is passed through untouched rather than coerced into
+    // `{ kind }`: inventing a token shape the bridge never produced would make
+    // this adapter the source of a value the host never sent.
+    if (token === null || typeof token !== 'object') return token;
+    if (token === lastToken) return lastWrappedToken;
+    lastToken = token;
+    lastWrappedToken = { ...(token as Record<string, unknown>), kind: BLOCK_TOKEN_KIND };
+    return lastWrappedToken;
+  };
 
   return function get() {
     const base = bridge.getSnapshot();
@@ -160,7 +304,7 @@ function composeSnapshot(bridge: BridgeTransport) {
     }
     lastBase = base;
     lastHostOrigin = hostOrigin;
-    lastComposed = { ...base, hostOrigin };
+    lastComposed = { ...base, hostOrigin, token: withKind((base as { token?: unknown }).token) };
     return lastComposed;
   };
 }
@@ -188,25 +332,33 @@ export function createSdkTransportAdapter(bridge: BridgeTransport = getTransport
     },
 
     request: async (type: string, params: unknown, opts?: { signal?: AbortSignal }) => {
-      const responseType = RESPONSE_TYPE[type];
-      if (!responseType) {
+      const binding = BRIDGE_REQUESTS[type];
+      if (!binding) {
         throw new Error(
           `sdk-transport: no response type mapped for request '${type}'. ` +
-            'The bridge requires the caller to name the reply message; add it to ' +
-            'RESPONSE_TYPE with a source for the pairing rather than guessing, ' +
-            'because a wrong reply type hangs until timeout and reads as a dead host.',
+            'The bridge requires the caller to name the reply message AND choose a ' +
+            'deadline; add it to BRIDGE_REQUESTS with a source for the pairing and ' +
+            "its bucket from @civitai/blocks-react's internal/requestTimeouts.js, " +
+            'rather than guessing: a wrong reply type hangs until timeout and reads ' +
+            'as a dead host, and a human-gated request left on the 30s default ' +
+            "rejects while the viewer's dialog is still open (civitai/civitai#4158).",
         );
       }
       const inflight = sendTypedRequest(
         bridge,
         { type, payload: params } as Parameters<typeof sendTypedRequest>[1],
-        responseType as Parameters<typeof sendTypedRequest>[2],
-        // 🔴 NOT a pass-through, and not castable: the SDK's opts is
+        binding.responseType as Parameters<typeof sendTypedRequest>[2],
+        // 🔴 THE DEADLINE COMES FROM THE TABLE, AND `undefined` HERE IS NOT
+        // NEUTRAL — the bridge reads `opts.timeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS`
+        // (30s), so passing nothing SELECTS the protocol bucket for a request that
+        // waits on a person. See `BRIDGE_REQUESTS`.
+        //
+        // The SDK's `opts` cannot be smuggled through here either: it is
         // `{ signal?: AbortSignal }` and the bridge's is `{ timeoutMs?: number }`
         // — no common property. Casting one to the other would compile and
         // silently discard the caller's cancellation, so the signal is honoured
-        // below instead of smuggled through a cast.
-        undefined,
+        // below instead.
+        binding.timeoutMs === undefined ? undefined : { timeoutMs: binding.timeoutMs },
       ) as Promise<unknown>;
 
       const signal = opts?.signal;

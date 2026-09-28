@@ -16,7 +16,9 @@ vi.mock('@civitai/blocks-react', () => ({
   sendTypedRequest,
 }));
 
-const { createSdkTransportAdapter } = await import('./sdk-transport.js');
+const { createSdkTransportAdapter, HUMAN_INTERACTION_TIMEOUT_MS } = await import(
+  './sdk-transport.js'
+);
 
 /**
  * A stand-in for the bridge transport. Only the five members the adapter touches
@@ -155,6 +157,62 @@ describe('sdk-transport adapter — the reply-type table', () => {
     expect(passedReplyType).toBe(replyType);
   });
 
+  /**
+   * 🔴 THE MERGE BLOCKER THIS FILE PREVIOUSLY COULD NOT SEE, AND IT IS A MONEY
+   * DEFECT. The bridge's `sendRequest(request, responseType, opts = {})` reads
+   * `opts.timeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS` = **30_000**, so an `undefined`
+   * fourth argument is not a neutral default — it SELECTS the protocol bucket for
+   * a request whose reply waits on a person. `@civitai/blocks-react`'s own ledger
+   * (`internal/requestTimeouts.js`) files all three types below as `'human'` at
+   * `HUMAN_INTERACTION_TIMEOUT_MS` (10 minutes) and quotes the incident:
+   * `PUBLISH_GENERATION_OUTPUTS` shipped on the 30s default and rejected while the
+   * consent dialog was still on screen, after the generation had been billed, with
+   * no refund path for a dead bridge (civitai/civitai#4158).
+   *
+   * 🔴 THE ASSERTION IS ON THE ACTUAL FOURTH ARGUMENT, PER TYPE — not on "some
+   * timeout exists". A test that only checked truthiness is walkable by any wrong
+   * number, and the defect this pins IS a wrong number (30s standing in for 600s).
+   * So: the literal object, and `10 * 60_000` restated as the expected value
+   * rather than read back off the module under test.
+   *
+   * Watched to FAIL on `30f30b0` (the unfixed adapter, which passed a bare
+   * `undefined`): all three rows go red with
+   * "expected undefined to deeply equal { timeoutMs: 600000 }".
+   */
+  const BOUNDS: ReadonlyArray<[string, { timeoutMs: number } | undefined]> = [
+    // 'human' in the bridge's ledger — the viewer walks a purchase flow.
+    ['OPEN_BUZZ_PURCHASE', { timeoutMs: 600_000 }],
+    // 'human' — the viewer browses a catalog and picks.
+    ['OPEN_RESOURCE_PICKER', { timeoutMs: 600_000 }],
+    // 'human' — the viewer answers a consent confirm. #4158 itself.
+    ['PUBLISH_GENERATION_OUTPUTS', { timeoutMs: 600_000 }],
+    // 'protocol' — no person in the loop, so the bridge's own 30s default, passed
+    // as `undefined`. Pinned so a blanket "give everything 10 minutes" fix, which
+    // would let a genuinely dead host hang a token re-mint for ten minutes, fails
+    // here rather than passing as a generalisation.
+    ['REQUEST_TOKEN', undefined],
+  ];
+
+  it.each(BOUNDS)('passes the %s bucket bound to sendTypedRequest', async (type, expected) => {
+    sendTypedRequest.mockReset();
+    sendTypedRequest.mockResolvedValue({ ok: 1 });
+    const { bridge } = fakeBridge();
+    const t = createSdkTransportAdapter(bridge as never);
+
+    await t.request(type, {});
+
+    expect(sendTypedRequest).toHaveBeenCalledTimes(1);
+    expect(sendTypedRequest.mock.calls[0]![3]).toEqual(expected);
+  });
+
+  // The constant the three human-gated rows above are built from, pinned to the
+  // bridge's own value. Its own guard, because the rows spell the number out: if
+  // this module's constant ever drifts from `internal/requestTimeouts.js` the rows
+  // would keep passing on a literal while production sent something else.
+  it('states the bridge ledger HUMAN_INTERACTION_TIMEOUT_MS as ten minutes', () => {
+    expect(HUMAN_INTERACTION_TIMEOUT_MS).toBe(600_000);
+  });
+
   // 🔴 A wrong reply type does not fail loudly — it waits for the request timeout
   // and surfaces as an unresponsive host. So an unmapped type must REFUSE rather
   // than guess, and the refusal must say what to do.
@@ -282,6 +340,101 @@ describe('sdk-transport adapter — abort', () => {
     const t = createSdkTransportAdapter(bridge as never);
 
     await expect(t.request('REQUEST_TOKEN', {})).resolves.toEqual({ token: 'tok' });
+  });
+});
+
+describe('sdk-transport adapter — the SDK is handed a BLOCK token kind', () => {
+  /**
+   * 🔴 THE FIELD THE BRIDGE DROPS DISARMS THE ONE RUNTIME NET UNDER THIS
+   * MIGRATION'S MOST EXPENSIVE MISTAKE.
+   *
+   * `@civitai/sdk` gates two guards on
+   * `holdsBlockToken = () => snapshot().viewer !== null && snapshot().token.kind ===
+   * 'block'` (`dist/app/index.js:55`): `refuseBlockToken`, which rejects every
+   * `app.orchestration.*` call EAGERLY because the orchestrator accepts a block
+   * token on no route at all, and `explainApiRefusal`, which annotates a 401/403
+   * outside `blocks/*`. But `@civitai/blocks-react`'s `tokenFromWrapped` builds
+   * `{ raw, scopes, expiresAt, buzzBudget }` and DROPS `kind`
+   * (`dist/internal/transport.js:157-164`) — the SDK's own version of the same
+   * function carries it (`dist/core/transport.js:30-38`). So through an unmodified
+   * adapter `token.kind` is `undefined` for ever and both guards are dead.
+   *
+   * That is not a cosmetic loss here. `sdk-runtime.ts` records `app.site` vs
+   * `app.orchestration` as *"the sharpest trap in the whole migration because the
+   * wrong version compiles"* — it type-checks, passes tests, and silently drops the
+   * per-call `buzzBudget`, the per-viewer spend caps, the maturity clamp and per-app
+   * attribution. `refuseBlockToken` is the alarm against exactly that, and without
+   * `kind` a substitution reaches the orchestrator, collects a bare 401, and reads as
+   * a scope misconfiguration instead of an architectural error.
+   *
+   * 🔴 THE ASSERTION IS BEHAVIOURAL, NOT STRUCTURAL: a real `initialize()` over this
+   * adapter, then a real `app.orchestration` call, which must be refused BEFORE
+   * reaching `fetch`. A structural `snapshot.token.kind === 'block'` check would
+   * type-check past a guard that had been rewired to read something else.
+   *
+   * Watched to FAIL on `30f30b0` (adapter without the `kind` stamp): the call is NOT
+   * refused, `fetch` records a request to `https://orchestration.civitai.com/...`,
+   * and the rejects-assertion goes red.
+   */
+  async function clientOverAdapter() {
+    const { initialize } = await import('@civitai/sdk');
+    const { bridge, state } = fakeBridge({
+      // Both halves of `holdsBlockToken` have to be true for the guard to be live, so
+      // the snapshot carries a signed-in viewer as well as a ready flag.
+      getSnapshot: () => state.snapshot,
+    });
+    state.snapshot = {
+      ready: true,
+      renderMode: 'iframe',
+      context: { slotId: 'page' },
+      settings: {},
+      viewer: { id: 7, username: 'zed' },
+      theme: 'dark',
+      blockInstanceId: 'inst-1',
+      token: { raw: 'jwt-1', scopes: ['ai:write:budgeted'], expiresAt: new Date('2030-01-01') },
+    };
+    state.hostOrigin = 'https://civitai.com';
+
+    const seen: string[] = [];
+    const fetchSpy = vi.fn(async (input: RequestInfo | URL) => {
+      seen.push(String(input));
+      return new Response(JSON.stringify({ ok: true }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }) as unknown as typeof globalThis.fetch;
+
+    const client = await initialize({
+      transport: createSdkTransportAdapter(bridge as never) as never,
+      fetch: fetchSpy,
+    });
+    return { client, seen };
+  }
+
+  it('refuses an app.orchestration call eagerly, without reaching the wire', async () => {
+    const { client, seen } = await clientOverAdapter();
+
+    await expect(client.orchestration.queryWorkflows()).rejects.toThrow(
+      /orchestrator does not accept a block-scoped token/i,
+    );
+    // The refusal is EAGER: nothing was sent. Asserted separately from the rejection
+    // because a guard that rejected only AFTER the request would satisfy the line
+    // above while still having leaked a money-scoped token to the orchestrator.
+    expect(seen.filter((u) => u.includes('orchestration'))).toEqual([]);
+  });
+
+  /**
+   * 🔴 THE POSITIVE CONTROL. Without it the case above is indistinguishable from a
+   * `fetch` that was never wired to anything: a zero-length `seen` would be
+   * "proof" either way. So the same client, the same spy, one call that MUST reach
+   * the wire — and the count has to move.
+   */
+  it('positive control: a blocks/* site call DOES reach the injected fetch', async () => {
+    const { client, seen } = await clientOverAdapter();
+
+    await client.site.get('blocks/gated-images', { query: { ids: '1' } });
+
+    expect(seen.filter((u) => u.includes('blocks/gated-images'))).toHaveLength(1);
   });
 });
 
