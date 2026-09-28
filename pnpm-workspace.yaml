@@ -18,6 +18,14 @@
 #   - @civitai/components@0.3.0 + @civitai/components-react@0.3.0 — the
 #     attribute-driven CSS + React primitives (Slider/Image/Tooltip/Toast/
 #     SegmentedControl) the UI adopts.
+#   - @civitai/sdk@0.8.0 — the successor package this block's runtime bindings
+#     now sit on (`initialize({ transport })` → `app.site`/`storage`/
+#     `sharedStorage` + `createHost`). See `src/lib/sdk-runtime.ts`.
+#     🔴 PUBLISHED 2026-09-27T02:04:53.050Z (`npm view @civitai/sdk time --json`).
+#     This entry is INERT 24h after that instant — delete it then rather than
+#     leaving a permanent exemption. The version is EXACT on purpose: a bare
+#     `@civitai/sdk` would exempt every future release, including one cut by a
+#     compromised publish token, which is the whole thing the gate is for.
 # All resolve from the npm registry directly — no local `link:`/`overrides`.
 #
 # Single-package repo: declare the root explicitly so pnpm and setup-node's
@@ -32,3 +40,4 @@ minimumReleaseAgeExclude:
   - '@civitai/theme@0.2.0 || 0.3.1'
   - '@civitai/components@0.3.0 || 0.4.1'
   - '@civitai/components-react@0.3.0 || 0.4.1'
+  - '@civitai/sdk@0.8.0'

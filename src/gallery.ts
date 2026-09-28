@@ -1031,14 +1031,65 @@ export function publishResultMessage(result: PublishResult): string {
 // Reading the gallery.
 // ---------------------------------------------------------------------------
 
-/** The slice of one `useSharedStorage().list()` item this module reads. */
+/**
+ * The slice of one `useSharedStorage().list()` item this module reads.
+ *
+ * 🔴 `value` IS `unknown`, AND THAT IS A CORRECTION RATHER THAN A LOOSENING. It
+ * used to be declared as the WRITE shape (`{ title: string; body?: string; data?:
+ * unknown }`), which asserted something nothing had checked: a listed row was
+ * written by some OTHER viewer's copy of this app — possibly an older version,
+ * possibly a newer one — so its shape is a fact about stored data, not a promise
+ * any client can keep. `@civitai/sdk`'s `SharedItem.value` says `unknown` for
+ * exactly that reason, and this declaration now agrees with the wire.
+ *
+ * Nothing downstream had to change to accommodate it, which is the evidence the
+ * old type was decorative: `toGalleryEntry` below ALREADY validates every field it
+ * reads (`isObj(value) && typeof value.title === 'string'`, then
+ * `parseGalleryData`), because a moderated or version-skewed row was always
+ * possible and the old type never stopped one arriving.
+ */
 export interface SharedItemLike {
   key: string;
   authorUserId: number;
-  value: { title: string; body?: string; data?: unknown };
+  value: unknown;
   count: number;
   updatedAt: Date;
   viewerVoted: boolean;
+}
+
+/**
+ * Narrow a shared row's `value` to the merge base `PublishDeps.getEntry` returns.
+ *
+ * 🔴 AN UNREADABLE VALUE MUST NOT BECOME `null`, AND IT MUST NOT THROW. Those are
+ * the two obvious moves and both are wrong, for different reasons the four-state
+ * table in `publishMatrix` spells out:
+ *
+ *   - `null` from `getEntry` means "the row is GENUINELY GONE", which LICENSES AN
+ *     APPEND. A row the server resolved demonstrably exists, so appending would
+ *     mint the second row for one matrix — and once the ledger names two entry
+ *     keys for a matrix, `publishTargetKey` returns `null` for it forever and
+ *     every later publish appends again.
+ *   - throwing lands on the `catch`, whose `entryState` is `'unknown'` — a guess.
+ *     Here we know MORE than that: the row was resolved. Downgrading a fact to a
+ *     guess would make the orphan copy less honest, not safer.
+ *
+ * So this returns an object with NO `data`, which `parseGalleryData` rejects,
+ * which lands on the `existing-unchanged` orphan arm — the state that is a FACT
+ * (the row exists and we did not touch it). `title` is only carried when it is
+ * genuinely a string, and `body` only when it is genuinely a string, so a value
+ * that reaches `deps.update` cannot smuggle a non-string into `SharedValue`.
+ */
+export function toSharedEntryValue(value: unknown): {
+  title: string;
+  body?: string;
+  data?: unknown;
+} {
+  if (!isObj(value) || typeof value.title !== 'string') return { title: '' };
+  return {
+    title: value.title,
+    ...(typeof value.body === 'string' ? { body: value.body } : {}),
+    data: value.data,
+  };
 }
 
 /** The slice of `useSharedStorage()` this module needs. */

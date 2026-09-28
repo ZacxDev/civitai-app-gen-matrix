@@ -1,5 +1,11 @@
 import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from 'react';
 
+// 🔴 THE BINDINGS, NOT THE BRIDGE. These fourteen used to come from
+// `@civitai/blocks-react`; they now come from this app's own runtime module over
+// `@civitai/sdk`. Read `src/lib/sdk-runtime.ts` before changing any call site
+// here — it documents which of them are still postMessage, which are now HTTP,
+// and (for the money path) which throw rules were reproduced byte-for-byte so
+// this file's error classification keeps behaving as it did.
 import {
   useAppStorage,
   useAppWorkflows,
@@ -15,7 +21,10 @@ import {
   useRequestSignIn,
   useResourcePicker,
   useSharedStorage,
-} from '@civitai/blocks-react';
+} from './lib/sdk-runtime.js';
+// `/ui` stays on the bridge until starters#328 — see `src/lib/sdk-transport.ts`
+// for why that keeps the bridge transport alive, and why the SDK adapts that one
+// rather than standing up a second.
 import { ResourceCard } from '@civitai/blocks-react/ui';
 import { Slider, Tooltip, useToast } from '@civitai/components-react';
 import type { BlockWorkflowSnapshot } from '@civitai/app-sdk/blocks';
@@ -116,6 +125,7 @@ import {
   publishTargetKey,
   publishedCellsBlob,
   shouldClearPublishTitle,
+  toSharedEntryValue,
   unpublishedCells,
   type PublishedCellRecord,
   type GalleryEntry,
@@ -1519,15 +1529,14 @@ export function App() {
         // case — an item past the first page — and it returns `null` for a
         // withdrawn or moderated row, which is the one case where appending a
         // fresh entry is right.
+        // 🔴 `item.value` IS `unknown` — the row was written by some other
+        // viewer's copy of this app, so its shape is stored data rather than a
+        // promise a client can keep. `toSharedEntryValue` owns the narrowing AND
+        // the reason an unreadable value must come back as neither `null` nor a
+        // throw; read its docblock before changing this line.
         getEntry: async (key) => {
           const item = await shared.get(key);
-          return item == null
-            ? null
-            : {
-                title: item.value.title,
-                ...(item.value.body !== undefined ? { body: item.value.body } : {}),
-                data: item.value.data,
-              };
+          return item == null ? null : toSharedEntryValue(item.value);
         },
       },
       (done, total) => setPublishPhase({ kind: 'busy', done, total }),

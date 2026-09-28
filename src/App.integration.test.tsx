@@ -3,7 +3,7 @@ import userEvent from '@testing-library/user-event';
 import type { ReactNode } from 'react';
 import { describe, expect, it } from 'vitest';
 
-import { Harness, createMockHost, resetTransport } from '@civitai/blocks-react/testing';
+import { Harness, createMockHost } from '@civitai/blocks-react/testing';
 import { ToastProvider } from '@civitai/components-react';
 
 import { App } from './App.js';
@@ -16,13 +16,43 @@ import { GALLERY_DATA_VERSION, GALLERY_LIST_CAP } from './gallery.js';
 // The block bundles its allowed-parent-origins from env; in the test env the mock
 // host fires from window.location.origin, so allow it via the transport (main.tsx
 // does this in the harness path; tests must too or BLOCK_INIT never lands).
-import { getTransport } from '@civitai/blocks-react';
+import { installHarnessTransport, resetHarnessTransport } from './dev-transport.js';
+import { createRestFake, splitRestOptions } from './dev-rest.js';
+import { configureSdkRuntime } from './lib/sdk-runtime.js';
+
+// ---------------------------------------------------------------------------
+// TWO FAKES, ONE OPTION BAG — and reading this before touching a case below is
+// the difference between a real assertion and a vacuous one.
+// ---------------------------------------------------------------------------
+//
+// 🔴 THE MOCK HOST NO LONGER ANSWERS THE DATA THESE CASES SEED. After the port off
+// the bridge (`src/lib/sdk-runtime.ts`), five families are HTTP rather than
+// postMessage: the workflow money path, this app's workflow read-model, per-viewer
+// app storage, cross-user shared storage, and the gated image read. The mock host
+// still HAS handlers for all five, and nothing reaches them any more — so a case
+// that kept seeding `storage`/`shared`/`generation`/`appWorkflows`/`gatedImages`
+// through `<Harness>` alone would seed NOTHING, assert against an empty store, and
+// look entirely correct while exercising none of the code that now carries the
+// traffic. That is the single worst failure this port can introduce, and it is
+// silent in the passing direction.
+//
+// So every mount installs BOTH fakes and `splitRestOptions` decides which half
+// each key belongs to (its docblock in `src/dev-rest.ts` is the ledger):
+//
+//   group 1 + 2, still the bridge → `<Harness>` / `createMockHost`
+//   group 3, now HTTP             → `createRestFake` via `configureSdkRuntime`
+//
+// The option NAMES are unchanged from the mock host's, deliberately, so the ~40
+// cases below read exactly as they did and can be diffed against what they used to
+// claim.
 
 function renderApp(harnessProps: Record<string, unknown>): void {
-  getTransport({ allowedParentOrigins: [window.location.origin] });
+  installHarnessTransport();
+  const { host, rest } = splitRestOptions(harnessProps);
+  configureSdkRuntime({ fetch: createRestFake(rest) });
   const wrap = (children: ReactNode) => (
     <ToastProvider>
-      <Harness applyUrlToggles={false} showLog={false} {...harnessProps}>
+      <Harness applyUrlToggles={false} showLog={false} {...host}>
         {children}
       </Harness>
     </ToastProvider>
@@ -31,24 +61,37 @@ function renderApp(harnessProps: Record<string, unknown>): void {
 }
 
 /**
- * Mount the app against a mock host the TEST owns, so it can be remounted
- * against the SAME backing store.
+ * Mount the app against a host AND a REST fake the TEST owns, so it can be
+ * remounted against the SAME backing stores.
  *
  * 🔴 `<Harness>` CANNOT EXPRESS A RELOAD, AND A RELOAD IS THE WHOLE DEFECT.
  * `Harness` installs a fresh `createMockHost` on mount and tears it down on
- * unmount, and the KV store is built once from `storage.seed` at CREATION — so
- * re-rendering it hands the app a brand-new store and every write the first
+ * unmount, and its stores are built once from the seeds at CREATION — so
+ * re-rendering it hands the app brand-new stores and every write the first
  * mount made is gone. A defect whose symptom is "this state does not survive a
  * reload" is therefore structurally invisible through it: the second mount can
- * only ever see the seed. Installing the host once and rendering twice against
- * it is what makes the second mount read what the first mount actually wrote.
+ * only ever see the seed. Installing once and rendering twice is what makes the
+ * second mount read what the first mount actually wrote.
+ *
+ * 🔴 AFTER THE PORT THE STORE THAT MUST SURVIVE IS THE REST FAKE'S, NOT THE
+ * HOST'S. Every one of these cases reloads to check per-viewer KV — the persisted
+ * run manifest, the history rows, the published-cells ledger — and that KV is now
+ * `blocks/app-storage/*`. So `createRestFake` is called ONCE here, outside
+ * `mount()`, for exactly the reason `createMockHost` always was. What DOES have to
+ * be re-done per mount is `configureSdkRuntime`: `resetTransport()` invalidates
+ * the bridge transport, `sdk-runtime` keys its adapter on that transport's
+ * identity, and the AppClient is bound to the adapter — so the client must be
+ * rebuilt while the `fetch` behind it stays the same object.
  */
 function mountShared(options: Record<string, unknown>): {
   remount: () => void;
   cleanup: () => void;
 } {
+  const { host: hostOptions, rest } = splitRestOptions(options);
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const host = createMockHost(options as any);
+  const host = createMockHost(hostOptions as any);
+  // ONE fetch fake for the life of this helper — the "disk" the reload reads back.
+  const restFetch = createRestFake(rest);
   let uninstall: () => void = () => {};
   let view: ReturnType<typeof render> | null = null;
 
@@ -57,12 +100,12 @@ function mountShared(options: Record<string, unknown>): {
   // second `render` against a still-installed host never completes the handshake
   // and sits on the loading skeleton forever — which reads as "the app failed to
   // restore" and would make this test lie in the direction of a false PASS if it
-  // were asserting an absence. The KV store is built at `createMockHost` time,
-  // outside `install()`, so it survives the cycle: that is what makes this a
-  // reload rather than a fresh app.
+  // were asserting an absence. The stores are built outside `install()`, so they
+  // survive the cycle: that is what makes this a reload rather than a fresh app.
   const mount = () => {
-    resetTransport();
-    getTransport({ allowedParentOrigins: [window.location.origin] });
+    resetHarnessTransport();
+    // Same `fetch`, fresh AppClient — see the docblock above.
+    configureSdkRuntime({ fetch: restFetch });
     uninstall = host.install();
     view = render(
       <ToastProvider>
@@ -1140,6 +1183,15 @@ describe('gallery — an orphaned publish still disarms the cell (F3-round4)', (
       shared: {
         seed: [
           {
+            // 🔴 THE KEY IS PINNED, AND IT USED TO BE IMPLICIT. The publish ledger
+            // in this case's storage seed names `entryKey: 'shared_1'` — which was
+            // the RETIRED MOCK HOST's minting convention (`shared_<n>`), not
+            // anything the platform promises: the real server generates a ULID
+            // (`apps-shared.router.ts`). `src/dev-rest.ts` mints ULID-SHAPED keys so
+            // that coupling cannot be re-established by accident, so the case now
+            // states which row the ledger points at instead of relying on a fake's
+            // counter.
+            key: 'shared_1',
             value: {
               title: 'Existing row',
               data: galleryData([{ imageId: 100, row: 0, col: 0 }]),
@@ -1200,6 +1252,15 @@ describe('gallery — the extend target survives an unloaded gallery (F1-round4)
       shared: {
         seed: [
           {
+            // 🔴 THE KEY IS PINNED, AND IT USED TO BE IMPLICIT. The publish ledger
+            // in this case's storage seed names `entryKey: 'shared_1'` — which was
+            // the RETIRED MOCK HOST's minting convention (`shared_<n>`), not
+            // anything the platform promises: the real server generates a ULID
+            // (`apps-shared.router.ts`). `src/dev-rest.ts` mints ULID-SHAPED keys so
+            // that coupling cannot be re-established by accident, so the case now
+            // states which row the ledger points at instead of relying on a fake's
+            // counter.
+            key: 'shared_1',
             value: {
               title: 'Existing row',
               data: galleryData([{ imageId: 200, row: 0, col: 0 }]),
@@ -1263,6 +1324,9 @@ describe('gallery — the extend target is resolved AUTHORITATIVELY (F1-round5)'
     // rows to push it past GALLERY_LIST_CAP.
     const seed = [
       {
+        // Pinned — the ledger above names `entryKey: 'shared_1'`. See the longer
+        // note on the same pin in the F1-round4 case above.
+        key: 'shared_1',
         value: {
           title: 'The off-page row',
           data: galleryData([{ imageId: 300, row: 0, col: 0 }]),
@@ -1336,6 +1400,9 @@ describe('gallery — the extend target is resolved AUTHORITATIVELY (F1-round5)'
       shared: {
         seed: [
           {
+            // Pinned — the ledger above names `entryKey: 'shared_1'`. See the
+            // longer note on the same pin in the F1-round4 case above.
+            key: 'shared_1',
             // Authored by SOMEBODY ELSE, so the app's own gallery still lists it
             // but the row is not one this viewer's page would treat as theirs —
             // the point is only that the key resolves through `get`.
@@ -1389,7 +1456,12 @@ describe('gallery — an orphaned publish still reaches the ledger', () => {
       },
       shared: {
         seed: [
-          { value: { title: 'Row', data: galleryData([{ imageId: 600, row: 0, col: 0 }]) } },
+          // Pinned — the ledger above names `entryKey: 'shared_1'`. See the
+          // longer note on the same pin in the F1-round4 case above.
+          {
+            key: 'shared_1',
+            value: { title: 'Row', data: galleryData([{ imageId: 600, row: 0, col: 0 }]) },
+          },
         ],
         // The authoritative re-read fails after the images are created.
         failNext: 1,
@@ -1454,12 +1526,21 @@ function threeDoneManifest() {
   return buildRunManifest({ phase: 'done', cells, perCellEstimate: 8 });
 }
 
-/** Mount against a host the test keeps a handle on, so it can retune mid-run. */
+/**
+ * Mount against a host the test keeps a handle on, so it can retune mid-run.
+ *
+ * Both cases below retune `publishError`, which is GROUP 2 — publish stays on the
+ * bridge by an explicit platform decision (the host draws the viewer's
+ * confirmation and binds it to what gets written), so `host.setScenario` is still
+ * the right lever for it. What these cases ALSO need is `storage`, which is group 3
+ * now — hence the split.
+ */
 function mountTunable(options: Record<string, unknown>) {
+  const { host: hostOptions, rest } = splitRestOptions(options);
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const host = createMockHost(options as any);
-  resetTransport();
-  getTransport({ allowedParentOrigins: [window.location.origin] });
+  const host = createMockHost(hostOptions as any);
+  resetHarnessTransport();
+  configureSdkRuntime({ fetch: createRestFake(rest) });
   const uninstall = host.install();
   const view = render(
     <ToastProvider>

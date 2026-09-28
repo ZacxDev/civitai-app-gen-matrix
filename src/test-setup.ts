@@ -1,13 +1,15 @@
 // Setup for the `dom` vitest project (jsdom + Testing Library). Loaded per
 // *.test.tsx file. Registers jest-dom matchers, stubs matchMedia (jsdom has
-// none), and resets the SDK transport singleton + DOM between tests so a mock
-// host from one test never leaks into the next.
+// none), and resets the bridge transport singleton, the SDK runtime and the DOM
+// between tests so one test's fakes never leak into the next.
 
 import '@testing-library/jest-dom/vitest';
 import { cleanup } from '@testing-library/react';
 import { afterEach, beforeEach, vi } from 'vitest';
 
 import { resetTransport } from '@civitai/blocks-react/testing';
+
+import { resetSdkRuntime } from './lib/sdk-runtime.js';
 
 // The design-system components inject a stylesheet on mount that uses modern CSS
 // (`@property`, `@layer`, `color-mix()`, nesting) which jsdom's CSS parser can't
@@ -41,6 +43,15 @@ beforeEach(() => {
 afterEach(() => {
   cleanup();
   resetTransport();
+  // 🔴 THE COUNTERPART `resetTransport()` ALONE NO LONGER COVERS. `sdk-runtime`
+  // holds three process-wide things — the adapted transport, the AppClient built
+  // on it, and the `fetch` a test installed via `configureSdkRuntime`. The first
+  // two are keyed on the bridge transport's identity, so `resetTransport()` does
+  // invalidate them; the `fetch` is NOT, so without this a test's REST fake
+  // answers every later test in the same file. The direction of that leak is a
+  // false PASS: a case that seeded nothing would silently read the previous
+  // case's store.
+  resetSdkRuntime();
   vi.useRealTimers();
   vi.unstubAllGlobals();
 });
