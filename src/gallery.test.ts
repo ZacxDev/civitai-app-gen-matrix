@@ -88,19 +88,31 @@ function entryWith(images: { imageId: number; row: number; col: number }[]): Gal
   };
 }
 
+/**
+ * The well-formed row payload these cases start from.
+ *
+ * Declared separately, and TYPED, because `SharedItemLike.value` is now `unknown`
+ * — the wire's own answer, since a listed row was written by somebody else's copy
+ * of this app. Several cases below build a malformed value by spreading this one
+ * and overriding a field, and `{ ...unknown }` does not compile. Naming the
+ * good shape here keeps those spreads legal without re-asserting on the READ type
+ * the thing the port deliberately stopped claiming.
+ */
+const WELL_FORMED_SHARED_VALUE: { title: string; body?: string; data?: unknown } = {
+  title: 'A matrix',
+  data: {
+    v: GALLERY_DATA_VERSION,
+    rows: [{ row: 0, versionId: 4444 }],
+    cols: [{ col: 0, key: MODIFIERS[0].key, loraVersionId: null }],
+    images: [{ imageId: 777, row: 0, col: 0 }],
+  },
+};
+
 function sharedItem(over: Partial<SharedItemLike> = {}): SharedItemLike {
   return {
     key: 'k_1',
     authorUserId: 91,
-    value: {
-      title: 'A matrix',
-      data: {
-        v: GALLERY_DATA_VERSION,
-        rows: [{ row: 0, versionId: 4444 }],
-        cols: [{ col: 0, key: MODIFIERS[0].key, loraVersionId: null }],
-        images: [{ imageId: 777, row: 0, col: 0 }],
-      },
-    },
+    value: { ...WELL_FORMED_SHARED_VALUE },
     count: 3,
     updatedAt: new Date(1_700_000_000_000),
     viewerVoted: false,
@@ -497,7 +509,7 @@ describe('loadGallery', () => {
 
   it('treats a blank body as absent', () => {
     const entry = toGalleryEntry(
-      sharedItem({ value: { ...sharedItem().value, body: '   ' } }),
+      sharedItem({ value: { ...WELL_FORMED_SHARED_VALUE, body: '   ' } }),
     );
     expect(entry?.body).toBeNull();
   });
@@ -951,7 +963,7 @@ describe('rendered text bounds', () => {
 
   it('still bounds a body from somebody else’s client', () => {
     const entry = toGalleryEntry(
-      sharedItem({ value: { ...sharedItem().value, body: 'B'.repeat(GALLERY_BODY_MAX + 500) } }),
+      sharedItem({ value: { ...WELL_FORMED_SHARED_VALUE, body: 'B'.repeat(GALLERY_BODY_MAX + 500) } }),
     );
     expect(entry?.body?.length).toBe(GALLERY_BODY_MAX + 1);
   });
@@ -975,7 +987,7 @@ describe('rendered text bounds', () => {
   it('🔴 clamps a title and body written by somebody else’s client', () => {
     const entry = toGalleryEntry(
       sharedItem({
-        value: { ...sharedItem().value, title: 'T'.repeat(5000), body: 'B'.repeat(5000) },
+        value: { ...WELL_FORMED_SHARED_VALUE, title: 'T'.repeat(5000), body: 'B'.repeat(5000) },
       }),
     );
     expect(
@@ -1315,7 +1327,7 @@ describe('mergeGalleryData respects the reader’s own per-coordinate bound', ()
 describe('a blank title from another client', () => {
   it('renders the fallback rather than an empty heading, and keeps the row', () => {
     const entry = toGalleryEntry(
-      sharedItem({ value: { ...sharedItem().value, title: '   ' } }),
+      sharedItem({ value: { ...WELL_FORMED_SHARED_VALUE, title: '   ' } }),
     );
     expect(entry).not.toBeNull();
     expect(entry?.title).toBe('Untitled matrix');

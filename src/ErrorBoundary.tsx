@@ -5,10 +5,17 @@
 //
 // It is mounted INSIDE `<BlockGate>` (see main.tsx) so `useBlockAnalytics()`
 // always has host context when it reports a caught crash.
+//
+// ⚠ `useBlockAnalytics` NOW COMES FROM `src/lib/sdk-runtime.ts` AND IS A NO-OP —
+// which it already was on `main`. `TRACK_EVENT` is "not carried" by
+// `@civitai/sdk`, and it had no host-side sink on the bridge either (the
+// platform's handler-parity ledger marks both hosts N/A, "analytics
+// fire-and-forget; no host-side sink wired"). The call site below is kept rather
+// than deleted so there is one place to wire a real sink the day one exists.
 
 import { Component, type ErrorInfo, type ReactNode } from 'react';
 
-import { useBlockAnalytics } from '@civitai/blocks-react';
+import { useBlockAnalytics } from './lib/sdk-runtime.js';
 
 interface ErrorBoundaryProps {
   children: ReactNode;

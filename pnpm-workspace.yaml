@@ -18,7 +18,30 @@
 #   - @civitai/components@0.3.0 + @civitai/components-react@0.3.0 — the
 #     attribute-driven CSS + React primitives (Slider/Image/Tooltip/Toast/
 #     SegmentedControl) the UI adopts.
+#   - @civitai/sdk@0.8.0 — the successor package this block's runtime bindings
+#     now sit on (`initialize({ transport })` → `app.site`/`storage`/
+#     `sharedStorage` + `createHost`). See `src/lib/sdk-runtime.ts`.
+#     🔴 PUBLISHED 2026-09-27T02:04:53.050Z (`npm view @civitai/sdk time --json`).
+#     This entry is INERT 24h after that instant — delete it then rather than
+#     leaving a permanent exemption. The version is EXACT on purpose: a bare
+#     `@civitai/sdk` would exempt every future release, including one cut by a
+#     compromised publish token, which is the whole thing the gate is for.
 # All resolve from the npm registry directly — no local `link:`/`overrides`.
+#
+# ⚠ MEASURED, AND IT CORRECTS THE FIRST SENTENCE OF THIS FILE: there is no "default
+# minimumReleaseAge gate" in effect here. `minimumReleaseAge` is NOT configured —
+# `pnpm config get minimumReleaseAge` answers `undefined` — and `minimumReleaseAgeExclude`
+# alone does nothing, so every entry in the list below is currently INERT. Checked at
+# four points, all of which install a same-day package clean with NO exclude entry:
+# pnpm 10.28.1 and pnpm 11.28.0, each with `--frozen-lockfile` and with a fresh
+# resolution (`--lockfile-only`, lockfile deleted). The mechanism does work — adding
+# `minimumReleaseAge: 10080` makes pnpm 11 refuse with
+# `ERR_PNPM_NO_MATURE_MATCHING_VERSION`, which is how the list above was confirmed to
+# be about a real thing rather than a cargo-culted key.
+#
+# So keep maintaining this list — it is the repo's convention, it is what makes
+# turning the gate ON a one-line change, and each entry records WHEN a version was
+# published. Just do not believe a green `pnpm install` proves an entry was needed.
 #
 # Single-package repo: declare the root explicitly so pnpm and setup-node's
 # `cache: pnpm` don't error "packages field missing or empty". The deployed
@@ -32,3 +55,4 @@ minimumReleaseAgeExclude:
   - '@civitai/theme@0.2.0 || 0.3.1'
   - '@civitai/components@0.3.0 || 0.4.1'
   - '@civitai/components-react@0.3.0 || 0.4.1'
+  - '@civitai/sdk@0.8.0'
