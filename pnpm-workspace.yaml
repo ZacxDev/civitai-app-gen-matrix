@@ -28,20 +28,46 @@
 #     compromised publish token, which is the whole thing the gate is for.
 # All resolve from the npm registry directly — no local `link:`/`overrides`.
 #
-# ⚠ MEASURED, AND IT CORRECTS THE FIRST SENTENCE OF THIS FILE: there is no "default
-# minimumReleaseAge gate" in effect here. `minimumReleaseAge` is NOT configured —
-# `pnpm config get minimumReleaseAge` answers `undefined` — and `minimumReleaseAgeExclude`
-# alone does nothing, so every entry in the list below is currently INERT. Checked at
-# four points, all of which install a same-day package clean with NO exclude entry:
-# pnpm 10.28.1 and pnpm 11.28.0, each with `--frozen-lockfile` and with a fresh
-# resolution (`--lockfile-only`, lockfile deleted). The mechanism does work — adding
-# `minimumReleaseAge: 10080` makes pnpm 11 refuse with
-# `ERR_PNPM_NO_MATURE_MATCHING_VERSION`, which is how the list above was confirmed to
-# be about a real thing rather than a cargo-culted key.
+# 🔴 THIS LIST IS LIVE AND ITS ENTRIES ARE MANDATORY. A previous version of this
+# block asserted the opposite — "every entry in the list below is currently INERT"
+# — and that was WRONG in the expensive direction: it reads as permission to skip
+# the entry on a bump, and skipping it fails CI outright. Retracted 2026-10-02 by
+# a measurement WITH A CONTROL, on the toolchain this repo actually pins.
 #
-# So keep maintaining this list — it is the repo's convention, it is what makes
-# turning the gate ON a one-line change, and each entry records WHEN a version was
-# published. Just do not believe a green `pnpm install` proves an entry was needed.
+# WHY THE OLD CLAIM LOOKED TRUE, and it is the reusable lesson: `pnpm config get
+# minimumReleaseAge` answers `undefined`, and `undefined` DOES NOT MEAN OFF — pnpm
+# 11.25.0 applies a BUILT-IN 24-HOUR DEFAULT. So the one command anyone reaches for
+# to check reports the gate absent while it is enforcing. The old block also states
+# its own scope: it checked pnpm 10.28.1 and 11.28.0 — NEITHER of which is the
+# 11.25.0 that `flake.nix` pins — so its conclusion never covered this repo's own
+# toolchain. A version-dependent claim measured at two points that exclude the one
+# in use is how a false "inert" survives review.
+#
+# THE CONTROL (2026-10-02T04:55Z, pnpm 11.25.0, `rm -rf node_modules` first).
+# Removing ONLY the `0.62.0` token from the blocks-react line below:
+#
+#   $ pnpm install --frozen-lockfile          # rc=1
+#   [ERR_PNPM_MINIMUM_RELEASE_AGE_VIOLATION] 1 lockfile entries failed verification:
+#     @civitai/blocks-react@0.62.0 was published at 2026-10-02T04:00:25.000Z,
+#     within the minimumReleaseAge cutoff (2026-10-01T04:55:23.576Z)
+#
+# Putting the token back: rc=0, `Done in 3.5s`. The cutoff is exactly now-24h, so
+# the gate expires per-version on a clock rather than on a config change.
+#
+# CI runs `pnpm install --frozen-lockfile` (`.github/workflows/ci.yml`), so an
+# omitted entry is not a style nit — it is a red build until the version ages out.
+#
+# WHICH MEANS: add the version you are bumping TO, and record its publish instant
+# so a later prune is mechanical rather than a guess. An entry is dead once the
+# version is >24h old AND `package.json` no longer resolves to it; the stale tokens
+# still listed below are exemptions for versions this repo can no longer install,
+# and pruning them is a tidy-up this bump deliberately does not fold in.
+#   - @civitai/blocks-react@0.62.0 — PUBLISHED 2026-10-02T04:02:03.809Z (npm view
+#     @civitai/blocks-react time --json). Required until ~2026-10-03T04:02Z.
+#   - @civitai/app-sdk@0.54.0 — PUBLISHED 2026-10-01T02:52:24.760Z, i.e. already
+#     older than 24h at this bump, MEASURED to install clean with NO entry (rc=0).
+#     Deliberately NOT added: an unneeded token here is a permanent exemption for a
+#     version that does not need one, which is the thing this file warns against.
 #
 # Single-package repo: declare the root explicitly so pnpm and setup-node's
 # `cache: pnpm` don't error "packages field missing or empty". The deployed
@@ -51,7 +77,7 @@ packages:
   - '.'
 minimumReleaseAgeExclude:
   - '@civitai/app-sdk@0.28.0'
-  - '@civitai/blocks-react@0.37.0 || 0.46.0 || 0.47.0'
+  - '@civitai/blocks-react@0.37.0 || 0.46.0 || 0.47.0 || 0.62.0'
   - '@civitai/theme@0.2.0 || 0.3.1'
   - '@civitai/components@0.3.0 || 0.4.1'
   - '@civitai/components-react@0.3.0 || 0.4.1'

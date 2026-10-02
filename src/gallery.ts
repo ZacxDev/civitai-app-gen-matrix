@@ -1277,9 +1277,28 @@ export function provenanceLabel(isOwn: boolean): string {
 // The gated read.
 // ---------------------------------------------------------------------------
 
-/** The slice of `BlockGatedImage` this module reads. Mirrors the SDK union. */
+/**
+ * The slice of `BlockGatedImage` this module reads. Mirrors the SDK union.
+ *
+ * 🔴 `nsfwLevel` IS OPTIONAL BECAUSE THE SDK'S IS. `@civitai/app-sdk` widened
+ * `BlockGatedImage`'s visible arm to `nsfwLevel?: number` (it also gained
+ * `contentRating`/`width`/`height`/`ratingPending`, none of which this module
+ * reads), so a required field here is NARROWER than the value the host actually
+ * sends and the SDK array stops being assignable. Keeping it required is not an
+ * option; the question is only what an absent level means.
+ *
+ * It means UNKNOWN, and unknown must resolve to the RESTRICTIVE side. It is
+ * deliberately propagated as `undefined` rather than defaulted to a number:
+ * every numeric default is a level, and the SFW ones (0/1) are *allowed*, so
+ * `?? 0` would silently unblur an image whose rating the host declined to state
+ * — the one direction of this change that is a content-safety defect rather
+ * than a cosmetic one. `shouldBlurResult` already takes
+ * `number | null | undefined` and answers `gate.isSfw` for the unknown case
+ * (pinned in `persistence.test.ts`), so the restrictive answer needs no new
+ * branch here — only the absence of a lossy default.
+ */
 export type GatedImageLike =
-  | { imageId: number; status: 'visible'; url: string; nsfwLevel: number }
+  | { imageId: number; status: 'visible'; url: string; nsfwLevel?: number }
   | { imageId: number; status: 'hidden' };
 
 /**
@@ -1319,7 +1338,20 @@ export function collectImageIds(entries: readonly GalleryEntry[]): number[] {
 
 /** One rendered cell of a gallery entry's grid. */
 export type GalleryCellView =
-  | { kind: 'visible'; imageId: number; row: number; col: number; url: string; nsfwLevel: number }
+  /**
+   * `nsfwLevel` is optional for the same reason it is on {@link GatedImageLike}
+   * — the host may decline to state a level — and it stays `undefined` rather
+   * than taking a numeric default so the maturity gate reads it as unknown and
+   * blurs under an SFW ceiling. See that type's docblock.
+   */
+  | {
+      kind: 'visible';
+      imageId: number;
+      row: number;
+      col: number;
+      url: string;
+      nsfwLevel?: number;
+    }
   /** Withheld from THIS viewer by the host's per-viewer clamp. Carries no url. */
   | { kind: 'hidden'; imageId: number; row: number; col: number }
   /** The host could not resolve the id at all — removed, or never resolvable. */
