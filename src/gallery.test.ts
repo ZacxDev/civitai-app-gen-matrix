@@ -52,6 +52,7 @@ import {
 import { CHECKPOINTS, MODIFIERS } from './models.js';
 import { MAX_CELLS, PROMPT_MAX, buildMatrix, type MatrixCell } from './matrix.js';
 import { HISTORY_RETENTION_CAP } from './history.js';
+import { shouldBlurResult } from './persistence.js';
 
 // ---------------------------------------------------------------------------
 // Fixtures.
@@ -561,6 +562,38 @@ describe('gated image resolution', () => {
       'gallery-hidden-guard: a hidden result carries NO url from the host, and the view must not invent one — the block can never obtain an unclamped url for an image this viewer may not see',
     ).not.toContain('http');
     expect(view.cells[0]).toEqual({ kind: 'hidden', imageId: 404, row: 0, col: 0 });
+  });
+
+  it('propagates an ABSENT nsfwLevel as unknown, so the gate blurs it', () => {
+    // 🔴 REGRESSION GUARD FOR THE `@civitai/app-sdk` WIDENING. The SDK's
+    // `BlockGatedImage` visible arm carries `nsfwLevel?: number` — the host may
+    // decline to state a level — so this shape is one the host really sends and
+    // `GatedImageLike` has to admit it. The hazard is not the type, it is the
+    // repair someone reaches for when it goes red: `?? 0`, or any numeric
+    // default. Every number is a LEVEL and the low ones are SFW-allowed, so a
+    // default turns "rating unknown" into "rated safe" and unblurs the image
+    // under an SFW ceiling. Asserting `undefined` is what makes that repair
+    // fail instead of ship.
+    const entry = entryWith([{ imageId: 707, row: 0, col: 0 }]);
+    const view = resolveEntryImages(
+      entry,
+      indexGatedImages([{ imageId: 707, status: 'visible', url: 'https://img/707' }]),
+    );
+    const cell = view.cells[0];
+    expect(cell.kind).toBe('visible');
+    expect(
+      cell.kind === 'visible' ? cell.nsfwLevel : 'not-visible',
+      'gallery-unknown-level-guard: an image the host sent WITHOUT an nsfwLevel must stay unknown — any numeric default reads as a rating, and a low one unblurs an unrated image under an SFW ceiling',
+    ).toBeUndefined();
+    // The restrictive end of the same relationship: unknown must BLUR under an
+    // SFW gate. Pinned here too, not only on `shouldBlurResult`'s own unit, so
+    // the two halves cannot pass while the wiring between them is wrong.
+    expect(
+      shouldBlurResult(cell.kind === 'visible' ? cell.nsfwLevel : 0, {
+        isLevelAllowed: (level: number) => level <= 1,
+        isSfw: true,
+      }),
+    ).toBe(true);
   });
 
   it('reports allGone only when EVERY image is gone', () => {
