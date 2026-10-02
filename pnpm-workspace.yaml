@@ -65,9 +65,30 @@
 #   - @civitai/blocks-react@0.62.0 — PUBLISHED 2026-10-02T04:02:03.809Z (npm view
 #     @civitai/blocks-react time --json). Required until ~2026-10-03T04:02Z.
 #   - @civitai/app-sdk@0.54.0 — PUBLISHED 2026-10-01T02:52:24.760Z, i.e. already
-#     older than 24h at this bump, MEASURED to install clean with NO entry (rc=0).
+#     older than 24h at that bump, MEASURED to install clean with NO entry (rc=0).
 #     Deliberately NOT added: an unneeded token here is a permanent exemption for a
 #     version that does not need one, which is the thing this file warns against.
+#
+# THE 0.63.0 BUMP (2026-10-02T19:06Z). Four tokens were added, and EACH ONE WAS
+# CONTROLLED — removed on its own, `rm -rf node_modules`, `pnpm install
+# --frozen-lockfile`, and the resulting rc recorded. All four are MANDATORY:
+#   - @civitai/blocks-react@0.63.0 — PUBLISHED 2026-10-02T17:42:54.561Z. Required
+#     until ~2026-10-03T17:43Z. Control: rc=1, "1 lockfile entries failed
+#     verification: @civitai/blocks-react@0.63.0 was published at
+#     2026-10-02T17:38:43.000Z, within the minimumReleaseAge cutoff".
+#   - @civitai/app-sdk@0.55.0 — PUBLISHED 2026-10-02T17:41:53.057Z. Required until
+#     ~2026-10-03T17:42Z. NOT optional the way 0.54.0 was: blocks-react@0.63.0
+#     declares `peerDependencies: {"@civitai/app-sdk": ">=0.55.0 <1.0.0"}`, and a
+#     pre-1.0 caret locks the MINOR, so `^0.54.0` = `>=0.54.0 <0.55.0` EXCLUDES
+#     0.55.0. Control: rc=1 on @civitai/app-sdk@0.55.0.
+#   - @civitai/theme@0.5.0 and @civitai/components@0.9.1 — PUBLISHED
+#     2026-10-02T17:38:43.000Z. 🔴 TRANSITIVE, NOT DIRECT: this package.json still
+#     pins theme ^0.3.1 / components ^0.4.1; these two versions enter the lockfile
+#     only as blocks-react@0.63.0's own nested deps, and pnpm APPENDED both tokens
+#     for us during `pnpm install`. The lesson: the release-age gate scores every
+#     LOCKFILE entry, not just the ranges you edited, so a bump can require
+#     exemptions for packages you never touched. Control: rc=1, "2 lockfile
+#     entries failed verification" naming both.
 #
 # Single-package repo: declare the root explicitly so pnpm and setup-node's
 # `cache: pnpm` don't error "packages field missing or empty". The deployed
@@ -76,9 +97,9 @@
 packages:
   - '.'
 minimumReleaseAgeExclude:
-  - '@civitai/app-sdk@0.28.0'
-  - '@civitai/blocks-react@0.37.0 || 0.46.0 || 0.47.0 || 0.62.0'
-  - '@civitai/theme@0.2.0 || 0.3.1'
-  - '@civitai/components@0.3.0 || 0.4.1'
+  - '@civitai/app-sdk@0.28.0 || 0.55.0'
+  - '@civitai/blocks-react@0.37.0 || 0.46.0 || 0.47.0 || 0.62.0 || 0.63.0'
+  - '@civitai/theme@0.2.0 || 0.3.1 || 0.5.0'
+  - '@civitai/components@0.3.0 || 0.4.1 || 0.9.1'
   - '@civitai/components-react@0.3.0 || 0.4.1'
   - '@civitai/sdk@0.8.0'
